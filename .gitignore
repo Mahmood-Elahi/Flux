@@ -1,0 +1,65 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python packaging and native builds
+build/
+dist/
+*.egg-info/
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exp
+*.ptx
+*.cubin
+*.fatbin
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local model and dataset caches
+.cache/
+models/
+checkpoints/
+huggingface/
+
+# Generated benchmark and profiling output
+benchmark-results/
+profile-results/
+profiles/
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.log
