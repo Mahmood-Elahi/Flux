@@ -30,14 +30,18 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
         ) from error
 
     rmsnorm_dir = ROOT / "csrc" / "rmsnorm"
+    residual_rmsnorm_dir = ROOT / "csrc" / "residual_rmsnorm"
     extension = CUDAExtension(
         name="flux._C",
         sources=[
             str(rmsnorm_dir / "rmsnorm_torch.cpp"),
             str(rmsnorm_dir / "rmsnorm.cpp"),
             str(rmsnorm_dir / "rmsnorm_cuda.cu"),
+            str(residual_rmsnorm_dir / "residual_rmsnorm_torch.cpp"),
+            str(residual_rmsnorm_dir / "residual_rmsnorm.cpp"),
+            str(residual_rmsnorm_dir / "residual_rmsnorm_cuda.cu"),
         ],
-        include_dirs=[str(rmsnorm_dir)],
+        include_dirs=[str(rmsnorm_dir), str(residual_rmsnorm_dir)],
         extra_compile_args={
             "cxx": ["/W4", "/permissive-"],
             "nvcc": [
