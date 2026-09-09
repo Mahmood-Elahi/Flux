@@ -43,7 +43,10 @@ def _inputs(shape: tuple[int, ...], device: str) -> tuple[torch.Tensor, torch.Te
 
 
 @pytest.mark.parametrize("device", _devices())
-@pytest.mark.parametrize("shape", [(576,), (2, 7, 576), (2, 3, 4, 64)])
+@pytest.mark.parametrize(
+    "shape",
+    [(576,), (2, 7, 576), (2, 3, 4, 64), (3, 513), (1024, 576)],
+)
 def test_matches_reference_across_shapes(device: str, shape: tuple[int, ...]) -> None:
     input, weight = _inputs(shape, device)
     expected = rms_norm(input, weight, EPSILON)

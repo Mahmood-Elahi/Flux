@@ -8,6 +8,17 @@ namespace flux {
 namespace {
 
 constexpr unsigned int kBlockSize = 256;
+constexpr unsigned int kWarpSize = 32;
+constexpr unsigned int kWarpCount = kBlockSize / kWarpSize;
+
+static_assert(kBlockSize % kWarpSize == 0);
+
+__device__ float warp_reduce_sum(float value) {
+    for (unsigned int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+        value += __shfl_down_sync(0xFFFFFFFFU, value, offset);
+    }
+    return value;
+}
 
 __global__ void rmsnorm_cuda_fp32_kernel(
     const float* input,
@@ -15,7 +26,7 @@ __global__ void rmsnorm_cuda_fp32_kernel(
     float* output,
     const std::size_t hidden_size,
     const float epsilon) {
-    __shared__ float reduction[kBlockSize];
+    __shared__ float warp_sums[kWarpCount];
 
     const std::size_t row_offset =
         static_cast<std::size_t>(blockIdx.x) * hidden_size;
@@ -25,25 +36,26 @@ __global__ void rmsnorm_cuda_fp32_kernel(
         const float value = input[row_offset + column];
         sum_squares += value * value;
     }
-    reduction[threadIdx.x] = sum_squares;
+    const unsigned int lane = threadIdx.x % kWarpSize;
+    const unsigned int warp = threadIdx.x / kWarpSize;
+    sum_squares = warp_reduce_sum(sum_squares);
+    if (lane == 0) {
+        warp_sums[warp] = sum_squares;
+    }
     __syncthreads();
 
-    // kBlockSize is a power of two, so every active thread has a partner.
-    for (unsigned int stride = kBlockSize / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
+    if (warp == 0) {
+        sum_squares = lane < kWarpCount ? warp_sums[lane] : 0.0F;
+        sum_squares = warp_reduce_sum(sum_squares);
     }
-
     if (threadIdx.x == 0) {
         const float mean_square =
-            reduction[0] / static_cast<float>(hidden_size);
-        reduction[0] = rsqrtf(mean_square + epsilon);
+            sum_squares / static_cast<float>(hidden_size);
+        warp_sums[0] = rsqrtf(mean_square + epsilon);
     }
     __syncthreads();
 
-    const float inv_rms = reduction[0];
+    const float inv_rms = warp_sums[0];
     for (std::size_t column = threadIdx.x; column < hidden_size;
          column += blockDim.x) {
         const std::size_t index = row_offset + column;

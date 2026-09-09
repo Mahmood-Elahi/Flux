@@ -9,7 +9,7 @@ Flux is one continuous project progressing toward a single final outcome: an int
 5. **Completed:** Integrate FP32 RMSNorm as an inference-only PyTorch custom operator with CPU and CUDA dispatcher implementations and correct current-stream CUDA launches.
 6. **Completed:** Add CPU and CUDA custom-operator correctness tests against the PyTorch reference, including FakeTensor/opcheck and non-default CUDA stream coverage.
 7. **Completed:** Establish a reproducible pre-optimization CUDA RMSNorm benchmark against PyTorch's native RMSNorm on SmolLM2-relevant FP32 shapes.
-8. Optimize RMSNorm based on the measured baseline.
+8. **Completed:** Optimize FP32 CUDA RMSNorm with a measured warp-level reduction, and evaluate aligned `float4` memory access; retain scalar access after the vector path regressed the largest benchmark workload.
 9. Implement dual-output fused residual + RMSNorm.
 10. Implement transformer attention softmax.
 11. Ensure all CUDA operators use the correct current CUDA stream.

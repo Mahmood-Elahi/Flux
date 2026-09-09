@@ -274,6 +274,9 @@ void test_deterministic(cudaStream_t stream) {
         run_cuda(input, weight, num_rows, hidden_size, 1.0e-5F, stream);
     const std::vector<float> second =
         run_cuda(input, weight, num_rows, hidden_size, 1.0e-5F, stream);
+    const std::vector<float> expected =
+        cpu_reference(input, weight, num_rows, hidden_size, 1.0e-5F);
+    expect_close(first, expected, "513-wide scalar-fallback case");
     expect_true(
         std::memcmp(first.data(), second.data(), first.size() * sizeof(float)) == 0,
         "repeated CUDA execution produced different output bytes");

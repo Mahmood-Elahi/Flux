@@ -1,4 +1,4 @@
-"""Benchmark the initial Flux CUDA RMSNorm against PyTorch RMSNorm.
+"""Benchmark Flux CUDA RMSNorm against PyTorch RMSNorm.
 
 Run from the repository root after building the native extension:
 

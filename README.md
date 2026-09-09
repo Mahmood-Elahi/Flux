@@ -2,9 +2,9 @@
 
 Flux is a long-term systems and machine-learning project for building a CUDA-accelerated transformer inference system around **SmolLM2-135M**. It uses Python, C++, CUDA C++, and PyTorch.
 
-Development begins with reproducible PyTorch reference inference and will progressively replace important transformer operations with custom native and CUDA implementations. The FP32 RMSNorm correctness oracle, standalone native implementations, PyTorch custom operator with CPU and CUDA dispatch, and initial performance benchmark are now implemented. Planned work includes fused residual + RMSNorm, attention softmax, profiling, and integration into the SmolLM2 inference path.
+Development begins with reproducible PyTorch reference inference and will progressively replace important transformer operations with custom native and CUDA implementations. The FP32 RMSNorm correctness oracle, standalone native implementations, PyTorch custom operator with CPU and CUDA dispatch, warp-reduced CUDA kernel, and performance benchmark are now implemented. Planned work includes fused residual + RMSNorm, attention softmax, profiling, and integration into the SmolLM2 inference path.
 
-The repository provides a Hugging Face / PyTorch SmolLM2-135M reference inference baseline and FP32 RMSNorm implementations in PyTorch, native C++, and CUDA. The native implementations are exposed as `torch.ops.flux.rmsnorm` through PyTorch's CPU and CUDA dispatch keys. RMSNorm optimization and model-path integration have not yet been performed.
+The repository provides a Hugging Face / PyTorch SmolLM2-135M reference inference baseline and FP32 RMSNorm implementations in PyTorch, native C++, and CUDA. The native implementations are exposed as `torch.ops.flux.rmsnorm` through PyTorch's CPU and CUDA dispatch keys. Model-path integration has not yet been performed.
 
 ## Development setup
 
@@ -40,13 +40,22 @@ does not implement autograd. Input and weight may be non-contiguous because the
 C++ wrappers make contiguous copies before calling the standalone row-major
 implementations. No dtype conversion is performed.
 
-The RMSNorm stack is correctness-complete, but its CUDA kernel remains the naive
-pre-optimization baseline. With the native extension built, benchmark that
-baseline against PyTorch's native RMSNorm from the repository root:
+The RMSNorm stack is correctness-complete, and its CUDA kernel uses warp
+shuffles plus a small shared-memory reduction across warp partials. With the
+native extension built, benchmark it against PyTorch's native RMSNorm from the
+repository root:
 
 ```bash
 python benchmarks/benchmark_rmsnorm.py
 ```
+
+An aligned `float4` memory-access path was evaluated as the final standalone
+RMSNorm optimization, but was not retained. Across three repeated 5,000-call
+runs on an otherwise idle RTX 5070 Ti, the `(1, 8192, 576)` median increased
+from 29.502 microseconds for scalar warp reduction to 37.166 microseconds with
+vectorized access. A 128-thread vector variant remained slower at 38.106
+microseconds. The production kernel therefore retains scalar memory access for
+all hidden sizes.
 
 The benchmark checks correctness before timing and prints machine-specific
 results to standard output; it does not save them in the repository.
@@ -88,8 +97,9 @@ The implementation accumulates each sum of squares sequentially in `float`.
 PyTorch may reduce in a different order, so cross-language checks use FP32
 tolerances rather than requiring bit-for-bit equality.
 
-The standalone CUDA baseline uses one 256-thread block per row, FP32 shared-memory
-reduction, and a caller-provided CUDA stream. For an RTX 5070 Ti (compute
+The standalone CUDA kernel uses one 256-thread block per row, scalar FP32 memory
+access, a two-level FP32 warp reduction, and a caller-provided CUDA stream. For
+an RTX 5070 Ti (compute
 capability 12.0), build and validate it from the same developer prompt with:
 
 ```bat
