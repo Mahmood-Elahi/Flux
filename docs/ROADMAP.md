@@ -2,7 +2,7 @@
 
 Flux is one continuous project progressing toward a single final outcome: an integrated, CUDA-accelerated SmolLM2-135M inference system. The milestones below are sequential stages of that project, not separate projects, versions, or independent finish lines.
 
-1. Establish reproducible SmolLM2-135M PyTorch reference inference.
+1. **Completed:** Establish reproducible SmolLM2-135M PyTorch reference inference. Validated with seven offline tests and real FP32 CUDA forward inference and greedy generation on an RTX 5070 Ti (Python 3.11.9, PyTorch 2.14.0+cu132, Transformers 5.16.1).
 2. Implement a Python reference RMSNorm.
 3. Implement native C++ RMSNorm.
 4. Implement naive FP32 CUDA RMSNorm.
