@@ -93,7 +93,7 @@ def main() -> int:
         temp_path = Path(temp_directory)
         for case_index, (shape, epsilon) in enumerate(CASES):
             hidden, residual, weight = _make_inputs(shape, case_index)
-            expected_residual, expected_norm = residual_rmsnorm(
+            expected_norm, expected_residual = residual_rmsnorm(
                 hidden, residual, weight, epsilon
             )
             input_path = temp_path / f"input-{case_index}.bin"
@@ -110,7 +110,7 @@ def main() -> int:
                 ],
                 check=True,
             )
-            actual_residual, actual_norm = _read_outputs(
+            actual_norm, actual_residual = _read_outputs(
                 output_path, hidden.numel(), shape
             )
 

@@ -172,8 +172,8 @@ CudaResult run_cuda(
             device_hidden.get(),
             device_residual.get(),
             device_weight.get(),
-            device_residual_out.get(),
             device_norm_out.get(),
+            device_residual_out.get(),
             num_rows,
             hidden_size,
             epsilon,
@@ -399,12 +399,12 @@ void test_launcher_validation() {
         flux::residual_rmsnorm_cuda_fp32(
             pointer, pointer, pointer, nullptr, pointer, 1, 1, 0.0F, nullptr) ==
             cudaErrorInvalidValue,
-        "null residual output was accepted");
+        "null normalized output was accepted");
     expect_true(
         flux::residual_rmsnorm_cuda_fp32(
             pointer, pointer, pointer, pointer, nullptr, 1, 1, 0.0F, nullptr) ==
             cudaErrorInvalidValue,
-        "null normalized output was accepted");
+        "null residual output was accepted");
     expect_true(
         flux::residual_rmsnorm_cuda_fp32(
             pointer, pointer, pointer, pointer, pointer, 0, 1, 0.0F, nullptr) ==
@@ -420,6 +420,30 @@ void test_launcher_validation() {
             pointer, pointer, pointer, pointer, pointer, 1, 1, -1.0F, nullptr) ==
             cudaErrorInvalidValue,
         "negative epsilon was accepted");
+    expect_true(
+        flux::residual_rmsnorm_cuda_fp32(
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            1,
+            1,
+            std::numeric_limits<float>::quiet_NaN(),
+            nullptr) == cudaErrorInvalidValue,
+        "NaN epsilon was accepted");
+    expect_true(
+        flux::residual_rmsnorm_cuda_fp32(
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            1,
+            1,
+            std::numeric_limits<float>::infinity(),
+            nullptr) == cudaErrorInvalidValue,
+        "infinite epsilon was accepted");
     if (sizeof(std::size_t) > sizeof(unsigned int)) {
         const std::size_t too_many_rows =
             static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()) + 1;

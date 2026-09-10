@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <limits>
 
 namespace flux {
@@ -9,7 +10,6 @@ namespace {
 
 constexpr unsigned int kBlockSize = 256;
 constexpr unsigned int kWarpSize = 32;
-constexpr unsigned int kWarpCount = kBlockSize / kWarpSize;
 
 static_assert(kBlockSize % kWarpSize == 0);
 
@@ -20,25 +20,46 @@ __device__ float warp_reduce_sum(float value) {
     return value;
 }
 
+template <unsigned int CachedValuesPerThread>
 __global__ void residual_rmsnorm_cuda_fp32_kernel(
     const float* hidden,
     const float* residual,
     const float* weight,
-    float* residual_out,
     float* norm_out,
+    float* residual_out,
     const std::size_t hidden_size,
     const float epsilon) {
+    constexpr unsigned int kWarpCount = kBlockSize / kWarpSize;
     __shared__ float warp_sums[kWarpCount];
 
     const std::size_t row_offset =
         static_cast<std::size_t>(blockIdx.x) * hidden_size;
     float sum_squares = 0.0F;
-    for (std::size_t column = threadIdx.x; column < hidden_size;
-         column += blockDim.x) {
-        const std::size_t index = row_offset + column;
-        const float value = hidden[index] + residual[index];
-        residual_out[index] = value;
-        sum_squares += value * value;
+    float cached_values[CachedValuesPerThread == 0 ? 1 : CachedValuesPerThread];
+    if constexpr (CachedValuesPerThread > 0) {
+#pragma unroll
+        for (unsigned int value_index = 0;
+             value_index < CachedValuesPerThread;
+            ++value_index) {
+            const std::size_t column =
+                threadIdx.x + value_index * kBlockSize;
+            float value = 0.0F;
+            if (column < hidden_size) {
+                const std::size_t index = row_offset + column;
+                value = hidden[index] + residual[index];
+                residual_out[index] = value;
+                sum_squares += value * value;
+            }
+            cached_values[value_index] = value;
+        }
+    } else {
+        for (std::size_t column = threadIdx.x; column < hidden_size;
+             column += blockDim.x) {
+            const std::size_t index = row_offset + column;
+            const float value = hidden[index] + residual[index];
+            residual_out[index] = value;
+            sum_squares += value * value;
+        }
     }
 
     const unsigned int lane = threadIdx.x % kWarpSize;
@@ -61,10 +82,24 @@ __global__ void residual_rmsnorm_cuda_fp32_kernel(
     __syncthreads();
 
     const float inv_rms = warp_sums[0];
-    for (std::size_t column = threadIdx.x; column < hidden_size;
-         column += blockDim.x) {
-        const std::size_t index = row_offset + column;
-        norm_out[index] = residual_out[index] * inv_rms * weight[column];
+    if constexpr (CachedValuesPerThread > 0) {
+#pragma unroll
+        for (unsigned int value_index = 0;
+             value_index < CachedValuesPerThread;
+            ++value_index) {
+            const std::size_t column =
+                threadIdx.x + value_index * kBlockSize;
+            if (column < hidden_size) {
+                norm_out[row_offset + column] =
+                    cached_values[value_index] * inv_rms * weight[column];
+            }
+        }
+    } else {
+        for (std::size_t column = threadIdx.x; column < hidden_size;
+             column += blockDim.x) {
+            const std::size_t index = row_offset + column;
+            norm_out[index] = residual_out[index] * inv_rms * weight[column];
+        }
     }
 }
 
@@ -74,15 +109,15 @@ cudaError_t residual_rmsnorm_cuda_fp32(
     const float* hidden,
     const float* residual,
     const float* weight,
-    float* residual_out,
     float* norm_out,
+    float* residual_out,
     const std::size_t num_rows,
     const std::size_t hidden_size,
     const float epsilon,
     cudaStream_t stream) {
     if (hidden == nullptr || residual == nullptr || weight == nullptr ||
-        residual_out == nullptr || norm_out == nullptr || num_rows == 0 ||
-        hidden_size == 0 || epsilon < 0.0F) {
+        norm_out == nullptr || residual_out == nullptr || num_rows == 0 ||
+        hidden_size == 0 || !std::isfinite(epsilon) || epsilon < 0.0F) {
         return cudaErrorInvalidValue;
     }
     if (num_rows > std::numeric_limits<unsigned int>::max() ||
@@ -90,15 +125,27 @@ cudaError_t residual_rmsnorm_cuda_fp32(
         return cudaErrorInvalidValue;
     }
 
-    residual_rmsnorm_cuda_fp32_kernel<<<
-        static_cast<unsigned int>(num_rows), kBlockSize, 0, stream>>>(
-        hidden,
-        residual,
-        weight,
-        residual_out,
-        norm_out,
-        hidden_size,
-        epsilon);
+    if (hidden_size == 576) {
+        residual_rmsnorm_cuda_fp32_kernel<3><<<
+            static_cast<unsigned int>(num_rows), kBlockSize, 0, stream>>>(
+            hidden,
+            residual,
+            weight,
+            norm_out,
+            residual_out,
+            hidden_size,
+            epsilon);
+    } else {
+        residual_rmsnorm_cuda_fp32_kernel<0><<<
+            static_cast<unsigned int>(num_rows), kBlockSize, 0, stream>>>(
+            hidden,
+            residual,
+            weight,
+            norm_out,
+            residual_out,
+            hidden_size,
+            epsilon);
+    }
     return cudaGetLastError();
 }
 

@@ -84,12 +84,12 @@ std::tuple<at::Tensor, at::Tensor> residual_rmsnorm_cpu(
         contiguous_hidden.const_data_ptr<float>(),
         contiguous_residual.const_data_ptr<float>(),
         contiguous_weight.const_data_ptr<float>(),
-        residual_out.mutable_data_ptr<float>(),
         norm_out.mutable_data_ptr<float>(),
+        residual_out.mutable_data_ptr<float>(),
         num_rows,
         hidden_size,
         static_cast<float>(epsilon));
-    return {residual_out, norm_out};
+    return {norm_out, residual_out};
 }
 
 std::tuple<at::Tensor, at::Tensor> residual_rmsnorm_cuda(
@@ -118,13 +118,13 @@ std::tuple<at::Tensor, at::Tensor> residual_rmsnorm_cuda(
         contiguous_hidden.const_data_ptr<float>(),
         contiguous_residual.const_data_ptr<float>(),
         contiguous_weight.const_data_ptr<float>(),
-        residual_out.mutable_data_ptr<float>(),
         norm_out.mutable_data_ptr<float>(),
+        residual_out.mutable_data_ptr<float>(),
         num_rows,
         hidden_size,
         static_cast<float>(epsilon),
         stream.stream()));
-    return {residual_out, norm_out};
+    return {norm_out, residual_out};
 }
 
 }  // namespace
@@ -133,7 +133,7 @@ std::tuple<at::Tensor, at::Tensor> residual_rmsnorm_cuda(
 TORCH_LIBRARY_FRAGMENT(flux, library) {
     library.def(
         "residual_rmsnorm(Tensor hidden, Tensor residual, Tensor weight, "
-        "float epsilon) -> (Tensor, Tensor)");
+        "float epsilon) -> (Tensor norm_out, Tensor residual_out)");
 }
 
 TORCH_LIBRARY_IMPL(flux, CPU, library) {

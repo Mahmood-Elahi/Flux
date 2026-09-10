@@ -128,8 +128,8 @@ Outputs run_case(
         hidden.data(),
         residual.data(),
         weight.data(),
-        actual.residual.data(),
         actual.norm.data(),
+        actual.residual.data(),
         num_rows,
         hidden_size,
         epsilon);
@@ -152,8 +152,8 @@ void test_hand_verifiable_one_row() {
         hidden.data(),
         residual.data(),
         weight.data(),
-        output.residual.data(),
         output.norm.data(),
+        output.residual.data(),
         1,
         2,
         0.0F);
@@ -177,8 +177,8 @@ void test_output_bounds() {
         hidden.data(),
         residual.data(),
         weight.data(),
-        residual_out.data() + 1,
         norm_out.data() + 1,
+        residual_out.data() + 1,
         2,
         3,
         1.0e-5F);
@@ -230,11 +230,11 @@ void test_deterministic() {
     Outputs second{std::vector<float>(hidden.size()), std::vector<float>(hidden.size())};
 
     flux::residual_rmsnorm_fp32(
-        hidden.data(), residual.data(), weight.data(), first.residual.data(),
-        first.norm.data(), num_rows, hidden_size, 1.0e-5F);
+        hidden.data(), residual.data(), weight.data(), first.norm.data(),
+        first.residual.data(), num_rows, hidden_size, 1.0e-5F);
     flux::residual_rmsnorm_fp32(
-        hidden.data(), residual.data(), weight.data(), second.residual.data(),
-        second.norm.data(), num_rows, hidden_size, 1.0e-5F);
+        hidden.data(), residual.data(), weight.data(), second.norm.data(),
+        second.residual.data(), num_rows, hidden_size, 1.0e-5F);
 
     expect_true(
         std::memcmp(
@@ -254,8 +254,8 @@ void expect_invalid_argument(
     const float* hidden,
     const float* residual,
     const float* weight,
-    float* residual_out,
     float* norm_out,
+    float* residual_out,
     const std::size_t num_rows,
     const std::size_t hidden_size,
     const float epsilon,
@@ -265,8 +265,8 @@ void expect_invalid_argument(
             hidden,
             residual,
             weight,
-            residual_out,
             norm_out,
+            residual_out,
             num_rows,
             hidden_size,
             epsilon);
@@ -293,10 +293,10 @@ void test_validation() {
         "null weight was accepted");
     expect_invalid_argument(
         &input, &input, &input, nullptr, &output, 1, 1, 0.0F,
-        "null residual output was accepted");
+        "null normalized output was accepted");
     expect_invalid_argument(
         &input, &input, &input, &output, nullptr, 1, 1, 0.0F,
-        "null normalized output was accepted");
+        "null residual output was accepted");
     expect_invalid_argument(
         &input, &input, &input, &output, &output, 0, 1, 0.0F,
         "zero rows was accepted");
@@ -306,6 +306,26 @@ void test_validation() {
     expect_invalid_argument(
         &input, &input, &input, &output, &output, 1, 1, -1.0e-5F,
         "negative epsilon was accepted");
+    expect_invalid_argument(
+        &input,
+        &input,
+        &input,
+        &output,
+        &output,
+        1,
+        1,
+        std::numeric_limits<float>::quiet_NaN(),
+        "NaN epsilon was accepted");
+    expect_invalid_argument(
+        &input,
+        &input,
+        &input,
+        &output,
+        &output,
+        1,
+        1,
+        std::numeric_limits<float>::infinity(),
+        "infinite epsilon was accepted");
     expect_invalid_argument(
         &input, &input, &input, &output, &output, too_many_rows, 2, 0.0F,
         "overflowing element count was accepted");

@@ -1,6 +1,7 @@
 #include "residual_rmsnorm.h"
 
 #include <cerrno>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
@@ -30,8 +31,9 @@ float parse_epsilon(const char* text) {
     char* end = nullptr;
     errno = 0;
     const float value = std::strtof(text, &end);
-    if (errno != 0 || end == text || *end != '\0' || value < 0.0F) {
-        throw std::invalid_argument("epsilon must be a non-negative float");
+    if (errno != 0 || end == text || *end != '\0' || !std::isfinite(value) ||
+        value < 0.0F) {
+        throw std::invalid_argument("epsilon must be a non-negative finite float");
     }
     return value;
 }
@@ -101,8 +103,8 @@ int main(int argc, char** argv) {
             hidden.data(),
             residual.data(),
             weight.data(),
-            residual_out.data(),
             norm_out.data(),
+            residual_out.data(),
             num_rows,
             hidden_size,
             epsilon);
@@ -111,8 +113,8 @@ int main(int argc, char** argv) {
         if (!output_stream) {
             throw std::runtime_error("could not open output file");
         }
-        write_exact(output_stream, residual_out.data(), residual_out.size());
         write_exact(output_stream, norm_out.data(), norm_out.size());
+        write_exact(output_stream, residual_out.data(), residual_out.size());
     } catch (const std::exception& error) {
         std::cerr << "residual_rmsnorm_cli: " << error.what() << '\n';
         return 1;

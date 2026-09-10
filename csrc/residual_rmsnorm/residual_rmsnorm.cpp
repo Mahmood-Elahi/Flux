@@ -10,15 +10,15 @@ void residual_rmsnorm_fp32(
     const float* hidden,
     const float* residual,
     const float* weight,
-    float* residual_out,
     float* norm_out,
+    float* residual_out,
     const std::size_t num_rows,
     const std::size_t hidden_size,
     const float epsilon) {
     if (hidden == nullptr || residual == nullptr || weight == nullptr ||
-        residual_out == nullptr || norm_out == nullptr) {
+        norm_out == nullptr || residual_out == nullptr) {
         throw std::invalid_argument(
-            "hidden, residual, weight, residual_out, and norm_out must not be null");
+            "hidden, residual, weight, norm_out, and residual_out must not be null");
     }
     if (num_rows == 0) {
         throw std::invalid_argument("num_rows must be positive");
@@ -29,8 +29,8 @@ void residual_rmsnorm_fp32(
     if (num_rows > std::numeric_limits<std::size_t>::max() / hidden_size) {
         throw std::invalid_argument("num_rows * hidden_size overflows size_t");
     }
-    if (epsilon < 0.0F) {
-        throw std::invalid_argument("epsilon must be non-negative");
+    if (!std::isfinite(epsilon) || epsilon < 0.0F) {
+        throw std::invalid_argument("epsilon must be non-negative and finite");
     }
 
     const float hidden_size_as_float = static_cast<float>(hidden_size);

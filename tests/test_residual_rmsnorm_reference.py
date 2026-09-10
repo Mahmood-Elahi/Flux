@@ -20,7 +20,7 @@ def _manual_residual_rmsnorm(
     residual_out = hidden + residual
     mean_square = residual_out.pow(2).mean(dim=-1, keepdim=True)
     norm_out = weight * residual_out * torch.rsqrt(mean_square + eps)
-    return residual_out, norm_out
+    return norm_out, residual_out
 
 
 def _nontrivial_weight(hidden_size: int) -> torch.Tensor:
@@ -36,10 +36,10 @@ def test_matches_independent_reference_across_shapes(
     residual = torch.randn(shape, dtype=torch.float32)
     weight = _nontrivial_weight(shape[-1])
 
-    actual_residual, actual_norm = residual_rmsnorm(
+    actual_norm, actual_residual = residual_rmsnorm(
         hidden, residual, weight, SMOLLM2_EPS
     )
-    expected_residual, expected_norm = _manual_residual_rmsnorm(
+    expected_norm, expected_residual = _manual_residual_rmsnorm(
         hidden, residual, weight, SMOLLM2_EPS
     )
 
@@ -51,12 +51,12 @@ def test_matches_independent_reference_across_shapes(
     torch.testing.assert_close(actual_norm, expected_norm, rtol=RTOL, atol=ATOL)
 
 
-def test_preserves_unnormalized_residual_as_first_output() -> None:
+def test_returns_normalized_then_unnormalized_residual() -> None:
     hidden = torch.tensor([[1.0, 2.0, 4.0]], dtype=torch.float32)
     residual = torch.tensor([[0.5, -0.5, 1.0]], dtype=torch.float32)
     weight = torch.tensor([0.5, 1.0, 2.0], dtype=torch.float32)
 
-    residual_out, norm_out = residual_rmsnorm(
+    norm_out, residual_out = residual_rmsnorm(
         hidden, residual, weight, SMOLLM2_EPS
     )
 
@@ -74,8 +74,8 @@ def test_supports_arbitrary_hidden_sizes(hidden_size: int) -> None:
     actual = residual_rmsnorm(hidden, residual, weight, SMOLLM2_EPS)
     expected = _manual_residual_rmsnorm(hidden, residual, weight, SMOLLM2_EPS)
 
-    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], expected[1], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[0], expected[0], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("eps", [0.0, 1e-6, SMOLLM2_EPS, 1e-3])
@@ -88,8 +88,8 @@ def test_supports_non_negative_epsilon_values(eps: float) -> None:
     actual = residual_rmsnorm(hidden, residual, weight, eps)
     expected = _manual_residual_rmsnorm(hidden, residual, weight, eps)
 
-    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], expected[1], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[0], expected[0], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
 def test_does_not_modify_inputs() -> None:
@@ -126,12 +126,12 @@ def test_gradients_from_both_outputs_match_manual_expression() -> None:
     actual_gradients = torch.autograd.grad(
         actual_outputs,
         (hidden, residual, weight),
-        grad_outputs=(residual_grad, norm_grad),
+        grad_outputs=(norm_grad, residual_grad),
     )
     expected_gradients = torch.autograd.grad(
         expected_outputs,
         (reference_hidden, reference_residual, reference_weight),
-        grad_outputs=(residual_grad, norm_grad),
+        grad_outputs=(norm_grad, residual_grad),
     )
 
     for actual, expected in zip(actual_gradients, expected_gradients, strict=True):
@@ -150,8 +150,8 @@ def test_supports_non_contiguous_inputs() -> None:
     actual = residual_rmsnorm(hidden, residual, weight, SMOLLM2_EPS)
     expected = _manual_residual_rmsnorm(hidden, residual, weight, SMOLLM2_EPS)
 
-    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], expected[1], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[0], expected[0], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -223,4 +223,12 @@ def test_rejects_negative_epsilon() -> None:
     with pytest.raises(ValueError, match="non-negative"):
         residual_rmsnorm(
             torch.ones(2, 3), torch.ones(2, 3), torch.ones(3), -1e-5
+        )
+
+
+@pytest.mark.parametrize("eps", [float("nan"), float("inf")])
+def test_rejects_non_finite_epsilon(eps: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        residual_rmsnorm(
+            torch.ones(2, 3), torch.ones(2, 3), torch.ones(3), eps
         )

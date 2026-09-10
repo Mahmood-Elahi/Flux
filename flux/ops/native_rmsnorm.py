@@ -171,7 +171,7 @@ def residual_rmsnorm_native(
     weight: torch.Tensor,
     epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the inference-only native fused residual RMSNorm operator.
+    """Return ``(norm_out, residual_out)`` from fused residual RMSNorm.
 
     The C++ wrappers make all inputs contiguous when necessary, allocate two
     distinct contiguous outputs, and do not perform dtype conversion.

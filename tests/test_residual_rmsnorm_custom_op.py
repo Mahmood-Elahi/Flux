@@ -71,11 +71,11 @@ def test_matches_reference_across_shapes(
     device: str, shape: tuple[int, ...]
 ) -> None:
     hidden, residual, weight = _inputs(shape, device)
-    expected_residual, expected_norm = residual_rmsnorm(
+    expected_norm, expected_residual = residual_rmsnorm(
         hidden, residual, weight, EPSILON
     )
 
-    actual_residual, actual_norm = residual_rmsnorm_native(
+    actual_norm, actual_residual = residual_rmsnorm_native(
         hidden, residual, weight, EPSILON
     )
 
@@ -100,8 +100,8 @@ def test_matches_reference_across_epsilon_values(
     actual = residual_rmsnorm_native(hidden, residual, weight, epsilon)
     expected = residual_rmsnorm(hidden, residual, weight, epsilon)
 
-    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], expected[1], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[0], expected[0], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("device", _devices())
@@ -111,7 +111,7 @@ def test_allocates_distinct_outputs_without_modifying_inputs(device: str) -> Non
     residual_before = residual.clone()
     weight_before = weight.clone()
 
-    residual_out, norm_out = residual_rmsnorm_native(
+    norm_out, residual_out = residual_rmsnorm_native(
         hidden, residual, weight, EPSILON
     )
 
@@ -141,8 +141,8 @@ def test_internally_makes_all_inputs_contiguous(device: str) -> None:
 
     assert actual[0].is_contiguous()
     assert actual[1].is_contiguous()
-    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], expected[1], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[0], expected[0], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("device", _devices())
@@ -254,8 +254,8 @@ def test_inference_mode_accepts_parameters_that_require_grad() -> None:
     assert not actual[0].requires_grad
     assert not actual[1].requires_grad
     expected = residual_rmsnorm(hidden, residual, weight, EPSILON)
-    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(actual[1], expected[1], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[0], expected[0], rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -276,7 +276,7 @@ def test_uses_current_non_default_cuda_stream_for_producer_and_consumer() -> Non
         hidden.copy_(hidden_values)
         residual.copy_(residual_values)
         weight.copy_(weight_values)
-        residual_out, norm_out = residual_rmsnorm_native(
+        norm_out, residual_out = residual_rmsnorm_native(
             hidden, residual, weight, EPSILON
         )
         consumed_residual = residual_out + 0.0
@@ -284,10 +284,10 @@ def test_uses_current_non_default_cuda_stream_for_producer_and_consumer() -> Non
 
     stream.synchronize()
     torch.testing.assert_close(
-        consumed_residual.cpu(), expected[0], rtol=0, atol=0
+        consumed_residual.cpu(), expected[1], rtol=0, atol=0
     )
     torch.testing.assert_close(
-        consumed_norm.cpu(), expected[1], rtol=RTOL, atol=ATOL
+        consumed_norm.cpu(), expected[0], rtol=RTOL, atol=ATOL
     )
 
 
@@ -298,7 +298,7 @@ def test_fake_tensor_returns_two_distinct_contiguous_outputs() -> None:
         residual = torch.empty_like(hidden)
         weight = torch.empty(576, dtype=torch.float32)
 
-        residual_out, norm_out = residual_rmsnorm_native(
+        norm_out, residual_out = residual_rmsnorm_native(
             hidden, residual, weight, EPSILON
         )
 

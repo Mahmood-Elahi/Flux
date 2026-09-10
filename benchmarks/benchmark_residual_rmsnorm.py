@@ -224,7 +224,7 @@ def _pytorch_residual_rmsnorm(
         weight=weight,
         eps=EPSILON,
     )
-    return residual_out, norm_out
+    return norm_out, residual_out
 
 
 def _make_inputs(
@@ -241,10 +241,10 @@ def _check_correctness(
     residual: torch.Tensor,
     weight: torch.Tensor,
 ) -> None:
-    expected_residual, expected_norm = _pytorch_residual_rmsnorm(
+    expected_norm, expected_residual = _pytorch_residual_rmsnorm(
         hidden, residual, weight
     )
-    actual_residual, actual_norm = residual_rmsnorm_native(
+    actual_norm, actual_residual = residual_rmsnorm_native(
         hidden, residual, weight, EPSILON
     )
     torch.testing.assert_close(actual_residual, expected_residual, rtol=0, atol=0)
