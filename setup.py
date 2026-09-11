@@ -32,6 +32,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
     rmsnorm_dir = ROOT / "csrc" / "rmsnorm"
     residual_rmsnorm_dir = ROOT / "csrc" / "residual_rmsnorm"
     softmax_dir = ROOT / "csrc" / "softmax"
+    attention_score_softmax_dir = ROOT / "csrc" / "attention_score_softmax"
     extension = CUDAExtension(
         name="flux._C",
         sources=[
@@ -44,8 +45,15 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(softmax_dir / "softmax_torch.cpp"),
             str(softmax_dir / "softmax.cpp"),
             str(softmax_dir / "softmax_cuda.cu"),
+            str(attention_score_softmax_dir / "attention_score_softmax_torch.cpp"),
+            str(attention_score_softmax_dir / "attention_score_softmax.cpp"),
         ],
-        include_dirs=[str(rmsnorm_dir), str(residual_rmsnorm_dir), str(softmax_dir)],
+        include_dirs=[
+            str(rmsnorm_dir),
+            str(residual_rmsnorm_dir),
+            str(softmax_dir),
+            str(attention_score_softmax_dir),
+        ],
         extra_compile_args={
             "cxx": ["/W4", "/permissive-"],
             "nvcc": [

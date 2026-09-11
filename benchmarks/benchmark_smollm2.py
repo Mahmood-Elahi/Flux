@@ -31,6 +31,7 @@ from transformers import DynamicCache
 from flux.model.smollm2 import MODEL_ID, MODEL_REVISION, load_model
 from flux.model.smollm2_flux import enable_flux_ops, flux_operator_counts
 from flux.ops import (
+    native_attention_score_softmax_is_available,
     native_residual_rmsnorm_is_available,
     native_rmsnorm_is_available,
     native_softmax_is_available,
@@ -546,6 +547,7 @@ def _profile_components(profiler: Any) -> dict[str, float]:
         "QK matmul": 0.0,
         "attention mask/elementwise": 0.0,
         "softmax": 0.0,
+        "fused score post-processing": 0.0,
         "P@V matmul": 0.0,
         "output projection": 0.0,
         "MLP gate/up projections": 0.0,
@@ -589,6 +591,8 @@ def _profile_components(profiler: Any) -> dict[str, float]:
                 totals_us["P@V matmul"] += duration
         elif event.name in {"aten::_softmax", "flux::softmax"}:
             totals_us["softmax"] += duration
+        elif event.name == "flux::attention_score_softmax":
+            totals_us["fused score post-processing"] += duration
         elif event.name == "aten::rms_norm" or event.name == "flux::rmsnorm":
             totals_us["RMSNorm"] += duration
         elif event.name == "flux::residual_rmsnorm":
@@ -658,7 +662,12 @@ def _profile_operation(
     ) / 1000.0
     components = _profile_components(profiler)
     averages = {event.key: event for event in profiler.key_averages()}
-    custom_names = ("flux::rmsnorm", "flux::residual_rmsnorm", "flux::softmax")
+    custom_names = (
+        "flux::rmsnorm",
+        "flux::residual_rmsnorm",
+        "flux::softmax",
+        "flux::attention_score_softmax",
+    )
     custom_counts = {
         name: int(averages[name].count) if name in averages else 0 for name in custom_names
     }
@@ -797,6 +806,7 @@ def _print_profiles(results: Sequence[ProfileResult]) -> None:
                 "QK matmul",
                 "attention mask/elementwise",
                 "softmax",
+                "fused score post-processing",
                 "P@V matmul",
                 "output projection",
                 "RoPE (excluding cat)",
@@ -818,7 +828,12 @@ def _print_profiles(results: Sequence[ProfileResult]) -> None:
         )
         if result.path == "Flux":
             print("  Flux custom operators:")
-            for name in ("flux::rmsnorm", "flux::residual_rmsnorm", "flux::softmax"):
+            for name in (
+                "flux::rmsnorm",
+                "flux::residual_rmsnorm",
+                "flux::softmax",
+                "flux::attention_score_softmax",
+            ):
                 count = result.custom_counts[name]
                 total_ms = result.custom_ms[name]
                 per_call_us = total_ms * 1000.0 / count if count else 0.0
@@ -838,9 +853,10 @@ def main() -> int:
             native_rmsnorm_is_available(),
             native_residual_rmsnorm_is_available(),
             native_softmax_is_available(),
+            native_attention_score_softmax_is_available(),
         )
     ):
-        raise RuntimeError("all three built Flux native operators are required")
+        raise RuntimeError("all built Flux native operators are required")
     _configure_runtime()
     _print_environment(args)
 

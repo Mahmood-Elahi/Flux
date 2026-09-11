@@ -10,6 +10,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from flux.model import smollm2_flux
 from flux.ops import (
+    native_attention_score_softmax_is_available,
     native_residual_rmsnorm_is_available,
     native_rmsnorm_is_available,
     native_softmax_is_available,
@@ -43,7 +44,12 @@ def _model(num_hidden_layers: int = 2) -> LlamaForCausalLM:
 @pytest.fixture
 def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Use exact Python formulations while exercising the model adapter."""
-    counts = {"rmsnorm": 0, "residual_rmsnorm": 0, "softmax": 0}
+    counts = {
+        "rmsnorm": 0,
+        "residual_rmsnorm": 0,
+        "softmax": 0,
+        "attention_score_softmax": 0,
+    }
 
     monkeypatch.setattr(smollm2_flux, "native_rmsnorm_is_available", lambda: True)
     monkeypatch.setattr(
@@ -52,6 +58,11 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         lambda: True,
     )
     monkeypatch.setattr(smollm2_flux, "native_softmax_is_available", lambda: True)
+    monkeypatch.setattr(
+        smollm2_flux,
+        "native_attention_score_softmax_is_available",
+        lambda: True,
+    )
 
     def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         counts["rmsnorm"] += 1
@@ -75,9 +86,26 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         counts["softmax"] += 1
         return torch.nn.functional.softmax(x, dim=-1, dtype=torch.float32)
 
+    def attention_score_softmax(
+        scores: torch.Tensor,
+        mask: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        counts["attention_score_softmax"] += 1
+        return torch.nn.functional.softmax(
+            scores * scale + mask,
+            dim=-1,
+            dtype=torch.float32,
+        )
+
     monkeypatch.setattr(smollm2_flux, "rms_norm_native", rmsnorm)
     monkeypatch.setattr(smollm2_flux, "residual_rmsnorm_native", residual_rmsnorm)
     monkeypatch.setattr(smollm2_flux, "softmax_native", softmax)
+    monkeypatch.setattr(
+        smollm2_flux,
+        "attention_score_softmax_native",
+        attention_score_softmax,
+    )
     return counts
 
 
@@ -139,7 +167,7 @@ def test_attention_preserves_causal_mask_gqa_rope_and_scale(
     assert torch.count_nonzero(actual_probs.triu(diagonal=1)) == 0
     torch.testing.assert_close(actual_probs, expected_probs, rtol=0, atol=0)
     torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
-    assert python_flux_ops["softmax"] == 1
+    assert python_flux_ops["attention_score_softmax"] == 1
 
 
 def test_decoder_layer_matches_reference(
@@ -171,7 +199,8 @@ def test_decoder_layer_matches_reference(
     assert python_flux_ops == {
         "rmsnorm": 1,
         "residual_rmsnorm": 1,
-        "softmax": 1,
+        "softmax": 0,
+        "attention_score_softmax": 1,
     }
 
 
@@ -218,7 +247,8 @@ def test_enable_flux_ops_preserves_parameters_and_invokes_every_operator(
     assert python_flux_ops == {
         "rmsnorm": 3,
         "residual_rmsnorm": 2,
-        "softmax": 2,
+        "softmax": 0,
+        "attention_score_softmax": 2,
     }
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -248,12 +278,33 @@ def test_enable_flux_ops_is_explicit_and_single_use(
 @pytest.mark.parametrize(
     ("operators", "expected_counts"),
     [
-        (("rmsnorm",), {"rmsnorm": 5, "residual_rmsnorm": 0, "softmax": 0}),
+        (
+            ("rmsnorm",),
+            {
+                "rmsnorm": 5,
+                "residual_rmsnorm": 0,
+                "softmax": 0,
+                "attention_score_softmax": 0,
+            },
+        ),
         (
             ("residual_rmsnorm",),
-            {"rmsnorm": 0, "residual_rmsnorm": 2, "softmax": 0},
+            {
+                "rmsnorm": 0,
+                "residual_rmsnorm": 2,
+                "softmax": 0,
+                "attention_score_softmax": 0,
+            },
         ),
-        (("softmax",), {"rmsnorm": 0, "residual_rmsnorm": 0, "softmax": 2}),
+        (
+            ("softmax",),
+            {
+                "rmsnorm": 0,
+                "residual_rmsnorm": 0,
+                "softmax": 0,
+                "attention_score_softmax": 2,
+            },
+        ),
     ],
 )
 def test_enable_flux_ops_can_select_operator_categories(
@@ -309,6 +360,7 @@ def test_greedy_generation_with_kv_cache_matches_reference(
     assert python_flux_ops["rmsnorm"] > 0
     assert python_flux_ops["residual_rmsnorm"] > 0
     assert python_flux_ops["softmax"] > 0
+    assert python_flux_ops["attention_score_softmax"] > 0
 
 
 def test_hidden_state_capture_survives_module_replacement(
@@ -335,7 +387,8 @@ def test_hidden_state_capture_survives_module_replacement(
 
 
 _NATIVE_OPS_AVAILABLE = (
-    native_rmsnorm_is_available()
+    native_attention_score_softmax_is_available()
+    and native_rmsnorm_is_available()
     and native_residual_rmsnorm_is_available()
     and native_softmax_is_available()
 )
@@ -369,3 +422,111 @@ def test_native_full_model_matches_reference(device: str) -> None:
         ).logits
 
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.skipif(
+    not _NATIVE_OPS_AVAILABLE,
+    reason="Flux native custom operators have not been built",
+)
+@pytest.mark.parametrize(
+    "device",
+    ["cpu"] + (["cuda"] if torch.cuda.is_available() else []),
+)
+def test_native_fused_attention_matches_current_flux_layer_and_model(
+    device: str,
+) -> None:
+    source = _model(2).to(device)
+    current = copy.deepcopy(source)
+    fused = copy.deepcopy(source)
+    smollm2_flux.enable_flux_ops(current, fuse_attention_scores=False)
+    smollm2_flux.enable_flux_ops(fused, fuse_attention_scores=True)
+    input_ids = torch.tensor([[0, 0, 1, 17, 42, 9, 3]], device=device)
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1]], device=device)
+
+    layer_input = torch.randn((1, 7, 32), device=device)
+    position_ids = torch.arange(7, device=device).unsqueeze(0)
+    position_embeddings = source.model.rotary_emb(layer_input, position_ids)
+    causal_mask = _causal_mask(7).to(device)
+    current_attention = current.model.layers[0].self_attn
+    fused_attention = fused.model.layers[0].self_attn
+    with torch.inference_mode():
+        current_layer, current_probs = current_attention(
+            layer_input,
+            position_embeddings=position_embeddings,
+            attention_mask=causal_mask,
+        )
+        fused_layer, fused_probs = fused_attention(
+            layer_input,
+            position_embeddings=position_embeddings,
+            attention_mask=causal_mask,
+        )
+        current_output = current(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+        fused_output = fused(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+
+    torch.testing.assert_close(fused_probs, current_probs, rtol=0, atol=0)
+    torch.testing.assert_close(fused_layer, current_layer, rtol=0, atol=0)
+    torch.testing.assert_close(
+        fused_output.logits,
+        current_output.logits,
+        rtol=0,
+        atol=0,
+    )
+    assert fused_output.past_key_values.get_seq_length() == input_ids.shape[1]
+    for fused_cache_layer, current_cache_layer in zip(
+        fused_output.past_key_values.layers,
+        current_output.past_key_values.layers,
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            fused_cache_layer.keys,
+            current_cache_layer.keys,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            fused_cache_layer.values,
+            current_cache_layer.values,
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.skipif(
+    not _NATIVE_OPS_AVAILABLE,
+    reason="Flux native custom operators have not been built",
+)
+@pytest.mark.parametrize(
+    "device",
+    ["cpu"] + (["cuda"] if torch.cuda.is_available() else []),
+)
+def test_native_fused_greedy_generation_matches_current_flux(device: str) -> None:
+    source = _model(2).to(device)
+    current = copy.deepcopy(source)
+    fused = copy.deepcopy(source)
+    smollm2_flux.enable_flux_ops(current, fuse_attention_scores=False)
+    smollm2_flux.enable_flux_ops(fused, fuse_attention_scores=True)
+    input_ids = torch.tensor([[1, 17, 42, 9]], device=device)
+
+    with torch.inference_mode():
+        expected = current.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=4,
+            use_cache=True,
+        )
+        actual = fused.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=4,
+            use_cache=True,
+        )
+
+    assert torch.equal(actual, expected)
