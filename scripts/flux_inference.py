@@ -10,6 +10,7 @@ from collections.abc import Callable
 import torch
 
 from flux.model.smollm2 import MODEL_ID, MODEL_REVISION, load_model, load_tokenizer
+from flux.model.smollm2_cuda_graph import cuda_graph_greedy_generate
 from flux.model.smollm2_flux import enable_flux_ops, flux_operator_counts
 
 
@@ -51,10 +52,21 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="also generate through the opt-in fixed-shape CUDA-Graph decode path",
+    )
+    parser.add_argument("--graph-warmup", type=int, default=3)
     args = parser.parse_args()
     if not args.prompt.strip():
         parser.error("--prompt must not be empty or whitespace")
-    if args.max_new_tokens < 1 or args.warmup < 0 or args.iterations < 1:
+    if (
+        args.max_new_tokens < 1
+        or args.warmup < 0
+        or args.iterations < 1
+        or args.graph_warmup < 0
+    ):
         parser.error("token and timing counts must be positive (warmup may be zero)")
 
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -106,6 +118,16 @@ def main() -> None:
             **inputs,
             **generation_kwargs,
         ).detach().cpu()
+        graph_tokens = None
+        if args.cuda_graph:
+            if device.type != "cuda":
+                parser.error("--cuda-graph requires a CUDA device")
+            graph_tokens = cuda_graph_greedy_generate(
+                model,
+                inputs["input_ids"],
+                max_new_tokens=args.max_new_tokens,
+                warmup_steps=args.graph_warmup,
+            ).detach().cpu()
         flux_ms = _latency_ms(
             full_forward,
             device,
@@ -137,6 +159,9 @@ def main() -> None:
     print(f"Greedy token IDs equal: {torch.equal(reference_tokens, flux_tokens)}")
     print(f"Reference token IDs: {reference_tokens[0].tolist()}")
     print(f"Flux token IDs: {flux_tokens[0].tolist()}")
+    if graph_tokens is not None:
+        print(f"CUDA-Graph greedy token IDs equal: {torch.equal(graph_tokens, flux_tokens)}")
+        print(f"CUDA-Graph token IDs: {graph_tokens[0].tolist()}")
     print(
         f"Reference full-forward latency ({args.iterations} iterations): "
         f"{reference_ms:.3f} ms"
