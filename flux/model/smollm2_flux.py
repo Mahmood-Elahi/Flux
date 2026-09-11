@@ -7,6 +7,7 @@ Hugging Face reference loader and global Transformers behavior untouched.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 import torch
@@ -28,6 +29,9 @@ from flux.ops import (
     rms_norm_native,
     softmax_native,
 )
+
+
+FLUX_OPERATOR_CATEGORIES = frozenset({"rmsnorm", "residual_rmsnorm", "softmax"})
 
 
 class FluxRMSNorm(LlamaRMSNorm):
@@ -121,15 +125,31 @@ class FluxLlamaAttention(LlamaAttention):
 class FluxLlamaDecoderLayer(LlamaDecoderLayer):
     """Llama decoder layer using Flux norm, residual-norm, and softmax ops."""
 
-    def __init__(self, source: LlamaDecoderLayer) -> None:
+    def __init__(
+        self,
+        source: LlamaDecoderLayer,
+        *,
+        use_rmsnorm: bool = True,
+        use_residual_rmsnorm: bool = True,
+        use_softmax: bool = True,
+    ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = source.hidden_size
-        self.self_attn = FluxLlamaAttention(source.self_attn)
-        self.mlp = source.mlp
-        self.input_layernorm = FluxRMSNorm(source.input_layernorm)
-        self.post_attention_layernorm = FluxRMSNorm(
-            source.post_attention_layernorm
+        self.self_attn = (
+            FluxLlamaAttention(source.self_attn) if use_softmax else source.self_attn
         )
+        self.mlp = source.mlp
+        self.input_layernorm = (
+            FluxRMSNorm(source.input_layernorm)
+            if use_rmsnorm
+            else source.input_layernorm
+        )
+        self.post_attention_layernorm = (
+            FluxRMSNorm(source.post_attention_layernorm)
+            if use_rmsnorm
+            else source.post_attention_layernorm
+        )
+        self.use_residual_rmsnorm = use_residual_rmsnorm
 
     def forward(
         self,
@@ -156,12 +176,16 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         # This is exactly the reference layer's post-attention addition followed
         # by post_attention_layernorm. Both outputs are needed: the normalized
         # value enters the MLP and the unnormalized sum is its residual.
-        hidden_states, residual = residual_rmsnorm_native(
-            attention_output,
-            residual,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.variance_epsilon,
-        )
+        if self.use_residual_rmsnorm:
+            hidden_states, residual = residual_rmsnorm_native(
+                attention_output,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            residual = residual + attention_output
+            hidden_states = self.post_attention_layernorm(residual)
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
 
@@ -189,13 +213,16 @@ def _check_model(model: nn.Module) -> LlamaForCausalLM:
     return model
 
 
-def _check_native_ops() -> None:
+def _check_native_ops(operators: frozenset[str]) -> None:
     missing = []
-    if not native_rmsnorm_is_available():
+    if "rmsnorm" in operators and not native_rmsnorm_is_available():
         missing.append("rmsnorm")
-    if not native_residual_rmsnorm_is_available():
+    if (
+        "residual_rmsnorm" in operators
+        and not native_residual_rmsnorm_is_available()
+    ):
         missing.append("residual_rmsnorm")
-    if not native_softmax_is_available():
+    if "softmax" in operators and not native_softmax_is_available():
         missing.append("softmax")
     if missing:
         raise RuntimeError(
@@ -205,26 +232,57 @@ def _check_native_ops() -> None:
         )
 
 
-def enable_flux_ops(model: nn.Module) -> LlamaForCausalLM:
+def enable_flux_ops(
+    model: nn.Module,
+    *,
+    operators: Collection[str] = FLUX_OPERATOR_CATEGORIES,
+) -> LlamaForCausalLM:
     """Replace supported modules on an evaluated FP32 Llama causal LM in place.
 
     The model retains its embeddings, projections, MLPs, RoPE module, causal
     mask construction, LM head, and cache machinery. Learned Parameters are
     reused rather than copied. The returned object is the same model instance.
     """
-    llama_model = _check_model(model)
-    _check_native_ops()
+    selected = frozenset(operators)
+    unknown = selected - FLUX_OPERATOR_CATEGORIES
+    if unknown:
+        raise ValueError(f"unknown Flux operator categories: {sorted(unknown)}")
+    if not selected:
+        raise ValueError("at least one Flux operator category must be selected")
 
-    llama_model.model.layers = nn.ModuleList(
-        [FluxLlamaDecoderLayer(layer) for layer in llama_model.model.layers]
-    )
-    llama_model.model.norm = FluxRMSNorm(llama_model.model.norm)
+    llama_model = _check_model(model)
+    _check_native_ops(selected)
+
+    if "residual_rmsnorm" in selected:
+        llama_model.model.layers = nn.ModuleList(
+            [
+                FluxLlamaDecoderLayer(
+                    layer,
+                    use_rmsnorm="rmsnorm" in selected,
+                    use_residual_rmsnorm=True,
+                    use_softmax="softmax" in selected,
+                )
+                for layer in llama_model.model.layers
+            ]
+        )
+    else:
+        for layer in llama_model.model.layers:
+            if "softmax" in selected:
+                layer.self_attn = FluxLlamaAttention(layer.self_attn)
+            if "rmsnorm" in selected:
+                layer.input_layernorm = FluxRMSNorm(layer.input_layernorm)
+                layer.post_attention_layernorm = FluxRMSNorm(
+                    layer.post_attention_layernorm
+                )
+    if "rmsnorm" in selected:
+        llama_model.model.norm = FluxRMSNorm(llama_model.model.norm)
     # Transformers installs output-capture hooks lazily on the original layer
     # instances. Force hook discovery to run again after module replacement.
     for module in (llama_model, llama_model.model):
         if hasattr(module, "_output_capturing_hooks_installed"):
             module._output_capturing_hooks_installed = False
     llama_model._flux_ops_enabled = True
+    llama_model._flux_operator_categories = tuple(sorted(selected))
     return llama_model
 
 
@@ -244,6 +302,7 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
 
 
 __all__ = [
+    "FLUX_OPERATOR_CATEGORIES",
     "FluxLlamaAttention",
     "FluxLlamaDecoderLayer",
     "FluxRMSNorm",

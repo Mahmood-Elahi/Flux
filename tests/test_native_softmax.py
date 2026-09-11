@@ -115,6 +115,40 @@ def test_numerical_properties(device: str, case: str) -> None:
     assert torch.all(torch.isfinite(actual))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("key_length", [512, 2048, 4096, 8192])
+def test_matches_torch_for_long_causal_attention_rows(key_length: int) -> None:
+    """Exercise model-shaped scores with Hugging Face's exact mask sentinel."""
+    prefix_lengths = sorted({1, 2, 8, key_length // 2, key_length - 1, key_length})
+    generator = torch.Generator(device="cuda").manual_seed(1234 + key_length)
+    query = torch.randn(
+        (1, 9, len(prefix_lengths), 64), generator=generator, device="cuda"
+    )
+    key = torch.randn((1, 9, key_length, 64), generator=generator, device="cuda")
+    scores = torch.matmul(query, key.transpose(2, 3)) * (64**-0.5)
+    columns = torch.arange(key_length, device="cuda")
+    prefix = torch.tensor(prefix_lengths, device="cuda").view(1, 1, -1, 1)
+    mask = torch.where(
+        columns.view(1, 1, 1, -1) < prefix,
+        torch.tensor(0.0, device="cuda"),
+        torch.tensor(torch.finfo(torch.float32).min, device="cuda"),
+    )
+    masked_scores = scores + mask
+
+    actual = softmax_native(masked_scores)
+    expected = torch.softmax(masked_scores, dim=-1)
+
+    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(
+        actual.sum(dim=-1),
+        torch.ones_like(actual[..., 0]),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+    for row, valid_prefix in enumerate(prefix_lengths):
+        assert torch.count_nonzero(actual[:, :, row, valid_prefix:]) == 0
+
+
 @pytest.mark.parametrize("device", _devices())
 def test_shift_invariance(device: str) -> None:
     input = _input((4, 129), device)

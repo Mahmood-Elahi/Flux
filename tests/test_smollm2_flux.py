@@ -245,6 +245,44 @@ def test_enable_flux_ops_is_explicit_and_single_use(
         smollm2_flux.enable_flux_ops(model)
 
 
+@pytest.mark.parametrize(
+    ("operators", "expected_counts"),
+    [
+        (("rmsnorm",), {"rmsnorm": 5, "residual_rmsnorm": 0, "softmax": 0}),
+        (
+            ("residual_rmsnorm",),
+            {"rmsnorm": 0, "residual_rmsnorm": 2, "softmax": 0},
+        ),
+        (("softmax",), {"rmsnorm": 0, "residual_rmsnorm": 0, "softmax": 2}),
+    ],
+)
+def test_enable_flux_ops_can_select_operator_categories(
+    python_flux_ops: dict[str, int],
+    operators: tuple[str, ...],
+    expected_counts: dict[str, int],
+) -> None:
+    model = _model(2)
+    reference = copy.deepcopy(model)
+    smollm2_flux.enable_flux_ops(model, operators=operators)
+    input_ids = torch.tensor([[1, 17, 42, 9, 3]])
+
+    with torch.inference_mode():
+        expected = reference(input_ids=input_ids, use_cache=False).logits
+        actual = model(input_ids=input_ids, use_cache=False).logits
+
+    assert python_flux_ops == expected_counts
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("operators", [(), ("unknown",)])
+def test_enable_flux_ops_rejects_invalid_operator_selection(
+    python_flux_ops: dict[str, int], operators: tuple[str, ...]
+) -> None:
+    model = _model(1)
+    with pytest.raises(ValueError, match="operator categor"):
+        smollm2_flux.enable_flux_ops(model, operators=operators)
+
+
 def test_greedy_generation_with_kv_cache_matches_reference(
     python_flux_ops: dict[str, int],
 ) -> None:
