@@ -2,9 +2,9 @@
 
 Flux is a long-term systems and machine-learning project for building a CUDA-accelerated transformer inference system around **SmolLM2-135M**. It uses Python, C++, CUDA C++, and PyTorch.
 
-Development begins with reproducible PyTorch reference inference and will progressively replace important transformer operations with custom native and CUDA implementations. The FP32 RMSNorm correctness oracle, standalone native implementations, PyTorch custom operator with CPU and CUDA dispatch, warp-reduced CUDA kernel, and performance benchmark are now implemented. Planned work includes fused residual + RMSNorm, attention softmax, profiling, and integration into the SmolLM2 inference path.
+Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, and attention softmax now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining Hugging Face projections, RoPE, masking, grouped-query attention, MLPs, and KV-cache management.
 
-The repository provides a Hugging Face / PyTorch SmolLM2-135M reference inference baseline and FP32 RMSNorm implementations in PyTorch, native C++, and CUDA. The native implementations are exposed as `torch.ops.flux.rmsnorm` through PyTorch's CPU and CUDA dispatch keys. Model-path integration has not yet been performed.
+The reference model remains unchanged as the numerical oracle. Call `enable_flux_ops(model)` explicitly on an evaluated FP32 `LlamaForCausalLM` to replace supported modules on that model instance; importing Flux never mutates a Hugging Face model or global Transformers behavior.
 
 ## Development setup
 
@@ -82,6 +82,21 @@ settings support repeatability in the same environment; bit-for-bit agreement
 is not guaranteed across GPUs, PyTorch/Transformers versions, CUDA versions,
 or dtypes. Lightweight tests use synthetic configurations and mocked loading
 boundaries and do not download model weights or tokenizers.
+
+## Flux-integrated inference
+
+With the native extension built, compare the pinned reference model with the
+integrated path on identical FP32 inputs:
+
+```bash
+python scripts/flux_inference.py
+```
+
+The script reports decoder-layer and full-logit differences, greedy token-ID
+equality with KV caching, installed Flux module counts, and a basic full-forward
+latency sanity check. The Flux attention path is deliberately explicit eager
+attention so that only softmax is replaced; it is not an optimized substitute
+for fused SDPA.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the planned progression toward the integrated system.
 

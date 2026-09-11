@@ -10,10 +10,10 @@ Flux is one continuous project progressing toward a single final outcome: an int
 6. **Completed:** Add CPU and CUDA custom-operator correctness tests against the PyTorch reference, including FakeTensor/opcheck and non-default CUDA stream coverage.
 7. **Completed:** Establish a reproducible pre-optimization CUDA RMSNorm benchmark against PyTorch's native RMSNorm on SmolLM2-relevant FP32 shapes.
 8. **Completed:** Optimize FP32 CUDA RMSNorm with a measured warp-level reduction, and evaluate aligned `float4` memory access; retain scalar access after the vector path regressed the largest benchmark workload.
-9. Implement dual-output fused residual + RMSNorm.
-10. Implement transformer attention softmax.
-11. Ensure all CUDA operators use the correct current CUDA stream.
-12. Integrate the custom operators into the SmolLM2 inference path.
+9. **Completed:** Implement dual-output fused residual + RMSNorm.
+10. **Completed:** Implement transformer attention softmax and perform two evidence-driven CUDA optimization rounds.
+11. **Completed:** Ensure all CUDA operators use the correct current CUDA stream.
+12. **Completed:** Integrate RMSNorm, post-attention fused residual + RMSNorm, and eager attention softmax into an optional FP32 SmolLM2 execution path, with layer, logits, generation, and KV-cache validation.
 13. Profile and benchmark the integrated system.
 14. Optimize measured bottlenecks.
 15. Reach the final integrated Flux inference system.
