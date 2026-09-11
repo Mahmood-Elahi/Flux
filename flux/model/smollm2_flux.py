@@ -25,15 +25,19 @@ from flux.ops import (
     attention_score_softmax_native,
     native_attention_score_softmax_is_available,
     native_residual_rmsnorm_is_available,
+    native_rope_is_available,
     native_rmsnorm_is_available,
     native_softmax_is_available,
     residual_rmsnorm_native,
     rms_norm_native,
+    rope_native,
     softmax_native,
 )
 
 
-FLUX_OPERATOR_CATEGORIES = frozenset({"rmsnorm", "residual_rmsnorm", "softmax"})
+FLUX_OPERATOR_CATEGORIES = frozenset(
+    {"rmsnorm", "residual_rmsnorm", "rope", "softmax"}
+)
 
 
 class FluxRMSNorm(LlamaRMSNorm):
@@ -61,6 +65,8 @@ class FluxLlamaAttention(LlamaAttention):
         self,
         source: LlamaAttention,
         *,
+        use_rope: bool = True,
+        use_softmax: bool = True,
         fuse_attention_scores: bool = True,
     ) -> None:
         nn.Module.__init__(self)
@@ -75,6 +81,8 @@ class FluxLlamaAttention(LlamaAttention):
         self.k_proj = source.k_proj
         self.v_proj = source.v_proj
         self.o_proj = source.o_proj
+        self.use_rope = use_rope
+        self.use_softmax = use_softmax
         self.fuse_attention_scores = fuse_attention_scores
 
     def forward(
@@ -96,12 +104,14 @@ class FluxLlamaAttention(LlamaAttention):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states,
-            key_states,
-            cos,
-            sin,
-        )
+        if self.use_rope:
+            query_states, key_states = rope_native(
+                query_states, key_states, cos, sin
+            )
+        else:
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(
@@ -122,7 +132,8 @@ class FluxLlamaAttention(LlamaAttention):
         # Prefill has a real additive mask and benefits from eliminating the
         # two full score-tensor intermediates produced by scale and add.
         if (
-            self.fuse_attention_scores
+            self.use_softmax
+            and self.fuse_attention_scores
             and attention_mask is not None
             and query_states.shape[-2] > 1
         ):
@@ -131,12 +142,24 @@ class FluxLlamaAttention(LlamaAttention):
                 attention_mask,
                 self.scaling,
             )
-        else:
+        elif self.use_softmax:
             attn_weights = attn_weights * self.scaling
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask
             attn_weights = softmax_native(attn_weights)
-        # Flux integration is inference-only, so dropout is intentionally absent.
+        else:
+            attn_weights = attn_weights * self.scaling
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            attn_weights = torch.nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(query_states.dtype)
+            attn_weights = torch.nn.functional.dropout(
+                attn_weights,
+                p=self.attention_dropout,
+                training=self.training,
+            )
+        # Flux integration is eval-only, so attention dropout is always inactive.
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -153,6 +176,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         *,
         use_rmsnorm: bool = True,
         use_residual_rmsnorm: bool = True,
+        use_rope: bool = True,
         use_softmax: bool = True,
         fuse_attention_scores: bool = True,
     ) -> None:
@@ -161,9 +185,11 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         self.self_attn = (
             FluxLlamaAttention(
                 source.self_attn,
+                use_rope=use_rope,
+                use_softmax=use_softmax,
                 fuse_attention_scores=fuse_attention_scores,
             )
-            if use_softmax
+            if use_softmax or use_rope
             else source.self_attn
         )
         self.mlp = source.mlp
@@ -256,6 +282,8 @@ def _check_native_ops(
         missing.append("residual_rmsnorm")
     if "softmax" in operators and not native_softmax_is_available():
         missing.append("softmax")
+    if "rope" in operators and not native_rope_is_available():
+        missing.append("rope")
     if (
         "softmax" in operators
         and fuse_attention_scores
@@ -305,6 +333,7 @@ def enable_flux_ops(
                     layer,
                     use_rmsnorm="rmsnorm" in selected,
                     use_residual_rmsnorm=True,
+                    use_rope="rope" in selected,
                     use_softmax="softmax" in selected,
                     fuse_attention_scores=fuse_attention_scores,
                 )
@@ -313,9 +342,11 @@ def enable_flux_ops(
         )
     else:
         for layer in llama_model.model.layers:
-            if "softmax" in selected:
+            if "softmax" in selected or "rope" in selected:
                 layer.self_attn = FluxLlamaAttention(
                     layer.self_attn,
+                    use_rope="rope" in selected,
+                    use_softmax="softmax" in selected,
                     fuse_attention_scores=fuse_attention_scores,
                 )
             if "rmsnorm" in selected:

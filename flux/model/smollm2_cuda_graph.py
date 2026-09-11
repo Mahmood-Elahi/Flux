@@ -215,10 +215,10 @@ class FluxCUDAGraphDecode:
             )
         required = {"rmsnorm", "residual_rmsnorm", "softmax"}
         selected = set(getattr(model, "_flux_operator_categories", ()))
-        if selected != required:
+        if not required.issubset(selected) or selected - required - {"rope"}:
             raise ValueError(
                 "Flux CUDA-Graph decode requires rmsnorm, residual_rmsnorm, "
-                "and softmax operators"
+                "and softmax operators, with optional rope"
             )
 
     @staticmethod

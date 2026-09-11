@@ -34,6 +34,7 @@ from flux.ops import (
     native_attention_score_softmax_is_available,
     native_residual_rmsnorm_is_available,
     native_rmsnorm_is_available,
+    native_rope_is_available,
     native_softmax_is_available,
 )
 
@@ -614,6 +615,8 @@ def _profile_components(profiler: Any) -> dict[str, float]:
             totals_us["SiLU/gating"] += duration
         elif event.name == "aten::add" and first and first[-1] == 576 and len(first) == 3:
             totals_us["residual adds"] += duration
+        elif event.name == "flux::rope":
+            totals_us["RoPE (excluding cat)"] += duration
         elif event.name == "aten::neg" and len(first) == 4 and first[-1] == 32:
             totals_us["RoPE (excluding cat)"] += duration
         elif (
@@ -667,6 +670,7 @@ def _profile_operation(
         "flux::residual_rmsnorm",
         "flux::softmax",
         "flux::attention_score_softmax",
+        "flux::rope",
     )
     custom_counts = {
         name: int(averages[name].count) if name in averages else 0 for name in custom_names
@@ -833,6 +837,7 @@ def _print_profiles(results: Sequence[ProfileResult]) -> None:
                 "flux::residual_rmsnorm",
                 "flux::softmax",
                 "flux::attention_score_softmax",
+                "flux::rope",
             ):
                 count = result.custom_counts[name]
                 total_ms = result.custom_ms[name]
@@ -852,6 +857,7 @@ def main() -> int:
         (
             native_rmsnorm_is_available(),
             native_residual_rmsnorm_is_available(),
+            native_rope_is_available(),
             native_softmax_is_available(),
             native_attention_score_softmax_is_available(),
         )

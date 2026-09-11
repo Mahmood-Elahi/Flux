@@ -38,7 +38,8 @@ VARIANTS: dict[str, tuple[str, ...]] = {
     "rmsnorm": ("rmsnorm",),
     "residual_rmsnorm": ("residual_rmsnorm",),
     "softmax": ("softmax",),
-    "all": ("rmsnorm", "residual_rmsnorm", "softmax"),
+    "rope": ("rope",),
+    "all": ("rmsnorm", "residual_rmsnorm", "rope", "softmax"),
 }
 
 

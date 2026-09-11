@@ -12,6 +12,7 @@ from flux.model import smollm2_flux
 from flux.ops import (
     native_attention_score_softmax_is_available,
     native_residual_rmsnorm_is_available,
+    native_rope_is_available,
     native_rmsnorm_is_available,
     native_softmax_is_available,
 )
@@ -49,6 +50,7 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         "residual_rmsnorm": 0,
         "softmax": 0,
         "attention_score_softmax": 0,
+        "rope": 0,
     }
 
     monkeypatch.setattr(smollm2_flux, "native_rmsnorm_is_available", lambda: True)
@@ -58,6 +60,7 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         lambda: True,
     )
     monkeypatch.setattr(smollm2_flux, "native_softmax_is_available", lambda: True)
+    monkeypatch.setattr(smollm2_flux, "native_rope_is_available", lambda: True)
     monkeypatch.setattr(
         smollm2_flux,
         "native_attention_score_softmax_is_available",
@@ -98,6 +101,15 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
             dtype=torch.float32,
         )
 
+    def rope(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        counts["rope"] += 1
+        return smollm2_flux.apply_rotary_pos_emb(query, key, cos, sin)
+
     monkeypatch.setattr(smollm2_flux, "rms_norm_native", rmsnorm)
     monkeypatch.setattr(smollm2_flux, "residual_rmsnorm_native", residual_rmsnorm)
     monkeypatch.setattr(smollm2_flux, "softmax_native", softmax)
@@ -106,6 +118,7 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         "attention_score_softmax_native",
         attention_score_softmax,
     )
+    monkeypatch.setattr(smollm2_flux, "rope_native", rope)
     return counts
 
 
@@ -168,6 +181,7 @@ def test_attention_preserves_causal_mask_gqa_rope_and_scale(
     torch.testing.assert_close(actual_probs, expected_probs, rtol=0, atol=0)
     torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
     assert python_flux_ops["attention_score_softmax"] == 1
+    assert python_flux_ops["rope"] == 1
 
 
 def test_decoder_layer_matches_reference(
@@ -201,6 +215,7 @@ def test_decoder_layer_matches_reference(
         "residual_rmsnorm": 1,
         "softmax": 0,
         "attention_score_softmax": 1,
+        "rope": 1,
     }
 
 
@@ -249,6 +264,7 @@ def test_enable_flux_ops_preserves_parameters_and_invokes_every_operator(
         "residual_rmsnorm": 2,
         "softmax": 0,
         "attention_score_softmax": 2,
+        "rope": 2,
     }
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -285,6 +301,7 @@ def test_enable_flux_ops_is_explicit_and_single_use(
                 "residual_rmsnorm": 0,
                 "softmax": 0,
                 "attention_score_softmax": 0,
+                "rope": 0,
             },
         ),
         (
@@ -294,6 +311,7 @@ def test_enable_flux_ops_is_explicit_and_single_use(
                 "residual_rmsnorm": 2,
                 "softmax": 0,
                 "attention_score_softmax": 0,
+                "rope": 0,
             },
         ),
         (
@@ -303,6 +321,17 @@ def test_enable_flux_ops_is_explicit_and_single_use(
                 "residual_rmsnorm": 0,
                 "softmax": 0,
                 "attention_score_softmax": 2,
+                "rope": 0,
+            },
+        ),
+        (
+            ("rope",),
+            {
+                "rmsnorm": 0,
+                "residual_rmsnorm": 0,
+                "softmax": 0,
+                "attention_score_softmax": 0,
+                "rope": 2,
             },
         ),
     ],
@@ -361,6 +390,7 @@ def test_greedy_generation_with_kv_cache_matches_reference(
     assert python_flux_ops["residual_rmsnorm"] > 0
     assert python_flux_ops["softmax"] > 0
     assert python_flux_ops["attention_score_softmax"] > 0
+    assert python_flux_ops["rope"] > 0
 
 
 def test_hidden_state_capture_survives_module_replacement(
@@ -390,6 +420,7 @@ _NATIVE_OPS_AVAILABLE = (
     native_attention_score_softmax_is_available()
     and native_rmsnorm_is_available()
     and native_residual_rmsnorm_is_available()
+    and native_rope_is_available()
     and native_softmax_is_available()
 )
 

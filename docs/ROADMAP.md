@@ -14,8 +14,9 @@ Flux is one continuous project progressing toward a single final outcome: an int
 10. **Completed:** Implement transformer attention softmax and perform two evidence-driven CUDA optimization rounds.
 11. **Completed:** Ensure all CUDA operators use the correct current CUDA stream.
 12. **Completed:** Integrate RMSNorm, post-attention fused residual + RMSNorm, and eager attention softmax into an optional FP32 SmolLM2 execution path, with layer, logits, generation, and KV-cache validation.
-13. Profile and benchmark the integrated system.
-14. Optimize measured bottlenecks.
-15. Reach the final integrated Flux inference system.
+13. **Completed:** Implement and integrate FP32 RoPE with CPU/CUDA dispatch, current-stream execution, GQA-aware Q/K rotation, positional-offset and cache-decode validation, and measured model-level gains.
+14. Profile and benchmark the integrated system.
+15. Optimize measured bottlenecks.
+16. Reach the final integrated Flux inference system.
 
 Each implementation and optimization milestone remains part of the same evolving codebase. Correctness against the reference path precedes performance work, and optimization decisions are driven by reproducible measurements.

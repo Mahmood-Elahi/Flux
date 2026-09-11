@@ -2,7 +2,7 @@
 
 Flux is a long-term systems and machine-learning project for building a CUDA-accelerated transformer inference system around **SmolLM2-135M**. It uses Python, C++, CUDA C++, and PyTorch.
 
-Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, attention softmax, and fused attention score post-processing now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining Hugging Face projections, RoPE, grouped-query attention, MLPs, and KV-cache management.
+Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, RoPE, attention softmax, and fused attention score post-processing now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining Hugging Face projections, grouped-query attention, MLPs, and KV-cache management.
 
 The reference model remains unchanged as the numerical oracle. Call `enable_flux_ops(model)` explicitly on an evaluated FP32 `LlamaForCausalLM` to replace supported modules on that model instance; importing Flux never mutates a Hugging Face model or global Transformers behavior.
 
@@ -94,12 +94,24 @@ python scripts/flux_inference.py
 
 The script reports decoder-layer and full-logit differences, greedy token-ID
 equality with KV caching, installed Flux module counts, and a basic full-forward
-latency sanity check. The Flux attention path remains explicit eager attention,
-but multi-token masked attention fuses score scaling, additive masking, and
+latency sanity check. The Flux attention path remains explicit eager attention.
+Its fused Q/K RoPE operator consumes the exact position-dependent cosine and
+sine tensors produced by Hugging Face, preserving position ids, offsets, and
+RoPE scaling. It reads non-contiguous projection views directly and supports
+SmolLM2's grouped-query head counts. Multi-token masked attention fuses score
+scaling, additive masking, and
 softmax after the QK matmul. Pass `fuse_attention_scores=False` to
 `enable_flux_ops` to retain the previous separate sequence for comparison. QK
 and P@V matmuls remain outside the operator; this is not a FlashAttention-style
 or fused-SDPA implementation.
+
+Validate the pinned model and benchmark RoPE in isolation and in integrated
+prefill/cached-decode paths with:
+
+```bash
+python scripts/validate_rope_model.py
+python benchmarks/benchmark_rope.py
+```
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the planned progression toward the integrated system.
 

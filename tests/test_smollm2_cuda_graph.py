@@ -15,6 +15,7 @@ from flux.model.smollm2_cuda_graph import (
 from flux.model.smollm2_flux import enable_flux_ops
 from flux.ops import (
     native_residual_rmsnorm_is_available,
+    native_rope_is_available,
     native_rmsnorm_is_available,
     native_softmax_is_available,
 )
@@ -60,6 +61,7 @@ _NATIVE_CUDA_AVAILABLE = (
     torch.cuda.is_available()
     and native_rmsnorm_is_available()
     and native_residual_rmsnorm_is_available()
+    and native_rope_is_available()
     and native_softmax_is_available()
 )
 
@@ -163,4 +165,3 @@ def test_eight_token_graph_greedy_continuation_matches_reference() -> None:
         )
 
     assert torch.equal(actual, expected)
-

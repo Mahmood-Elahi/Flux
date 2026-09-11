@@ -31,6 +31,7 @@ from flux.model.smollm2_flux import enable_flux_ops, flux_operator_counts
 from flux.ops import (
     native_residual_rmsnorm_is_available,
     native_rmsnorm_is_available,
+    native_rope_is_available,
     native_softmax_is_available,
 )
 
@@ -529,6 +530,7 @@ def main() -> int:
         (
             native_rmsnorm_is_available(),
             native_residual_rmsnorm_is_available(),
+            native_rope_is_available(),
             native_softmax_is_available(),
         )
     ):
