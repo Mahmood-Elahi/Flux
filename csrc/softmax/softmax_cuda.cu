@@ -9,11 +9,15 @@ namespace flux {
 namespace {
 
 constexpr unsigned int kWarpSize = 32;
+constexpr unsigned int kSmallBlockSize = 128;
 constexpr unsigned int kRegisterBlockSize = 256;
+constexpr unsigned int kWideBlockSize = 512;
 constexpr unsigned int kGenericBlockSize = 256;
 constexpr unsigned int kWarpsPerBlock = 4;
 constexpr std::size_t kWarpSoftmaxMaxWidth = 256;
 constexpr std::size_t kLargeRegisterWidth = 8192;
+constexpr std::size_t kHighRowCount = 512;
+constexpr std::size_t kLowRowCount = 64;
 
 __device__ float warp_reduce_max(float value) {
     for (unsigned int offset = kWarpSize / 2; offset > 0; offset /= 2) {
@@ -220,7 +224,11 @@ cudaError_t softmax_cuda_fp32(
         return cudaErrorInvalidValue;
     }
 
-    if (row_width <= kWarpSoftmaxMaxWidth) {
+    if (row_width == kWarpSoftmaxMaxWidth) {
+        register_softmax_cuda_fp32_kernel<2, kSmallBlockSize><<<
+            static_cast<unsigned int>(num_rows), kSmallBlockSize, 0, stream>>>(
+            input, output, row_width);
+    } else if (row_width < kWarpSoftmaxMaxWidth) {
         const unsigned int block_count = static_cast<unsigned int>(
             (num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
         if (row_width <= 32) {
@@ -240,7 +248,18 @@ cudaError_t softmax_cuda_fp32(
                 block_count, kWarpsPerBlock * kWarpSize, 0, stream>>>(
                 input, output, num_rows, row_width);
         }
-    } else if (row_width <= 512) {
+    } else if (row_width == 512) {
+        if (num_rows >= kHighRowCount) {
+            register_softmax_cuda_fp32_kernel<4, kSmallBlockSize><<<
+                static_cast<unsigned int>(num_rows), kSmallBlockSize, 0,
+                stream>>>(
+                input, output, row_width);
+        } else {
+            register_softmax_cuda_fp32_kernel<2, kRegisterBlockSize><<<
+                static_cast<unsigned int>(num_rows), kRegisterBlockSize, 0,
+                stream>>>(input, output, row_width);
+        }
+    } else if (row_width < 512) {
         register_softmax_cuda_fp32_kernel<2, kRegisterBlockSize><<<
             static_cast<unsigned int>(num_rows), kRegisterBlockSize, 0, stream>>>(
             input, output, row_width);
@@ -248,10 +267,25 @@ cudaError_t softmax_cuda_fp32(
         register_softmax_cuda_fp32_kernel<4, kRegisterBlockSize><<<
             static_cast<unsigned int>(num_rows), kRegisterBlockSize, 0, stream>>>(
             input, output, row_width);
-    } else if (row_width == kLargeRegisterWidth) {
-        register_softmax_cuda_fp32_kernel<32, kRegisterBlockSize><<<
-            static_cast<unsigned int>(num_rows), kRegisterBlockSize, 0, stream>>>(
+    } else if (row_width == 1024) {
+        register_softmax_cuda_fp32_kernel<8, kSmallBlockSize><<<
+            static_cast<unsigned int>(num_rows), kSmallBlockSize, 0, stream>>>(
             input, output, row_width);
+    } else if (row_width == 4096) {
+        register_softmax_cuda_fp32_kernel<8, kWideBlockSize><<<
+            static_cast<unsigned int>(num_rows), kWideBlockSize, 0, stream>>>(
+            input, output, row_width);
+    } else if (row_width == kLargeRegisterWidth) {
+        if (num_rows < kLowRowCount) {
+            register_softmax_cuda_fp32_kernel<16, kWideBlockSize><<<
+                static_cast<unsigned int>(num_rows), kWideBlockSize, 0,
+                stream>>>(
+                input, output, row_width);
+        } else {
+            register_softmax_cuda_fp32_kernel<32, kRegisterBlockSize><<<
+                static_cast<unsigned int>(num_rows), kRegisterBlockSize, 0,
+                stream>>>(input, output, row_width);
+        }
     } else {
         block_softmax_cuda_fp32_kernel<kGenericBlockSize><<<
             static_cast<unsigned int>(num_rows), kGenericBlockSize, 0, stream>>>(
