@@ -63,6 +63,11 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     monkeypatch.setattr(smollm2_flux, "native_rope_is_available", lambda: True)
     monkeypatch.setattr(
         smollm2_flux,
+        "native_packed_swiglu_is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        smollm2_flux,
         "native_attention_score_softmax_is_available",
         lambda: True,
     )
@@ -119,6 +124,12 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         attention_score_softmax,
     )
     monkeypatch.setattr(smollm2_flux, "rope_native", rope)
+    monkeypatch.setattr(
+        smollm2_flux,
+        "packed_swiglu_native",
+        lambda packed: torch.nn.functional.silu(packed.chunk(2, dim=-1)[0])
+        * packed.chunk(2, dim=-1)[1],
+    )
     return counts
 
 
@@ -293,6 +304,41 @@ def test_packed_mlp_layer_prefill_cache_decode_and_generation_match_reference(
     assert torch.equal(actual_tokens, expected_tokens)
     assert smollm2_flux.flux_operator_counts(packed)["packed_mlp_modules"] == 2
     assert python_flux_ops["attention_score_softmax"] > 0
+
+
+def test_packed_swiglu_is_separately_opt_in_and_matches_packed_mlp(
+    python_flux_ops: dict[str, int],
+) -> None:
+    source = _model(2)
+    packed = copy.deepcopy(source)
+    fused = copy.deepcopy(source)
+    packed_selection = {smollm2_flux.FLUX_PACKED_MLP_CATEGORY}
+    fused_selection = packed_selection | {
+        smollm2_flux.FLUX_PACKED_SWIGLU_CATEGORY
+    }
+    smollm2_flux.enable_flux_ops(packed, operators=packed_selection)
+    smollm2_flux.enable_flux_ops(fused, operators=fused_selection)
+    input_ids = torch.tensor([[1, 17, 42, 9, 3]])
+
+    with torch.inference_mode():
+        packed_logits = packed(input_ids=input_ids, use_cache=False).logits
+        fused_logits = fused(input_ids=input_ids, use_cache=False).logits
+
+    assert not packed.model.layers[0].mlp.use_packed_swiglu
+    assert fused.model.layers[0].mlp.use_packed_swiglu
+    assert not packed._flux_packed_swiglu_enabled
+    assert fused._flux_packed_swiglu_enabled
+    torch.testing.assert_close(fused_logits, packed_logits, rtol=0, atol=0)
+
+
+def test_packed_swiglu_requires_packed_mlp_category(
+    python_flux_ops: dict[str, int],
+) -> None:
+    with pytest.raises(ValueError, match="packed_swiglu.*requires.*mlp"):
+        smollm2_flux.enable_flux_ops(
+            _model(1),
+            operators=(smollm2_flux.FLUX_PACKED_SWIGLU_CATEGORY,),
+        )
 
 
 def test_rmsnorm_substitution_reuses_weight_and_matches_reference(

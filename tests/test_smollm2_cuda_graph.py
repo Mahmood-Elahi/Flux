@@ -14,6 +14,7 @@ from flux.model.smollm2_cuda_graph import (
 )
 from flux.model.smollm2_flux import FLUX_OPERATOR_CATEGORIES, enable_flux_ops
 from flux.ops import (
+    native_packed_swiglu_is_available,
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
     native_rmsnorm_is_available,
@@ -63,6 +64,7 @@ _NATIVE_CUDA_AVAILABLE = (
     and native_residual_rmsnorm_is_available()
     and native_rope_is_available()
     and native_softmax_is_available()
+    and native_packed_swiglu_is_available()
 )
 
 
@@ -70,15 +72,15 @@ _NATIVE_CUDA_AVAILABLE = (
     not _NATIVE_CUDA_AVAILABLE,
     reason="CUDA and all Flux native custom operators are required",
 )
-@pytest.mark.parametrize("packed_mlp", [False, True])
-def test_repeated_cuda_graph_decode_matches_eager_flux(packed_mlp: bool) -> None:
+@pytest.mark.parametrize("mlp_path", ["standard", "packed", "fused"])
+def test_repeated_cuda_graph_decode_matches_eager_flux(mlp_path: str) -> None:
     eager = _model().cuda()
     graph_model = copy.deepcopy(eager)
-    operators = (
-        FLUX_OPERATOR_CATEGORIES | {"mlp"}
-        if packed_mlp
-        else FLUX_OPERATOR_CATEGORIES
-    )
+    operators = FLUX_OPERATOR_CATEGORIES
+    if mlp_path in {"packed", "fused"}:
+        operators = operators | {"mlp"}
+    if mlp_path == "fused":
+        operators = operators | {"packed_swiglu"}
     enable_flux_ops(eager, operators=operators)
     enable_flux_ops(graph_model, operators=operators)
     prompt = torch.tensor([[1, 17, 42, 9, 3, 28, 11, 5]], device="cuda")

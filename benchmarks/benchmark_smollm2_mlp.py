@@ -1,14 +1,13 @@
-"""Validate and benchmark the opt-in packed SmolLM2 gate/up projection.
+"""Validate and benchmark packed projection and fused packed SwiGLU paths.
 
 Run from the repository root after building the native Flux extension:
 
     build/python3119/python.exe benchmarks/benchmark_smollm2_mlp.py
 
-The benchmark compares the established Flux model path against the same path
-with the ``mlp`` category enabled. Timed regions contain only the operation
-under test. CUDA-event samples alternate implementation order and report the
-median. Inputs, weight packing, cache cloning, and correctness checks remain
-outside timed regions.
+The benchmark preserves the established Flux/Hugging Face MLP, packed
+projection with PyTorch SwiGLU, and packed projection with Flux SwiGLU as
+separate paths. Timed regions contain only the operation under test.
+CUDA-event samples alternate implementation order and report the median.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 
 from benchmarks.benchmark_smollm2 import (
@@ -36,19 +36,23 @@ from flux.model.smollm2_cuda_graph import FluxCUDAGraphDecode
 from flux.model.smollm2_flux import (
     FLUX_OPERATOR_CATEGORIES,
     FLUX_PACKED_MLP_CATEGORY,
+    FLUX_PACKED_SWIGLU_CATEGORY,
     FluxPackedLlamaMLP,
     enable_flux_ops,
 )
 from flux.ops import (
     native_attention_score_softmax_is_available,
+    native_packed_swiglu_is_available,
     native_residual_rmsnorm_is_available,
     native_rmsnorm_is_available,
     native_rope_is_available,
     native_softmax_is_available,
+    packed_swiglu_native,
 )
 
 
 DEFAULT_LENGTHS = (128, 512, 1024, 2048, 4096)
+DEFAULT_SWIGLU_LENGTHS = (1, 128, 512, 1024, 2048, 4096)
 DEFAULT_DECODE_CONTEXTS = (128, 512, 1024, 2048, 4096)
 DEFAULT_WARMUP = 5
 DEFAULT_REPETITIONS = 30
@@ -74,12 +78,27 @@ class Comparison:
 
 
 @dataclass(frozen=True)
+class FusionComparison:
+    size: int
+    pytorch_ms: float
+    flux_ms: float
+    max_absolute_error: float
+    max_relative_error: float
+
+    @property
+    def speedup(self) -> float:
+        return self.pytorch_ms / self.flux_ms
+
+
+@dataclass(frozen=True)
 class LengthResult:
     projection: Comparison
     mlp: Comparison
     prefill: Comparison
     gate_max_absolute_error: float
     up_max_absolute_error: float
+    fused_mlp: FusionComparison
+    fused_prefill: FusionComparison
 
 
 @dataclass(frozen=True)
@@ -101,9 +120,19 @@ class MemoryResult:
 
 
 @dataclass(frozen=True)
+class ActivationMemoryResult:
+    length: int
+    theoretical_avoided_mib_per_layer: float
+    pytorch_peak_increment_mib: float
+    flux_peak_increment_mib: float
+
+
+@dataclass(frozen=True)
 class CorrectnessResult:
     layer_max_absolute_error: float
+    fused_layer_max_absolute_error: float
     greedy_equal: bool
+    fused_greedy_equal: bool
 
 
 @dataclass(frozen=True)
@@ -136,6 +165,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lengths", type=_parse_int_list, default=DEFAULT_LENGTHS)
     parser.add_argument(
+        "--swiglu-lengths",
+        type=_parse_int_list,
+        default=DEFAULT_SWIGLU_LENGTHS,
+    )
+    parser.add_argument(
         "--decode-contexts",
         type=_parse_int_list,
         default=DEFAULT_DECODE_CONTEXTS,
@@ -154,6 +188,7 @@ def _required_flux_ops_available() -> bool:
     return all(
         (
             native_attention_score_softmax_is_available(),
+            native_packed_swiglu_is_available(),
             native_residual_rmsnorm_is_available(),
             native_rmsnorm_is_available(),
             native_rope_is_available(),
@@ -200,7 +235,9 @@ def _assert_packed_logits_close(
     return maximum
 
 
-def _load_models() -> tuple[torch.nn.Module, torch.nn.Module, MemoryResult]:
+def _load_models() -> tuple[
+    torch.nn.Module, torch.nn.Module, torch.nn.Module, MemoryResult
+]:
     print("Loading established Flux model...", flush=True)
     separate = enable_flux_ops(load_model("cuda"))
     print("Loading packed-MLP candidate...", flush=True)
@@ -236,7 +273,10 @@ def _load_models() -> tuple[torch.nn.Module, torch.nn.Module, MemoryResult]:
         allocated_after / MIB,
         conversion_peak / MIB,
     )
-    return separate, packed, memory
+    print("Loading packed-MLP + fused-SwiGLU candidate...", flush=True)
+    fused_selection = selected | {FLUX_PACKED_SWIGLU_CATEGORY}
+    fused = enable_flux_ops(load_model("cuda"), operators=fused_selection)
+    return separate, packed, fused, memory
 
 
 def _capture_mlp_inputs(
@@ -297,16 +337,100 @@ def _repeat_mlps(
     return output
 
 
+def _pytorch_packed_swiglu(packed: torch.Tensor) -> torch.Tensor:
+    gate, up = packed.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+def _repeat_swiglu(packed: torch.Tensor, *, fused: bool) -> torch.Tensor:
+    operation = packed_swiglu_native if fused else _pytorch_packed_swiglu
+    output = operation(packed)
+    for _ in range(29):
+        output = operation(packed)
+    return output
+
+
+def _absolute_and_relative_errors(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> tuple[float, float]:
+    difference = (actual - expected).abs()
+    absolute = float(difference.max().item())
+    relative = float(
+        (difference / expected.abs().clamp_min(torch.finfo(torch.float32).tiny))
+        .max()
+        .item()
+    )
+    return absolute, relative
+
+
+def _benchmark_standalone_swiglu(
+    length: int,
+    warmup: int,
+    repetitions: int,
+) -> FusionComparison:
+    generator = torch.Generator(device="cuda").manual_seed(7000 + length)
+    packed = torch.randn(
+        (1, length, 3072),
+        generator=generator,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    expected = _pytorch_packed_swiglu(packed)
+    actual = packed_swiglu_native(packed)
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    absolute, relative = _absolute_and_relative_errors(actual, expected)
+    times = _event_latencies(
+        {
+            "PyTorch": lambda: _repeat_swiglu(packed, fused=False),
+            "Flux": lambda: _repeat_swiglu(packed, fused=True),
+        },
+        warmup,
+        repetitions,
+    )
+    del packed, expected, actual
+    return FusionComparison(length, times["PyTorch"], times["Flux"], absolute, relative)
+
+
+def _measure_activation_memory(length: int) -> ActivationMemoryResult:
+    packed = torch.empty((1, length, 3072), device="cuda", dtype=torch.float32)
+
+    def peak_increment(operation: Callable[[], torch.Tensor]) -> float:
+        torch.cuda.synchronize()
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        output = operation()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - baseline
+        del output
+        torch.cuda.synchronize()
+        return peak / MIB
+
+    pytorch_peak = peak_increment(lambda: _pytorch_packed_swiglu(packed))
+    flux_peak = peak_increment(lambda: packed_swiglu_native(packed))
+    theoretical = length * 1536 * torch.tensor([], dtype=torch.float32).element_size()
+    del packed
+    return ActivationMemoryResult(
+        length,
+        theoretical / MIB,
+        pytorch_peak,
+        flux_peak,
+    )
+
+
 def _maximum_projection_and_mlp_errors(
     separate_mlps: Sequence[torch.nn.Module],
     packed_mlps: Sequence[FluxPackedLlamaMLP],
+    fused_mlps: Sequence[FluxPackedLlamaMLP],
     inputs: Sequence[torch.Tensor],
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float, float]:
     gate_max = 0.0
     up_max = 0.0
     mlp_max = 0.0
-    for separate_mlp, packed_mlp, hidden_states in zip(
-        separate_mlps, packed_mlps, inputs, strict=True
+    fused_mlp_max = 0.0
+    fused_mlp_relative_max = 0.0
+    for separate_mlp, packed_mlp, fused_mlp, hidden_states in zip(
+        separate_mlps, packed_mlps, fused_mlps, inputs, strict=True
     ):
         expected_gate = separate_mlp.gate_proj(hidden_states)
         expected_up = separate_mlp.up_proj(hidden_states)
@@ -320,6 +444,7 @@ def _maximum_projection_and_mlp_errors(
         up_max = max(up_max, float((actual_up - expected_up).abs().max().item()))
         expected_mlp = separate_mlp(hidden_states)
         actual_mlp = packed_mlp(hidden_states)
+        actual_fused_mlp = fused_mlp(hidden_states)
         torch.testing.assert_close(actual_gate, expected_gate, rtol=2e-5, atol=2e-5)
         torch.testing.assert_close(actual_up, expected_up, rtol=2e-5, atol=2e-5)
         # Joining the two output-column groups can select a different cuBLAS
@@ -332,12 +457,24 @@ def _maximum_projection_and_mlp_errors(
             atol=MLP_ATOL,
         )
         mlp_max = max(mlp_max, float((actual_mlp - expected_mlp).abs().max().item()))
-    return gate_max, up_max, mlp_max
+        torch.testing.assert_close(
+            actual_fused_mlp,
+            actual_mlp,
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        absolute, relative = _absolute_and_relative_errors(
+            actual_fused_mlp, actual_mlp
+        )
+        fused_mlp_max = max(fused_mlp_max, absolute)
+        fused_mlp_relative_max = max(fused_mlp_relative_max, relative)
+    return gate_max, up_max, mlp_max, fused_mlp_max, fused_mlp_relative_max
 
 
 def _benchmark_length(
     separate: torch.nn.Module,
     packed: torch.nn.Module,
+    fused: torch.nn.Module,
     length: int,
     warmup: int,
     repetitions: int,
@@ -345,17 +482,27 @@ def _benchmark_length(
     input_ids = _input_ids(length, separate.config.vocab_size)
     separate_output = separate(input_ids=input_ids, use_cache=True)
     packed_output = packed(input_ids=input_ids, use_cache=True)
+    fused_output = fused(input_ids=input_ids, use_cache=True)
     logits_error = _assert_packed_logits_close(packed_output.logits, separate_output.logits)
+    fused_logits_error = _assert_packed_logits_close(
+        fused_output.logits, packed_output.logits
+    )
+    _, fused_logits_relative_error = _absolute_and_relative_errors(
+        fused_output.logits, packed_output.logits
+    )
     if separate_output.past_key_values.get_seq_length() != length:
         raise AssertionError("separate prefill cache has incorrect length")
     if packed_output.past_key_values.get_seq_length() != length:
         raise AssertionError("packed prefill cache has incorrect length")
-    del separate_output, packed_output
+    if fused_output.past_key_values.get_seq_length() != length:
+        raise AssertionError("fused prefill cache has incorrect length")
+    del separate_output, packed_output, fused_output
 
     prefill_times = _event_latencies(
         {
             "separate": lambda: separate(input_ids=input_ids, use_cache=True),
             "packed": lambda: packed(input_ids=input_ids, use_cache=True),
+            "fused": lambda: fused(input_ids=input_ids, use_cache=True),
         },
         warmup,
         repetitions,
@@ -364,10 +511,22 @@ def _benchmark_length(
     inputs = _capture_mlp_inputs(separate, input_ids)
     separate_mlps = tuple(layer.mlp for layer in separate.model.layers)
     packed_mlps = tuple(layer.mlp for layer in packed.model.layers)
+    fused_mlps = tuple(layer.mlp for layer in fused.model.layers)
     if not all(isinstance(mlp, FluxPackedLlamaMLP) for mlp in packed_mlps):
         raise AssertionError("packed candidate did not replace every MLP")
-    gate_error, up_error, mlp_error = _maximum_projection_and_mlp_errors(
-        separate_mlps, packed_mlps, inputs
+    if not all(
+        isinstance(mlp, FluxPackedLlamaMLP) and mlp.use_packed_swiglu
+        for mlp in fused_mlps
+    ):
+        raise AssertionError("fused candidate did not enable every packed SwiGLU")
+    (
+        gate_error,
+        up_error,
+        mlp_error,
+        fused_mlp_error,
+        fused_mlp_relative_error,
+    ) = _maximum_projection_and_mlp_errors(
+        separate_mlps, packed_mlps, fused_mlps, inputs
     )
     projection_times = _event_latencies(
         {
@@ -381,6 +540,7 @@ def _benchmark_length(
         {
             "separate": lambda: _repeat_mlps(separate_mlps, inputs),
             "packed": lambda: _repeat_mlps(packed_mlps, inputs),
+            "fused": lambda: _repeat_mlps(fused_mlps, inputs),
         },
         warmup,
         repetitions,
@@ -392,6 +552,20 @@ def _benchmark_length(
         Comparison(length, prefill_times["separate"], prefill_times["packed"], logits_error),
         gate_error,
         up_error,
+        FusionComparison(
+            length,
+            mlp_times["packed"],
+            mlp_times["fused"],
+            fused_mlp_error,
+            fused_mlp_relative_error,
+        ),
+        FusionComparison(
+            length,
+            prefill_times["packed"],
+            prefill_times["fused"],
+            fused_logits_error,
+            fused_logits_relative_error,
+        ),
     )
 
 
@@ -500,6 +674,7 @@ def _benchmark_graph_decode(
 def _layer_and_generation_correctness(
     separate: torch.nn.Module,
     packed: torch.nn.Module,
+    fused: torch.nn.Module,
 ) -> CorrectnessResult:
     input_ids = _input_ids(128, separate.config.vocab_size)
     captured: dict[str, torch.Tensor] = {}
@@ -512,24 +687,40 @@ def _layer_and_generation_correctness(
 
     separate_handle = separate.model.layers[0].register_forward_hook(capture("separate"))
     packed_handle = packed.model.layers[0].register_forward_hook(capture("packed"))
+    fused_handle = fused.model.layers[0].register_forward_hook(capture("fused"))
     try:
         separate_output = separate(input_ids=input_ids, use_cache=False)
         packed_output = packed(input_ids=input_ids, use_cache=False)
-        del separate_output, packed_output
+        fused_output = fused(input_ids=input_ids, use_cache=False)
+        del separate_output, packed_output, fused_output
     finally:
         separate_handle.remove()
         packed_handle.remove()
+        fused_handle.remove()
     torch.testing.assert_close(captured["packed"], captured["separate"], rtol=RTOL, atol=ATOL)
     layer_error = float((captured["packed"] - captured["separate"]).abs().max().item())
+    torch.testing.assert_close(captured["fused"], captured["packed"], rtol=2e-5, atol=2e-5)
+    fused_layer_error = float(
+        (captured["fused"] - captured["packed"]).abs().max().item()
+    )
 
     prompt = input_ids[:, :32]
     separate_tokens = separate.generate(prompt, do_sample=False, max_new_tokens=8, use_cache=True)
     packed_tokens = packed.generate(prompt, do_sample=False, max_new_tokens=8, use_cache=True)
+    fused_tokens = fused.generate(prompt, do_sample=False, max_new_tokens=8, use_cache=True)
     greedy_equal = bool(torch.equal(packed_tokens, separate_tokens))
     if not greedy_equal:
         raise AssertionError("packed MLP changed greedy generation token IDs")
-    del input_ids, prompt, separate_tokens, packed_tokens
-    return CorrectnessResult(layer_error, greedy_equal)
+    fused_greedy_equal = bool(torch.equal(fused_tokens, packed_tokens))
+    if not fused_greedy_equal:
+        raise AssertionError("fused packed SwiGLU changed greedy generation token IDs")
+    del input_ids, prompt, separate_tokens, packed_tokens, fused_tokens
+    return CorrectnessResult(
+        layer_error,
+        fused_layer_error,
+        greedy_equal,
+        fused_greedy_equal,
+    )
 
 
 def _profile_mlp(path: str, mlp: torch.nn.Module, hidden_states: torch.Tensor) -> list[ProfileRow]:
@@ -544,7 +735,15 @@ def _profile_mlp(path: str, mlp: torch.nn.Module, hidden_states: torch.Tensor) -
         output = mlp(hidden_states)
     torch.cuda.synchronize()
     del output
-    wanted = {"aten::linear", "aten::mm", "aten::silu", "aten::mul", "aten::split", "aten::narrow"}
+    wanted = {
+        "aten::linear",
+        "aten::mm",
+        "aten::silu",
+        "aten::mul",
+        "aten::split",
+        "aten::narrow",
+        "flux::packed_swiglu",
+    }
     rows = []
     for event in profiler.key_averages():
         if event.key in wanted:
@@ -573,9 +772,18 @@ def _print_environment(args: argparse.Namespace) -> None:
     print(f"  warmup={args.warmup}; repetitions={args.repetitions}; statistic=median")
 
 
-def _print_comparison(title: str, results: Sequence[Comparison], unit: str = "ms") -> None:
+def _print_comparison(
+    title: str,
+    results: Sequence[Comparison],
+    unit: str = "ms",
+    baseline_name: str = "separate",
+    candidate_name: str = "packed",
+) -> None:
     print(f"\n{title}")
-    print(f"{'tokens':>7} {'separate ' + unit:>14} {'packed ' + unit:>12} {'speedup':>10} {'max abs err':>13}")
+    print(
+        f"{'tokens':>7} {baseline_name + ' ' + unit:>14} "
+        f"{candidate_name + ' ' + unit:>12} {'speedup':>10} {'max abs err':>13}"
+    )
     for result in results:
         print(
             f"{result.size:>7} {result.separate_ms:>14.4f} {result.packed_ms:>12.4f} "
@@ -583,11 +791,31 @@ def _print_comparison(title: str, results: Sequence[Comparison], unit: str = "ms
         )
 
 
+def _print_fusion_comparison(
+    title: str,
+    results: Sequence[FusionComparison],
+    unit: str = "ms",
+) -> None:
+    print(f"\n{title}")
+    print(
+        f"{'tokens':>7} {'PyTorch ' + unit:>14} {'Flux ' + unit:>12} "
+        f"{'speedup':>10} {'max abs err':>13} {'max rel err':>13}"
+    )
+    for result in results:
+        print(
+            f"{result.size:>7} {result.pytorch_ms:>14.4f} {result.flux_ms:>12.4f} "
+            f"{result.speedup:>9.3f}x {result.max_absolute_error:>13.6g} "
+            f"{result.max_relative_error:>13.6g}"
+        )
+
+
 def _print_results(
+    standalone: Sequence[FusionComparison],
     lengths: Sequence[LengthResult],
     decodes: Sequence[DecodeResult],
     graph_decodes: Sequence[Comparison],
     memory: MemoryResult,
+    activation_memory: ActivationMemoryResult,
     correctness: CorrectnessResult,
     profiles: Sequence[ProfileRow],
     profile_length: int,
@@ -605,8 +833,47 @@ def _print_results(
     _print_comparison("Isolated gate/up projections across all layers", [result.projection for result in lengths])
     _print_comparison("Complete MLP across all layers", [result.mlp for result in lengths])
     _print_comparison("Integrated full-model prefill", [result.prefill for result in lengths])
-    _print_comparison("One-token cached decode", [result.comparison for result in decodes], "ms/token")
-    _print_comparison("CUDA-Graph cached decode replay", graph_decodes, "ms/token")
+    _print_fusion_comparison(
+        "Standalone SwiGLU across 30 layers",
+        standalone,
+    )
+    _print_fusion_comparison(
+        "Complete packed MLP: PyTorch vs fused SwiGLU",
+        [result.fused_mlp for result in lengths],
+    )
+    _print_fusion_comparison(
+        "Integrated packed-model prefill: PyTorch vs fused SwiGLU",
+        [result.fused_prefill for result in lengths],
+    )
+    _print_comparison(
+        "Packed vs fused one-token cached decode",
+        [result.comparison for result in decodes],
+        "ms/token",
+        "packed",
+        "fused",
+    )
+    _print_comparison(
+        "Packed vs fused CUDA-Graph cached decode replay",
+        graph_decodes,
+        "ms/token",
+        "packed",
+        "fused",
+    )
+
+    print("\nSwiGLU intermediate memory")
+    print(
+        f"  {activation_memory.length} tokens theoretical allocation avoided/layer: "
+        f"{activation_memory.theoretical_avoided_mib_per_layer:.3f} MiB"
+    )
+    print(
+        f"  measured PyTorch peak increment: "
+        f"{activation_memory.pytorch_peak_increment_mib:.3f} MiB"
+    )
+    print(
+        f"  measured Flux peak increment:    "
+        f"{activation_memory.flux_peak_increment_mib:.3f} MiB"
+    )
+    print("  Flux consumes the original contiguous packed tensor; no input copy is made.")
 
     print("\nNumerical maxima")
     for result in lengths:
@@ -616,12 +883,20 @@ def _print_results(
             f"logits={result.prefill.max_absolute_error:.9g}"
         )
     print(f"  decoder layer (128 tokens): {correctness.layer_max_absolute_error:.9g}")
+    print(
+        f"  fused vs packed decoder layer (128 tokens): "
+        f"{correctness.fused_layer_max_absolute_error:.9g}"
+    )
     for result in decodes:
         print(
             f"  decode context {result.comparison.size:>4}: logits={result.comparison.max_absolute_error:.9g}, "
             f"cache={result.cache_max_absolute_error:.9g}"
         )
-    print(f"  greedy generation token IDs equal: {correctness.greedy_equal}")
+    print(f"  packed vs standard greedy token IDs equal: {correctness.greedy_equal}")
+    print(
+        f"  fused vs packed greedy token IDs equal: "
+        f"{correctness.fused_greedy_equal}"
+    )
 
     if profiles:
         print(f"\nDiagnostic one-layer profiler at {profile_length} tokens")
@@ -641,7 +916,7 @@ def main() -> int:
         raise RuntimeError("all built Flux operators are required for integrated prefill")
     _configure_runtime()
     _print_environment(args)
-    separate, packed, memory = _load_models()
+    separate, packed, fused, memory = _load_models()
     maximum_position = int(separate.config.max_position_embeddings)
     valid_lengths = tuple(length for length in args.lengths if length <= maximum_position)
     valid_contexts = tuple(context for context in args.decode_contexts if context + 1 <= maximum_position)
@@ -652,7 +927,11 @@ def main() -> int:
     stabilization_ids = _input_ids(min(valid_lengths), separate.config.vocab_size)
     with torch.inference_mode():
         for iteration in range(args.stabilization_iterations):
-            models = (separate, packed) if iteration % 2 == 0 else (packed, separate)
+            models = (
+                (separate, packed, fused)
+                if iteration % 2 == 0
+                else (fused, packed, separate)
+            )
             for model in models:
                 output = model(input_ids=stabilization_ids, use_cache=True)
                 del output
@@ -660,15 +939,34 @@ def main() -> int:
     del stabilization_ids
 
     length_results = []
+    standalone_results = []
     decode_results = []
     graph_decode_results = []
     profiles: list[ProfileRow] = []
     with torch.inference_mode():
-        correctness = _layer_and_generation_correctness(separate, packed)
+        for length in args.swiglu_lengths:
+            print(f"Benchmarking standalone {length}-token SwiGLU...", flush=True)
+            standalone_results.append(
+                _benchmark_standalone_swiglu(
+                    length,
+                    args.warmup,
+                    args.repetitions,
+                )
+            )
+        correctness = _layer_and_generation_correctness(separate, packed, fused)
         for length in valid_lengths:
             print(f"Benchmarking {length}-token projection, MLP, and prefill...", flush=True)
             try:
-                length_results.append(_benchmark_length(separate, packed, length, args.warmup, args.repetitions))
+                length_results.append(
+                    _benchmark_length(
+                        separate,
+                        packed,
+                        fused,
+                        length,
+                        args.warmup,
+                        args.repetitions,
+                    )
+                )
             except torch.OutOfMemoryError as error:
                 print(f"Skipping length {length}: CUDA out of memory ({error})", flush=True)
                 gc.collect()
@@ -677,11 +975,19 @@ def main() -> int:
         for context in valid_contexts:
             print(f"Benchmarking one-token decode after context {context}...", flush=True)
             try:
-                decode_results.append(_benchmark_decode(separate, packed, context, args.warmup, args.repetitions))
+                decode_results.append(
+                    _benchmark_decode(
+                        packed,
+                        fused,
+                        context,
+                        args.warmup,
+                        args.repetitions,
+                    )
+                )
                 graph_decode_results.append(
                     _benchmark_graph_decode(
-                        separate,
                         packed,
+                        fused,
                         context,
                         args.warmup,
                         args.repetitions,
@@ -697,15 +1003,20 @@ def main() -> int:
             profile_input = _capture_mlp_inputs(separate, profile_ids)[0]
             profiles.extend(_profile_mlp("separate", separate.model.layers[0].mlp, profile_input))
             profiles.extend(_profile_mlp("packed", packed.model.layers[0].mlp, profile_input))
+            profiles.extend(_profile_mlp("fused", fused.model.layers[0].mlp, profile_input))
             del profile_ids, profile_input
+
+        activation_memory = _measure_activation_memory(args.profile_length)
 
     if not length_results:
         raise RuntimeError("no requested prefill length completed")
     _print_results(
+        standalone_results,
         length_results,
         decode_results,
         graph_decode_results,
         memory,
+        activation_memory,
         correctness,
         profiles,
         args.profile_length,

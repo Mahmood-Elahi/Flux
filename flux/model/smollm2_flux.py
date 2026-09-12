@@ -26,10 +26,12 @@ from transformers.models.llama.modeling_llama import (
 from flux.ops import (
     attention_score_softmax_native,
     native_attention_score_softmax_is_available,
+    native_packed_swiglu_is_available,
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
     native_rmsnorm_is_available,
     native_softmax_is_available,
+    packed_swiglu_native,
     residual_rmsnorm_native,
     rms_norm_native,
     rope_native,
@@ -41,8 +43,10 @@ FLUX_OPERATOR_CATEGORIES = frozenset(
     {"rmsnorm", "residual_rmsnorm", "rope", "softmax"}
 )
 FLUX_PACKED_MLP_CATEGORY = "mlp"
+FLUX_PACKED_SWIGLU_CATEGORY = "packed_swiglu"
 _SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
-    FLUX_PACKED_MLP_CATEGORY
+    FLUX_PACKED_MLP_CATEGORY,
+    FLUX_PACKED_SWIGLU_CATEGORY,
 }
 
 
@@ -54,7 +58,7 @@ class FluxPackedLlamaMLP(nn.Module):
     standard Llama ``gate_proj.weight`` and ``up_proj.weight`` interface.
     """
 
-    def __init__(self, source: LlamaMLP) -> None:
+    def __init__(self, source: LlamaMLP, *, use_packed_swiglu: bool = False) -> None:
         super().__init__()
         if source.gate_proj.bias is not None or source.up_proj.bias is not None:
             raise ValueError("Flux packed MLP requires bias-free gate/up projections")
@@ -66,6 +70,7 @@ class FluxPackedLlamaMLP(nn.Module):
         self.intermediate_size = source.intermediate_size
         self.act_fn = source.act_fn
         self.down_proj = source.down_proj
+        self.use_packed_swiglu = use_packed_swiglu
 
         # Constructing on meta avoids allocating an initialized throwaway
         # [2 * intermediate_size, hidden_size] tensor. torch.cat is the sole
@@ -137,6 +142,8 @@ class FluxPackedLlamaMLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(hidden_states)
+        if self.use_packed_swiglu:
+            return self.down_proj(packed_swiglu_native(gate_up))
         # chunk returns views; it does not allocate separate gate/up tensors.
         gate, up = gate_up.chunk(2, dim=-1)
         return self.down_proj(self.act_fn(gate) * up)
@@ -282,6 +289,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         use_softmax: bool = True,
         fuse_attention_scores: bool = True,
         use_packed_mlp: bool = False,
+        use_packed_swiglu: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = source.hidden_size
@@ -296,7 +304,12 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
             else source.self_attn
         )
         self.mlp = (
-            FluxPackedLlamaMLP(source.mlp) if use_packed_mlp else source.mlp
+            FluxPackedLlamaMLP(
+                source.mlp,
+                use_packed_swiglu=use_packed_swiglu,
+            )
+            if use_packed_mlp
+            else source.mlp
         )
         self.input_layernorm = (
             FluxRMSNorm(source.input_layernorm)
@@ -390,6 +403,11 @@ def _check_native_ops(
     if "rope" in operators and not native_rope_is_available():
         missing.append("rope")
     if (
+        FLUX_PACKED_SWIGLU_CATEGORY in operators
+        and not native_packed_swiglu_is_available()
+    ):
+        missing.append("packed_swiglu")
+    if (
         "softmax" in operators
         and fuse_attention_scores
         and not native_attention_score_softmax_is_available()
@@ -428,6 +446,11 @@ def enable_flux_ops(
         raise ValueError(f"unknown Flux operator categories: {sorted(unknown)}")
     if not selected:
         raise ValueError("at least one Flux operator category must be selected")
+    if (
+        FLUX_PACKED_SWIGLU_CATEGORY in selected
+        and FLUX_PACKED_MLP_CATEGORY not in selected
+    ):
+        raise ValueError('"packed_swiglu" requires the "mlp" operator category')
 
     llama_model = _check_model(model)
     _check_native_ops(
@@ -449,6 +472,7 @@ def enable_flux_ops(
                 use_softmax="softmax" in selected,
                 fuse_attention_scores=fuse_attention_scores,
                 use_packed_mlp=FLUX_PACKED_MLP_CATEGORY in selected,
+                use_packed_swiglu=FLUX_PACKED_SWIGLU_CATEGORY in selected,
             )
     else:
         for layer in llama_model.model.layers:
@@ -465,7 +489,10 @@ def enable_flux_ops(
                     layer.post_attention_layernorm
                 )
             if FLUX_PACKED_MLP_CATEGORY in selected:
-                layer.mlp = FluxPackedLlamaMLP(layer.mlp)
+                layer.mlp = FluxPackedLlamaMLP(
+                    layer.mlp,
+                    use_packed_swiglu=FLUX_PACKED_SWIGLU_CATEGORY in selected,
+                )
     if "rmsnorm" in selected:
         llama_model.model.norm = FluxRMSNorm(llama_model.model.norm)
     # Transformers installs output-capture hooks lazily on the original layer
@@ -479,6 +506,9 @@ def enable_flux_ops(
         "softmax" in selected and fuse_attention_scores
     )
     llama_model._flux_packed_mlp_enabled = FLUX_PACKED_MLP_CATEGORY in selected
+    llama_model._flux_packed_swiglu_enabled = (
+        FLUX_PACKED_SWIGLU_CATEGORY in selected
+    )
     return llama_model
 
 
@@ -503,6 +533,7 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
 __all__ = [
     "FLUX_OPERATOR_CATEGORIES",
     "FLUX_PACKED_MLP_CATEGORY",
+    "FLUX_PACKED_SWIGLU_CATEGORY",
     "FluxLlamaAttention",
     "FluxLlamaDecoderLayer",
     "FluxPackedLlamaMLP",
