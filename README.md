@@ -156,7 +156,9 @@ python -m benchmarks.benchmark_smollm2_mlp
 The independent `"gqa_decode_attention"` category replaces the one-token
 cached-decode sequence—K/V repetition, QK, scaling/mask/softmax, and P@V—with
 a native operator that reads unexpanded `[B, KVH, capacity, D]` cache storage.
-DynamicCache decode uses the fused path at every supported length. StaticCache
+The initial native contract is FP32, batch size one, and query length one;
+unsupported inputs retain the existing attention path. DynamicCache decode
+uses the fused path at every supported length. StaticCache
 CUDA-Graph decode uses it above the measured 1280-token capacity crossover and
 retains the existing path below that point. Prefill is unchanged. The FP32
 CUDA head-dimension-64 path uses one shared-score block through 512 tokens and
@@ -175,6 +177,33 @@ CUDA-Graph replay, numerical behavior, kernel inventory, and memory with:
 
 ```bash
 python benchmarks/benchmark_smollm2_gqa_decode_attention.py
+```
+
+The separately controlled `"packed_qkv_rope_cache"` category fuses the work
+between the retained packed QKV projection and native one-token GQA attention.
+For the FP32 SmolLM2 `B=1`, `Q=1` StaticCache path, one CUDA block applies Q/K
+RoPE, writes rotated K and unmodified V directly into unexpanded cache storage,
+returns compact head-major Q, and advances the device-resident cache length.
+It is CUDA-Graph safe and removes the separate RoPE/cache-update sequence
+without a workspace or graph-pool increase. It requires `"rope"`, `"qkv"`, and
+`"gqa_decode_attention"`; unsupported inputs use the retained path. As with
+native GQA attention, StaticCache capacities through 1280 retain the measured
+short-context crossover fallback. The specialized fused path supports
+capacities 1281 through 8192.
+
+```python
+enable_flux_ops(
+    model,
+    operators=FLUX_OPERATOR_CATEGORIES
+    | {"qkv", "gqa_decode_attention", "packed_qkv_rope_cache"},
+)
+```
+
+Validate and benchmark the fused boundary, including isolated, layer, eager,
+and CUDA-Graph measurements plus cache, generation, launch, and memory checks:
+
+```bash
+python benchmarks/benchmark_smollm2_packed_qkv_rope_cache.py
 ```
 
 Validate and benchmark the retained production packed-QKV path, including

@@ -716,6 +716,7 @@ def test_enable_flux_ops_preserves_parameters_and_invokes_every_operator(
         "packed_mlp_modules": 0,
         "packed_qkv_modules": 0,
         "gqa_decode_attention_modules": 0,
+        "packed_qkv_rope_cache_modules": 0,
     }
     # Two input norms, two fused post-attention norms, and one final norm.
     assert python_flux_ops == {
@@ -820,6 +821,17 @@ def test_enable_flux_ops_rejects_invalid_operator_selection(
     model = _model(1)
     with pytest.raises(ValueError, match="operator categor"):
         smollm2_flux.enable_flux_ops(model, operators=operators)
+
+
+def test_packed_qkv_rope_cache_requires_all_retained_dependencies(
+    python_flux_ops: dict[str, int],
+) -> None:
+    model = _model(1)
+    with pytest.raises(ValueError, match='requires the "rope", "qkv", and'):
+        smollm2_flux.enable_flux_ops(
+            model,
+            operators=(smollm2_flux.FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY,),
+        )
 
 
 def test_greedy_generation_with_kv_cache_matches_reference(
@@ -939,6 +951,24 @@ def test_gqa_decode_attention_category_falls_back_without_cached_decode(
 
     assert python_flux_ops.get("gqa_decode_attention", 0) == 0
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gqa_decode_attention_category_falls_back_for_batch_above_one(
+    python_flux_ops: dict[str, int],
+) -> None:
+    model = _model(1)
+    smollm2_flux.enable_flux_ops(
+        model,
+        operators=(smollm2_flux.FLUX_GQA_DECODE_ATTENTION_CATEGORY,),
+    )
+    prompt = torch.tensor([[1, 17, 42], [9, 3, 28]])
+    token = torch.tensor([[11], [5]])
+
+    with torch.inference_mode():
+        prefill = model(prompt, use_cache=True)
+        model(token, past_key_values=prefill.past_key_values, use_cache=True)
+
+    assert python_flux_ops.get("gqa_decode_attention", 0) == 0
 
 
 def test_gqa_decode_attention_falls_back_when_probabilities_are_requested(

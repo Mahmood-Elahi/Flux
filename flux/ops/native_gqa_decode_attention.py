@@ -31,6 +31,7 @@ def _register_fake() -> None:
             torch._check(key_cache.dim() == 4, lambda: "key_cache must be rank four")
             torch._check(value_cache.dim() == 4, lambda: "value_cache must be rank four")
             torch._check(query.shape[2] == 1, lambda: "query length must be one")
+            torch._check(query.shape[0] == 1, lambda: "batch size must be one")
             torch._check(query.dtype == torch.float32, lambda: "query must be float32")
             torch._check(key_cache.dtype == torch.float32, lambda: "key_cache must be float32")
             torch._check(value_cache.dtype == torch.float32, lambda: "value_cache must be float32")

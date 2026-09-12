@@ -31,6 +31,8 @@ void validate_gqa_decode_attention_arguments(
         "flux::gqa_decode_attention: Q/K/V tensors must be rank four");
     TORCH_CHECK(query.size(2) == 1,
         "flux::gqa_decode_attention: query length must be one");
+    TORCH_CHECK(query.size(0) == 1,
+        "flux::gqa_decode_attention: batch size must be one");
     TORCH_CHECK(query.scalar_type() == at::kFloat &&
             key_cache.scalar_type() == at::kFloat &&
             value_cache.scalar_type() == at::kFloat,
@@ -199,9 +201,14 @@ at::Tensor gqa_decode_attention_cuda(
     constexpr int64_t chunk_size = 256;
     const int64_t num_chunks =
         (key_cache.size(2) + chunk_size - 1) / chunk_size;
-    at::Tensor workspace = at::empty(
-        {query.size(0), query.size(1), num_chunks, query.size(3) + 2},
-        query.options());
+    at::Tensor workspace;
+    float* workspace_data = nullptr;
+    if (query.size(3) == 64 && key_cache.size(2) > 512) {
+        workspace = at::empty(
+            {query.size(0), query.size(1), num_chunks, query.size(3) + 2},
+            query.options());
+        workspace_data = workspace.mutable_data_ptr<float>();
+    }
     const c10::cuda::CUDAStream stream =
         c10::cuda::getCurrentCUDAStream(query.get_device());
     const std::array<int64_t, 4> query_strides = {
@@ -225,7 +232,7 @@ at::Tensor gqa_decode_attention_cuda(
             ? additive_attention_mask->const_data_ptr<float>() : nullptr,
         cache_length.has_value()
             ? cache_length->const_data_ptr<int64_t>() : nullptr,
-        output.mutable_data_ptr<float>(), workspace.mutable_data_ptr<float>(),
+        output.mutable_data_ptr<float>(), workspace_data,
         static_cast<float>(scale),
         static_cast<std::size_t>(query.size(0)),
         static_cast<std::size_t>(query.size(1)),

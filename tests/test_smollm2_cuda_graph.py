@@ -17,16 +17,29 @@ from flux.model.smollm2_cuda_graph import (
 from flux.model.smollm2_flux import (
     FLUX_GQA_DECODE_ATTENTION_CATEGORY,
     FLUX_OPERATOR_CATEGORIES,
+    FLUX_PACKED_MLP_CATEGORY,
+    FLUX_PACKED_QKV_CATEGORY,
+    FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY,
+    FLUX_PACKED_SWIGLU_CATEGORY,
     enable_flux_ops,
 )
 from flux.ops import (
     native_gqa_decode_attention_is_available,
     native_packed_swiglu_is_available,
+    native_packed_qkv_rope_cache_is_available,
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
     native_rmsnorm_is_available,
     native_softmax_is_available,
 )
+
+
+_FULL_DECODE_OPERATORS = FLUX_OPERATOR_CATEGORIES | {
+    FLUX_PACKED_MLP_CATEGORY,
+    FLUX_PACKED_QKV_CATEGORY,
+    FLUX_PACKED_SWIGLU_CATEGORY,
+    FLUX_GQA_DECODE_ATTENTION_CATEGORY,
+}
 
 
 def _config() -> LlamaConfig:
@@ -51,6 +64,26 @@ def _config() -> LlamaConfig:
 def _model() -> LlamaForCausalLM:
     torch.manual_seed(1234)
     return LlamaForCausalLM(_config()).float().eval()
+
+
+def _smollm2_geometry_model() -> LlamaForCausalLM:
+    config = LlamaConfig(
+        hidden_size=576,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=9,
+        num_key_value_heads=3,
+        head_dim=64,
+        vocab_size=128,
+        max_position_embeddings=2048,
+        rms_norm_eps=1e-5,
+        attention_bias=False,
+        attention_dropout=0.0,
+        mlp_bias=False,
+    )
+    config._attn_implementation = "eager"
+    torch.manual_seed(4321)
+    return LlamaForCausalLM(config).float().eval()
 
 
 def test_decode_state_requires_capture_factory() -> None:
@@ -259,3 +292,94 @@ def test_gqa_decode_cuda_graph_replay_matches_current_flux_and_preserves_address
             token = current_logits.argmax(dim=-1)
 
     assert fused_state.stable_addresses() == addresses
+
+
+@pytest.mark.skipif(
+    not (
+        _NATIVE_CUDA_AVAILABLE
+        and native_gqa_decode_attention_is_available()
+        and native_packed_qkv_rope_cache_is_available()
+    ),
+    reason="CUDA and all fused post-QKV dependencies are required",
+)
+def test_fused_packed_qkv_rope_cache_graph_matches_retained_path() -> None:
+    current = _smollm2_geometry_model().cuda()
+    fused = copy.deepcopy(current)
+    enable_flux_ops(current, operators=_FULL_DECODE_OPERATORS)
+    enable_flux_ops(
+        fused,
+        operators=_FULL_DECODE_OPERATORS
+        | {FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY},
+    )
+    prompt = torch.tensor([[1, 17, 42, 9, 3, 28, 11, 5]], device="cuda")
+
+    with torch.inference_mode():
+        # Capacity 1281 activates the retained native-GQA crossover and the
+        # specialized fused post-QKV path while keeping the logical context 8.
+        current_state = FluxCUDAGraphDecode.capture(
+            current, prompt, max_decode_steps=1273, warmup_steps=2
+        )
+        fused_state = FluxCUDAGraphDecode.capture(
+            fused, prompt, max_decode_steps=1273, warmup_steps=2
+        )
+        token = current_state.prefill_logits.argmax(dim=-1)
+        addresses = fused_state.stable_addresses()
+        for step in range(3):
+            expected = current_state.replay(token)
+            actual = fused_state.replay(token)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+            valid_length = prompt.shape[1] + step + 1
+            torch.testing.assert_close(
+                fused_state.cache.layers[0].keys[..., :valid_length, :],
+                current_state.cache.layers[0].keys[..., :valid_length, :],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                fused_state.cache.layers[0].values[..., :valid_length, :],
+                current_state.cache.layers[0].values[..., :valid_length, :],
+                rtol=0,
+                atol=0,
+            )
+            token = expected.argmax(dim=-1)
+
+    assert fused_state.stable_addresses() == addresses
+    assert fused_state.cache_position == current_state.cache_position == 11
+
+
+@pytest.mark.skipif(
+    not (
+        _NATIVE_CUDA_AVAILABLE
+        and native_gqa_decode_attention_is_available()
+        and native_packed_qkv_rope_cache_is_available()
+    ),
+    reason="CUDA and all fused post-QKV dependencies are required",
+)
+def test_fused_packed_qkv_rope_cache_falls_back_for_dynamic_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _smollm2_geometry_model().cuda()
+    enable_flux_ops(
+        model,
+        operators=_FULL_DECODE_OPERATORS
+        | {FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY},
+    )
+    calls = 0
+    original = smollm2_flux.packed_qkv_rope_cache_native
+
+    def counted(*args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(smollm2_flux, "packed_qkv_rope_cache_native", counted)
+    prompt = torch.tensor([[1, 17, 42, 9]], device="cuda")
+    with torch.inference_mode():
+        prefill = model(prompt, use_cache=True)
+        model(
+            torch.tensor([[3]], device="cuda"),
+            past_key_values=prefill.past_key_values,
+            use_cache=True,
+        )
+    assert calls == 0

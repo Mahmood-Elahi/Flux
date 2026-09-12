@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import multiprocessing
 import os
 import statistics
 import sys
@@ -46,6 +47,12 @@ KV_HEADS = 3
 HEAD_DIM = 64
 SCALE = HEAD_DIM**-0.5
 MIB = 1024.0**2
+# QK, softmax, and PV use different FP32 reduction trees in the two paths.
+# Model tolerances additionally cover propagation through all 30 layers.
+OP_RTOL = 2e-5
+OP_ATOL = 1e-6
+MODEL_RTOL = 2e-4
+MODEL_ATOL = 2e-5
 BASE_OPERATORS = FLUX_OPERATOR_CATEGORIES | {
     FLUX_PACKED_QKV_CATEGORY,
     FLUX_PACKED_MLP_CATEGORY,
@@ -67,7 +74,9 @@ class Pair:
 @dataclass(frozen=True)
 class Numerical:
     max_absolute: float
+    mean_absolute: float
     max_relative: float
+    mean_relative: float
     per_head_absolute: tuple[float, ...]
 
 
@@ -192,8 +201,37 @@ def _numerical(actual: torch.Tensor, expected: torch.Tensor) -> Numerical:
     relative = difference / expected.abs().clamp_min(1e-8)
     return Numerical(
         float(difference.max().item()),
+        float(difference.mean().item()),
         float(relative.max().item()),
+        float(relative.mean().item()),
         tuple(float(difference[:, head].max().item()) for head in range(actual.shape[1])),
+    )
+
+
+def _cache_numerical(actual_layers: Any, expected_layers: Any, field: str) -> Numerical:
+    max_absolute = 0.0
+    max_relative = 0.0
+    absolute_sum = 0.0
+    relative_sum = 0.0
+    elements = 0
+    for actual_layer, expected_layer in zip(
+        actual_layers, expected_layers, strict=True
+    ):
+        actual = getattr(actual_layer, field)
+        expected = getattr(expected_layer, field)
+        difference = (actual - expected).abs()
+        relative = difference / expected.abs().clamp_min(1e-8)
+        max_absolute = max(max_absolute, float(difference.max().item()))
+        max_relative = max(max_relative, float(relative.max().item()))
+        absolute_sum += float(difference.sum().item())
+        relative_sum += float(relative.sum().item())
+        elements += difference.numel()
+    return Numerical(
+        max_absolute,
+        absolute_sum / elements,
+        max_relative,
+        relative_sum / elements,
+        (),
     )
 
 
@@ -212,7 +250,7 @@ def _isolated(context: int, warmup: int, repetitions: int) -> tuple[Pair, Numeri
     mask = torch.zeros((1, 1, 1, context), device="cuda")
     expected = _current_attention(query, key, value, mask)
     actual = gqa_decode_attention_native(query, key, value, mask, SCALE)
-    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(actual, expected, rtol=OP_RTOL, atol=OP_ATOL)
     timing = _paired(
         lambda: _current_attention(query, key, value, mask),
         lambda: gqa_decode_attention_native(query, key, value, mask, SCALE),
@@ -233,7 +271,7 @@ def _eager_pair(
     context: int,
     warmup: int,
     repetitions: int,
-) -> tuple[Pair, float, float, float]:
+) -> tuple[Pair, Numerical, Numerical, Numerical]:
     token = _ids(context + 1, current.config.vocab_size)[:, -1:]
     _, current_base = _prefill(current, context)
     _, fused_base = _prefill(fused, context)
@@ -254,16 +292,23 @@ def _eager_pair(
     fused_call = prepare(fused, fused_base)
     current_output = current_call()
     fused_output = fused_call()
-    logits_error = float((fused_output.logits - current_output.logits).abs().max().item())
-    key_error = max(
-        float((a.keys - b.keys).abs().max().item())
-        for a, b in zip(fused_output.past_key_values.layers, current_output.past_key_values.layers, strict=True)
+    logits_error = _numerical(fused_output.logits, current_output.logits)
+    key_error = _cache_numerical(
+        fused_output.past_key_values.layers,
+        current_output.past_key_values.layers,
+        "keys",
     )
-    value_error = max(
-        float((a.values - b.values).abs().max().item())
-        for a, b in zip(fused_output.past_key_values.layers, current_output.past_key_values.layers, strict=True)
+    value_error = _cache_numerical(
+        fused_output.past_key_values.layers,
+        current_output.past_key_values.layers,
+        "values",
     )
-    torch.testing.assert_close(fused_output.logits, current_output.logits, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(
+        fused_output.logits,
+        current_output.logits,
+        rtol=MODEL_RTOL,
+        atol=MODEL_ATOL,
+    )
     return timing, logits_error, key_error, value_error
 
 
@@ -273,7 +318,7 @@ def _layer_pair(
     context: int,
     warmup: int,
     repetitions: int,
-) -> tuple[Pair, float]:
+) -> tuple[Pair, Numerical]:
     hidden = torch.randn((1, 1, current.config.hidden_size), device="cuda")
     position = torch.tensor([[context]], device="cuda")
     current_position = current.model.rotary_emb(hidden, position)
@@ -301,8 +346,10 @@ def _layer_pair(
     )
     expected = prepare(current, current_base, current_position)()
     actual = prepare(fused, fused_base, fused_position)()
-    error = float((actual - expected).abs().max().item())
-    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+    error = _numerical(actual, expected)
+    torch.testing.assert_close(
+        actual, expected, rtol=MODEL_RTOL, atol=MODEL_ATOL
+    )
     return timing, error
 
 
@@ -312,13 +359,60 @@ def _graph_pair(
     context: int,
     warmup: int,
     repetitions: int,
-) -> tuple[Pair, int, int]:
+) -> tuple[Pair]:
     steps = warmup + repetitions
     prompt = _ids(context, current.config.vocab_size)
     current_graph = FluxCUDAGraphDecode.capture(current, prompt, max_decode_steps=steps)
     fused_graph = FluxCUDAGraphDecode.capture(fused, prompt, max_decode_steps=steps)
     timing = _paired(current_graph.graph.replay, fused_graph.graph.replay, warmup, repetitions)
-    return timing, current_graph.memory.graph_pool_bytes, fused_graph.memory.graph_pool_bytes
+    return (timing,)
+
+
+def _graph_memory_worker(
+    connection: Any, context: int, steps: int, fused: bool
+) -> None:
+    """Measure one graph in a fresh process to avoid capture-order attribution."""
+    try:
+        _configure()
+        model = load_model("cuda")
+        operators = FUSED_OPERATORS if fused else BASE_OPERATORS
+        enable_flux_ops(model, operators=operators)
+        prompt = _ids(context, model.config.vocab_size)
+        state = FluxCUDAGraphDecode.capture(
+            model, prompt, max_decode_steps=steps
+        )
+        connection.send(("ok", state.memory.graph_pool_bytes))
+    except BaseException as error:
+        connection.send(("error", repr(error)))
+    finally:
+        connection.close()
+
+
+def _independent_graph_pool_bytes(context: int, steps: int) -> tuple[int, int]:
+    process_context = multiprocessing.get_context("spawn")
+    results: list[int] = []
+    for fused in (False, True):
+        receive, send = process_context.Pipe(duplex=False)
+        process = process_context.Process(
+            target=_graph_memory_worker,
+            args=(send, context, steps, fused),
+        )
+        process.start()
+        send.close()
+        process.join()
+        if process.exitcode != 0 or not receive.poll():
+            raise RuntimeError(
+                f"independent graph-memory probe failed with exit code "
+                f"{process.exitcode}"
+            )
+        status, payload = receive.recv()
+        receive.close()
+        if status != "ok":
+            raise RuntimeError(
+                f"independent graph-memory probe failed: {payload}"
+            )
+        results.append(payload)
+    return results[0], results[1]
 
 
 def _profile(operation: Callable[[], object]) -> ProfileResult:
@@ -384,9 +478,9 @@ def main() -> int:
         torch.cuda.synchronize()
         del stabilization_ids
 
-    layer: dict[int, tuple[Pair, float]] = {}
-    eager: dict[int, tuple[Pair, float, float, float]] = {}
-    graph: dict[int, tuple[Pair, int, int]] = {}
+    layer: dict[int, tuple[Pair, Numerical]] = {}
+    eager: dict[int, tuple[Pair, Numerical, Numerical, Numerical]] = {}
+    graph: dict[int, tuple[Pair]] = {}
     with torch.inference_mode():
         for context in args.contexts:
             print(f"Layer/eager/graph context {context}...", flush=True)
@@ -421,11 +515,21 @@ def main() -> int:
         current_peak = _peak_decode(current, profile_context)
         fused_peak = _peak_decode(fused, profile_context)
 
+    print("Measuring independent CUDA-Graph pools...", flush=True)
+    current_pool, fused_pool = _independent_graph_pool_bytes(
+        profile_context, args.warmup + args.model_repetitions
+    )
+
     print("\nIsolated attention")
-    print(f"{'L':>6} {'current us':>12} {'fused us':>11} {'speedup':>9} {'max abs':>11} {'max rel':>11}")
+    print(
+        f"{'L':>6} {'current us':>12} {'fused us':>11} {'speedup':>9} "
+        f"{'max abs':>11} {'mean abs':>11} {'max rel':>11} {'mean rel':>11}"
+    )
     for context, (timing, numerical) in isolated.items():
         print(f"{context:>6} {timing.current_ms*1000:>12.3f} {timing.fused_ms*1000:>11.3f} "
-              f"{timing.speedup:>8.3f}x {numerical.max_absolute:>11.3g} {numerical.max_relative:>11.3g}")
+              f"{timing.speedup:>8.3f}x {numerical.max_absolute:>11.3g} "
+              f"{numerical.mean_absolute:>11.3g} {numerical.max_relative:>11.3g} "
+              f"{numerical.mean_relative:>11.3g}")
         print("       per-head max abs: " + ", ".join(f"{value:.3g}" for value in numerical.per_head_absolute))
 
     for title, rows in (("Complete decoder layer", layer), ("Full eager decode", eager), ("CUDA-Graph replay", graph)):
@@ -436,10 +540,17 @@ def main() -> int:
             print(f"{context:>6} {timing.current_ms:>12.4f} {timing.fused_ms:>11.4f} {timing.speedup:>8.3f}x")
 
     print("\nIntegrated numerical differences")
-    print(f"{'L':>6} {'layer abs':>12} {'logit abs':>12} {'cache K':>12} {'cache V':>12}")
+    print(
+        f"{'L':>6} {'layer max/mean':>23} {'logit max/mean':>23} "
+        f"{'cache K max/mean':>23} {'cache V max/mean':>23}"
+    )
     for context in args.contexts:
-        print(f"{context:>6} {layer[context][1]:>12.3g} {eager[context][1]:>12.3g} "
-              f"{eager[context][2]:>12.3g} {eager[context][3]:>12.3g}")
+        errors = (layer[context][1], *eager[context][1:])
+        formatted = " ".join(
+            f"{error.max_absolute:>10.3g}/{error.mean_absolute:<10.3g}"
+            for error in errors
+        )
+        print(f"{context:>6} {formatted}")
     print(f"  greedy token equality ({args.generation_tokens} tokens): {greedy_equal}")
 
     repeated_bytes = 2 * HEADS * profile_context * HEAD_DIM * 4
@@ -459,9 +570,10 @@ def main() -> int:
     print(f"  fused partial workspace per layer call: {workspace_bytes/MIB:.3f} MiB")
     print(f"  unchanged 30-layer unexpanded K/V cache storage: {cache_bytes/MIB:.3f} MiB")
     print(f"  eager decode incremental peak: current={current_peak/MIB:.3f} MiB, fused={fused_peak/MIB:.3f} MiB")
-    current_pool = graph[profile_context][1]
-    fused_pool = graph[profile_context][2]
-    print(f"  graph pool: current={current_pool/MIB:.3f} MiB, fused={fused_pool/MIB:.3f} MiB")
+    print(
+        f"  independent graph pool: current={current_pool/MIB:.3f} MiB, "
+        f"fused={fused_pool/MIB:.3f} MiB"
+    )
     print("\nKernel design: 256-token partial online softmax + per-head max-rescaled reduction; "
           "qh -> qh // 3; caller current stream; valid length read from StaticCache device scalar.")
     gc.collect()

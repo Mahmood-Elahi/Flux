@@ -19,7 +19,8 @@ Flux is one continuous project progressing toward a single final outcome: an int
 15. **Completed:** Implement and retain separately opt-in FP32 packed SwiGLU with CPU/CUDA dispatch, current-stream execution, FakeTensor/opcheck coverage, model and CUDA-Graph integration, and measured MLP/prefill/decode/memory results.
 16. **Completed:** Profile and retain separately opt-in packed QKV as a structural PyTorch/cuBLAS optimization, preserving standard checkpoints, allocation-free strided RoPE/cache views, CUDA-Graph decode, and unchanged parameter/cache storage.
 17. **Completed:** Implement and retain separately opt-in FP32 one-token GQA decode attention over unexpanded DynamicCache/StaticCache K/V storage, with stable online softmax, current-stream execution, FakeTensor/opcheck and CUDA-Graph coverage, measured short-cache graph fallback, and isolated/layer/eager/long-context graph gains.
-18. Continue profiling and optimizing measured integrated-system bottlenecks.
-19. Reach the final integrated Flux inference system.
+18. **Completed:** Profile and retain a separately opt-in FP32 one-token packed-QKV post-projection CUDA path that applies Q/K RoPE, writes K/V directly into unexpanded StaticCache storage, emits compact Q for native GQA attention, advances graph-resident cache length, and measurably reduces long-context eager and CUDA-Graph decode latency without increasing peak or graph-pool memory.
+19. Continue profiling and optimizing measured integrated-system bottlenecks.
+20. Reach the final integrated Flux inference system.
 
 Each implementation and optimization milestone remains part of the same evolving codebase. Correctness against the reference path precedes performance work, and optimization decisions are driven by reproducible measurements.

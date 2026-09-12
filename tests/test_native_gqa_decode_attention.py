@@ -13,6 +13,9 @@ from flux.ops import (
 )
 
 
+# The fused kernel changes the FP32 reduction tree relative to cuBLAS QK/PV
+# and PyTorch softmax; these tolerances cover that ordering difference. The
+# benchmark records errors two orders of magnitude below the absolute bound.
 RTOL = 2e-5
 ATOL = 1e-6
 
@@ -58,11 +61,11 @@ def test_matches_reference_with_dynamic_and_static_cache_lengths(
 
 @pytest.mark.parametrize("device", _devices())
 def test_supports_none_and_broadcast_masks(device: str) -> None:
-    query, key, value, _ = _inputs(device, 31, batch=2, head_dim=8)
+    query, key, value, _ = _inputs(device, 31, head_dim=8)
     for mask in (
         None,
         torch.zeros((1, 1, 1, 1), device=device),
-        torch.randn((2, 9, 1, 31), device=device),
+        torch.randn((1, 9, 1, 31), device=device),
     ):
         actual = gqa_decode_attention_native(query, key, value, mask, 8**-0.5)
         expected = gqa_decode_attention(query, key, value, mask, 8**-0.5)
@@ -90,6 +93,13 @@ def test_reads_noncontiguous_cache_without_copying_or_modifying(device: str) -> 
 
 def test_rejects_invalid_arguments() -> None:
     query, key, value, mask = _inputs("cpu", 17)
+    batched_query, batched_key, batched_value, batched_mask = _inputs(
+        "cpu", 17, batch=2
+    )
+    with pytest.raises(RuntimeError, match="batch size must be one"):
+        gqa_decode_attention_native(
+            batched_query, batched_key, batched_value, batched_mask, 0.125
+        )
     with pytest.raises(RuntimeError, match="query length must be one"):
         gqa_decode_attention_native(query.expand(1, 9, 2, 64), key, value, mask, 0.125)
     with pytest.raises(RuntimeError, match="divisible"):
@@ -112,10 +122,10 @@ def test_rejects_autograd_input() -> None:
 def test_fake_tensor_metadata() -> None:
     mode = FakeTensorMode()
     with mode:
-        query = torch.empty((2, 9, 1, 64))
-        key = torch.empty((2, 3, 129, 64))
+        query = torch.empty((1, 9, 1, 64))
+        key = torch.empty((1, 3, 129, 64))
         value = torch.empty_like(key)
-        mask = torch.empty((2, 1, 1, 129))
+        mask = torch.empty((1, 1, 1, 129))
         length = torch.empty((), dtype=torch.int64)
         output = gqa_decode_attention_native(query, key, value, mask, 0.125, length)
     assert isinstance(output, FakeTensor)

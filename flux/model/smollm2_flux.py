@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from transformers import StaticCache
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaDecoderLayer,
@@ -30,11 +31,13 @@ from flux.ops import (
     native_attention_score_softmax_is_available,
     native_gqa_decode_attention_is_available,
     native_packed_swiglu_is_available,
+    native_packed_qkv_rope_cache_is_available,
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
     native_rmsnorm_is_available,
     native_softmax_is_available,
     packed_swiglu_native,
+    packed_qkv_rope_cache_native,
     residual_rmsnorm_native,
     rms_norm_native,
     rope_native,
@@ -49,11 +52,13 @@ FLUX_PACKED_MLP_CATEGORY = "mlp"
 FLUX_PACKED_SWIGLU_CATEGORY = "packed_swiglu"
 FLUX_PACKED_QKV_CATEGORY = "qkv"
 FLUX_GQA_DECODE_ATTENTION_CATEGORY = "gqa_decode_attention"
+FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY = "packed_qkv_rope_cache"
 _SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
     FLUX_GQA_DECODE_ATTENTION_CATEGORY,
     FLUX_PACKED_MLP_CATEGORY,
     FLUX_PACKED_SWIGLU_CATEGORY,
     FLUX_PACKED_QKV_CATEGORY,
+    FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY,
 }
 _GQA_DECODE_GRAPH_MINIMUM_CAPACITY = 1281
 
@@ -187,6 +192,7 @@ class FluxLlamaAttention(LlamaAttention):
         fuse_attention_scores: bool = True,
         use_gqa_decode_attention: bool = False,
         use_packed_qkv: bool = False,
+        use_packed_qkv_rope_cache: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.config = source.config
@@ -201,6 +207,7 @@ class FluxLlamaAttention(LlamaAttention):
         self.fuse_attention_scores = fuse_attention_scores
         self.use_gqa_decode_attention = use_gqa_decode_attention
         self.use_packed_qkv = use_packed_qkv
+        self.use_packed_qkv_rope_cache = use_packed_qkv_rope_cache
 
         projections = (source.q_proj, source.k_proj, source.v_proj)
         if use_packed_qkv:
@@ -340,34 +347,102 @@ class FluxLlamaAttention(LlamaAttention):
         if position_embeddings is None:
             raise ValueError("position_embeddings must be provided")
 
-        input_shape = hidden_states.shape[:-1]
-        query_states, key_states, value_states = self.project_qkv(hidden_states)
-
         cos, sin = position_embeddings
-        if self.use_rope:
-            query_states, key_states = rope_native(
-                query_states, key_states, cos, sin
-            )
-        else:
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin
-            )
-
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-            )
-
+        input_shape = hidden_states.shape[:-1]
         cache_length = None
-        if past_key_values is not None:
+        fused_post_qkv = False
+        cache_layer = None
+        if isinstance(past_key_values, StaticCache):
             cache_layer = past_key_values.layers[self.layer_idx]
             cache_length = getattr(cache_layer, "cumulative_length", None)
+        if (
+            self.use_packed_qkv_rope_cache
+            and cache_layer is not None
+            and getattr(cache_layer, "is_initialized", False)
+            and hidden_states.shape == (1, 1, 576)
+            and hidden_states.dtype == torch.float32
+            and hidden_states.device.type == "cuda"
+            and cos.shape == sin.shape == (1, 1, 64)
+            and cos.dtype == sin.dtype == torch.float32
+            and cos.device == sin.device == hidden_states.device
+            and self.query_width == 576
+            and self.key_width == self.value_width == 192
+            and self.query_heads == 9
+            and self.key_value_heads == 3
+            and self.head_dim == 64
+            and cache_layer.keys is not None
+            and cache_layer.values is not None
+            and cache_layer.keys.shape == cache_layer.values.shape
+            and cache_layer.keys.shape[0] == 1
+            and cache_layer.keys.shape[1] == 3
+            and cache_layer.keys.shape[2] >= _GQA_DECODE_GRAPH_MINIMUM_CAPACITY
+            and cache_layer.keys.shape[2] <= 8192
+            and cache_layer.keys.shape[3] == 64
+            and cache_layer.keys.dtype == cache_layer.values.dtype == torch.float32
+            and cache_layer.keys.device
+            == cache_layer.values.device
+            == hidden_states.device
+            and cache_length is not None
+            and cache_length.shape == ()
+            and cache_length.dtype == torch.int64
+            and cache_length.device == hidden_states.device
+            and (
+                attention_mask is None
+                or (
+                    attention_mask.ndim == 4
+                    and attention_mask.dtype == torch.float32
+                    and attention_mask.device == hidden_states.device
+                    and all(
+                        mask_size in (1, target_size)
+                        for mask_size, target_size in zip(
+                            attention_mask.shape,
+                            (1, 9, 1, cache_layer.keys.shape[2]),
+                            strict=True,
+                        )
+                    )
+                )
+            )
+            and not kwargs.get("output_attentions", False)
+        ):
+            packed = self.packed_qkv(hidden_states)
+            query_states = packed_qkv_rope_cache_native(
+                packed,
+                cos,
+                sin,
+                cache_layer.keys,
+                cache_layer.values,
+                cache_length,
+            )
+            del packed
+            key_states = cache_layer.keys
+            value_states = cache_layer.values
+            fused_post_qkv = True
+        else:
+            query_states, key_states, value_states = self.project_qkv(hidden_states)
+            if self.use_rope:
+                query_states, key_states = rope_native(
+                    query_states, key_states, cos, sin
+                )
+            else:
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin
+                )
+
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(
+                    key_states,
+                    value_states,
+                    self.layer_idx,
+                )
+
+            if past_key_values is not None:
+                cache_layer = past_key_values.layers[self.layer_idx]
+                cache_length = getattr(cache_layer, "cumulative_length", None)
 
         if (
             self.use_gqa_decode_attention
             and past_key_values is not None
+            and query_states.shape[0] == 1
             and query_states.shape[-2] == 1
             and query_states.dtype == torch.float32
             and key_states.dtype == torch.float32
@@ -418,6 +493,11 @@ class FluxLlamaAttention(LlamaAttention):
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = self.o_proj(attn_output)
             return attn_output, None
+
+        if fused_post_qkv:
+            raise RuntimeError(
+                "fused packed-QKV cache update requires native GQA decode attention"
+            )
 
         # Preserve Llama eager attention exactly around the Flux softmax:
         # grouped-query expansion, scaled QK, additive mask, softmax, then V.
@@ -479,6 +559,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         use_softmax: bool = True,
         fuse_attention_scores: bool = True,
         use_gqa_decode_attention: bool = False,
+        use_packed_qkv_rope_cache: bool = False,
         use_packed_mlp: bool = False,
         use_packed_swiglu: bool = False,
         use_packed_qkv: bool = False,
@@ -492,6 +573,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
                 use_softmax=use_softmax,
                 fuse_attention_scores=fuse_attention_scores,
                 use_gqa_decode_attention=use_gqa_decode_attention,
+                use_packed_qkv_rope_cache=use_packed_qkv_rope_cache,
                 use_packed_qkv=use_packed_qkv,
             )
             if use_softmax or use_rope or use_gqa_decode_attention or use_packed_qkv
@@ -612,6 +694,11 @@ def _check_native_ops(
         and not native_gqa_decode_attention_is_available()
     ):
         missing.append("gqa_decode_attention")
+    if (
+        FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY in operators
+        and not native_packed_qkv_rope_cache_is_available()
+    ):
+        missing.append("packed_qkv_rope_cache")
     if missing:
         raise RuntimeError(
             "Flux native operators are not built: "
@@ -637,8 +724,11 @@ def enable_flux_ops(
     ``fuse_attention_scores=False`` to retain the separate scale/mask/softmax
     sequence. The separately selected ``"gqa_decode_attention"`` category
     fuses one-token cached decode over unexpanded K/V storage. The default
-    categories intentionally exclude structural and decode-attention fusions,
-    so existing Flux and ordinary Hugging Face behavior are unchanged.
+    categories intentionally exclude structural and decode-attention fusions.
+    The ``"packed_qkv_rope_cache"`` category additionally fuses SmolLM2's
+    one-token Q/K RoPE and StaticCache K/V update and requires ``"rope"``,
+    ``"qkv"``, and ``"gqa_decode_attention"``. Existing Flux and ordinary
+    Hugging Face behavior remain unchanged unless these categories are selected.
     """
     selected = frozenset(operators)
     unknown = selected - _SUPPORTED_OPERATOR_CATEGORIES
@@ -651,6 +741,17 @@ def enable_flux_ops(
         and FLUX_PACKED_MLP_CATEGORY not in selected
     ):
         raise ValueError('"packed_swiglu" requires the "mlp" operator category')
+    if FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY in selected:
+        required_post_qkv = {
+            "rope",
+            FLUX_PACKED_QKV_CATEGORY,
+            FLUX_GQA_DECODE_ATTENTION_CATEGORY,
+        }
+        if not required_post_qkv.issubset(selected):
+            raise ValueError(
+                '"packed_qkv_rope_cache" requires the "rope", "qkv", and '
+                '"gqa_decode_attention" operator categories'
+            )
 
     llama_model = _check_model(model)
     _check_native_ops(
@@ -674,6 +775,9 @@ def enable_flux_ops(
                 use_gqa_decode_attention=(
                     FLUX_GQA_DECODE_ATTENTION_CATEGORY in selected
                 ),
+                use_packed_qkv_rope_cache=(
+                    FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY in selected
+                ),
                 use_packed_mlp=FLUX_PACKED_MLP_CATEGORY in selected,
                 use_packed_swiglu=FLUX_PACKED_SWIGLU_CATEGORY in selected,
                 use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
@@ -693,6 +797,9 @@ def enable_flux_ops(
                     fuse_attention_scores=fuse_attention_scores,
                     use_gqa_decode_attention=(
                         FLUX_GQA_DECODE_ATTENTION_CATEGORY in selected
+                    ),
+                    use_packed_qkv_rope_cache=(
+                        FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY in selected
                     ),
                     use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
                 )
@@ -726,6 +833,9 @@ def enable_flux_ops(
         FLUX_PACKED_SWIGLU_CATEGORY in selected
     )
     llama_model._flux_packed_qkv_enabled = FLUX_PACKED_QKV_CATEGORY in selected
+    llama_model._flux_packed_qkv_rope_cache_enabled = (
+        FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY in selected
+    )
     return llama_model
 
 
@@ -753,6 +863,11 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
             and module.use_gqa_decode_attention
             for module in model.modules()
         ),
+        "packed_qkv_rope_cache_modules": sum(
+            isinstance(module, FluxLlamaAttention)
+            and module.use_packed_qkv_rope_cache
+            for module in model.modules()
+        ),
     }
 
 
@@ -761,6 +876,7 @@ __all__ = [
     "FLUX_GQA_DECODE_ATTENTION_CATEGORY",
     "FLUX_PACKED_MLP_CATEGORY",
     "FLUX_PACKED_QKV_CATEGORY",
+    "FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY",
     "FLUX_PACKED_SWIGLU_CATEGORY",
     "FluxLlamaAttention",
     "FluxLlamaDecoderLayer",

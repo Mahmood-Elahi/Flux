@@ -14,6 +14,11 @@ from flux.ops.native_packed_swiglu import (
     native_packed_swiglu_is_available,
     packed_swiglu_native,
 )
+from flux.ops.native_packed_qkv_rope_cache import (
+    native_packed_qkv_rope_cache_is_available,
+    native_packed_qkv_rope_cache_load_error,
+    packed_qkv_rope_cache_native,
+)
 from flux.ops.native_rmsnorm import (
     native_residual_rmsnorm_is_available,
     native_rmsnorm_is_available,
@@ -45,6 +50,8 @@ __all__ = [
     "native_attention_score_softmax_is_available",
     "native_gqa_decode_attention_is_available",
     "native_packed_swiglu_is_available",
+    "native_packed_qkv_rope_cache_is_available",
+    "native_packed_qkv_rope_cache_load_error",
     "native_residual_rmsnorm_is_available",
     "native_rmsnorm_is_available",
     "native_rmsnorm_load_error",
@@ -54,6 +61,7 @@ __all__ = [
     "native_softmax_load_error",
     "packed_swiglu",
     "packed_swiglu_native",
+    "packed_qkv_rope_cache_native",
     "residual_rmsnorm",
     "residual_rmsnorm_native",
     "rms_norm",
