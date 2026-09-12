@@ -10,7 +10,9 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from flux.model import smollm2_flux
 from flux.ops import (
+    gqa_decode_attention as gqa_decode_attention_reference,
     native_attention_score_softmax_is_available,
+    native_gqa_decode_attention_is_available,
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
     native_rmsnorm_is_available,
@@ -71,6 +73,11 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         "native_attention_score_softmax_is_available",
         lambda: True,
     )
+    monkeypatch.setattr(
+        smollm2_flux,
+        "native_gqa_decode_attention_is_available",
+        lambda: True,
+    )
 
     def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         counts["rmsnorm"] += 1
@@ -115,6 +122,19 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         counts["rope"] += 1
         return smollm2_flux.apply_rotary_pos_emb(query, key, cos, sin)
 
+    def gqa_decode_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor | None,
+        scale: float,
+        cache_length: torch.Tensor | None,
+    ) -> torch.Tensor:
+        counts["gqa_decode_attention"] = counts.get("gqa_decode_attention", 0) + 1
+        return gqa_decode_attention_reference(
+            query, key, value, mask, scale, cache_length
+        )
+
     monkeypatch.setattr(smollm2_flux, "rms_norm_native", rmsnorm)
     monkeypatch.setattr(smollm2_flux, "residual_rmsnorm_native", residual_rmsnorm)
     monkeypatch.setattr(smollm2_flux, "softmax_native", softmax)
@@ -124,6 +144,11 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         attention_score_softmax,
     )
     monkeypatch.setattr(smollm2_flux, "rope_native", rope)
+    monkeypatch.setattr(
+        smollm2_flux,
+        "gqa_decode_attention_native",
+        gqa_decode_attention,
+    )
     monkeypatch.setattr(
         smollm2_flux,
         "packed_swiglu_native",
@@ -690,6 +715,7 @@ def test_enable_flux_ops_preserves_parameters_and_invokes_every_operator(
         "attention_modules": 2,
         "packed_mlp_modules": 0,
         "packed_qkv_modules": 0,
+        "gqa_decode_attention_modules": 0,
     }
     # Two input norms, two fused post-attention norms, and one final norm.
     assert python_flux_ops == {
@@ -824,6 +850,120 @@ def test_greedy_generation_with_kv_cache_matches_reference(
     assert python_flux_ops["softmax"] > 0
     assert python_flux_ops["attention_score_softmax"] > 0
     assert python_flux_ops["rope"] > 0
+
+
+def test_gqa_decode_attention_is_separately_opt_in_and_decode_only(
+    python_flux_ops: dict[str, int],
+) -> None:
+    source = _model(2)
+    current = copy.deepcopy(source)
+    fused = copy.deepcopy(source)
+    smollm2_flux.enable_flux_ops(current)
+    smollm2_flux.enable_flux_ops(
+        fused,
+        operators=smollm2_flux.FLUX_OPERATOR_CATEGORIES
+        | {smollm2_flux.FLUX_GQA_DECODE_ATTENTION_CATEGORY},
+    )
+    prompt = torch.tensor([[1, 17, 42, 9, 3]])
+    token = torch.tensor([[11]])
+
+    with torch.inference_mode():
+        current_prefill = current(prompt, use_cache=True)
+        fused_prefill = fused(prompt, use_cache=True)
+        assert python_flux_ops.get("gqa_decode_attention", 0) == 0
+        current_decode = current(
+            token,
+            past_key_values=current_prefill.past_key_values,
+            use_cache=True,
+        )
+        fused_decode = fused(
+            token,
+            past_key_values=fused_prefill.past_key_values,
+            use_cache=True,
+        )
+        current_tokens = current.generate(
+            prompt, do_sample=False, max_new_tokens=4, use_cache=True
+        )
+        fused_tokens = fused.generate(
+            prompt, do_sample=False, max_new_tokens=4, use_cache=True
+        )
+
+    assert fused._flux_gqa_decode_attention_enabled
+    assert not current._flux_gqa_decode_attention_enabled
+    assert smollm2_flux.flux_operator_counts(fused)[
+        "gqa_decode_attention_modules"
+    ] == 2
+    assert python_flux_ops["gqa_decode_attention"] > 0
+    torch.testing.assert_close(
+        fused_prefill.logits, current_prefill.logits, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        fused_decode.logits, current_decode.logits, rtol=2e-4, atol=2e-5
+    )
+    for layer_index, (fused_layer, current_layer) in enumerate(zip(
+        fused_decode.past_key_values.layers,
+        current_decode.past_key_values.layers,
+        strict=True,
+    )):
+        relative_tolerance = 0 if layer_index == 0 else 2e-4
+        absolute_tolerance = 0 if layer_index == 0 else 2e-5
+        torch.testing.assert_close(
+            fused_layer.keys,
+            current_layer.keys,
+            rtol=relative_tolerance,
+            atol=absolute_tolerance,
+        )
+        torch.testing.assert_close(
+            fused_layer.values,
+            current_layer.values,
+            rtol=relative_tolerance,
+            atol=absolute_tolerance,
+        )
+    assert torch.equal(fused_tokens, current_tokens)
+
+
+def test_gqa_decode_attention_category_falls_back_without_cached_decode(
+    python_flux_ops: dict[str, int],
+) -> None:
+    model = _model(1)
+    reference = copy.deepcopy(model)
+    smollm2_flux.enable_flux_ops(
+        model,
+        operators=(smollm2_flux.FLUX_GQA_DECODE_ATTENTION_CATEGORY,),
+    )
+    input_ids = torch.tensor([[7]])
+
+    with torch.inference_mode():
+        expected = reference(input_ids=input_ids, use_cache=False).logits
+        actual = model(input_ids=input_ids, use_cache=False).logits
+
+    assert python_flux_ops.get("gqa_decode_attention", 0) == 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gqa_decode_attention_falls_back_when_probabilities_are_requested(
+    python_flux_ops: dict[str, int],
+) -> None:
+    model = _model(1)
+    smollm2_flux.enable_flux_ops(
+        model,
+        operators=(smollm2_flux.FLUX_GQA_DECODE_ATTENTION_CATEGORY,),
+    )
+    prompt = torch.tensor([[1, 17, 42]])
+    token = torch.tensor([[9]])
+
+    with torch.inference_mode():
+        prefill = model(prompt, use_cache=True)
+        decode = model(
+            token,
+            past_key_values=prefill.past_key_values,
+            use_cache=True,
+            output_attentions=True,
+        )
+
+    assert python_flux_ops.get("gqa_decode_attention", 0) == 0
+    assert len(decode.attentions) == 1
+    assert decode.attentions[0].shape == (1, 4, 1, 4)
 
 
 def test_hidden_state_capture_survives_module_replacement(
@@ -994,3 +1134,65 @@ def test_native_fused_greedy_generation_matches_current_flux(device: str) -> Non
         )
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not (_NATIVE_OPS_AVAILABLE and native_gqa_decode_attention_is_available()),
+    reason="Flux native operators including GQA decode attention have not been built",
+)
+@pytest.mark.parametrize(
+    "device",
+    ["cpu"] + (["cuda"] if torch.cuda.is_available() else []),
+)
+def test_native_gqa_dynamic_decode_layer_logits_cache_and_generation(device: str) -> None:
+    source = _model(2).to(device)
+    current = copy.deepcopy(source)
+    fused = copy.deepcopy(source)
+    smollm2_flux.enable_flux_ops(current)
+    smollm2_flux.enable_flux_ops(
+        fused,
+        operators=smollm2_flux.FLUX_OPERATOR_CATEGORIES
+        | {smollm2_flux.FLUX_GQA_DECODE_ATTENTION_CATEGORY},
+    )
+    prompt = torch.tensor([[1, 17, 42, 9, 3]], device=device)
+    token = torch.tensor([[11]], device=device)
+
+    with torch.inference_mode():
+        current_prefill = current(prompt, use_cache=True)
+        fused_prefill = fused(prompt, use_cache=True)
+        current_decode = current(
+            token, past_key_values=current_prefill.past_key_values, use_cache=True
+        )
+        fused_decode = fused(
+            token, past_key_values=fused_prefill.past_key_values, use_cache=True
+        )
+        current_tokens = current.generate(
+            prompt, do_sample=False, max_new_tokens=4, use_cache=True
+        )
+        fused_tokens = fused.generate(
+            prompt, do_sample=False, max_new_tokens=4, use_cache=True
+        )
+
+    torch.testing.assert_close(
+        fused_decode.logits, current_decode.logits, rtol=2e-4, atol=2e-5
+    )
+    for layer_index, (fused_layer, current_layer) in enumerate(zip(
+        fused_decode.past_key_values.layers,
+        current_decode.past_key_values.layers,
+        strict=True,
+    )):
+        relative_tolerance = 0 if layer_index == 0 else 2e-4
+        absolute_tolerance = 0 if layer_index == 0 else 2e-5
+        torch.testing.assert_close(
+            fused_layer.keys,
+            current_layer.keys,
+            rtol=relative_tolerance,
+            atol=absolute_tolerance,
+        )
+        torch.testing.assert_close(
+            fused_layer.values,
+            current_layer.values,
+            rtol=relative_tolerance,
+            atol=absolute_tolerance,
+        )
+    assert torch.equal(fused_tokens, current_tokens)

@@ -2,7 +2,7 @@
 
 Flux is a long-term systems and machine-learning project for building a CUDA-accelerated transformer inference system around **SmolLM2-135M**. It uses Python, C++, CUDA C++, and PyTorch.
 
-Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, RoPE, attention softmax, fused attention score post-processing, and packed SwiGLU now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining grouped-query attention and Hugging Face KV-cache management. Separately opt-in structural adapters combine Q/K/V or gate/up projections through standard PyTorch/cuBLAS linear operations, and the MLP adapter can optionally fuse the following SwiGLU elementwise sequence.
+Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, RoPE, attention softmax, fused attention score post-processing, packed SwiGLU, and one-token GQA decode attention now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining Hugging Face KV-cache management. Separately opt-in structural adapters combine Q/K/V or gate/up projections through standard PyTorch/cuBLAS linear operations, and the MLP adapter can optionally fuse the following SwiGLU elementwise sequence.
 
 The reference model remains unchanged as the numerical oracle. Call `enable_flux_ops(model)` explicitly on an evaluated FP32 `LlamaForCausalLM` to replace supported modules on that model instance; importing Flux never mutates a Hugging Face model or global Transformers behavior.
 
@@ -151,6 +151,30 @@ integrated prefill, cached decode, numerical error, and parameter storage with:
 
 ```bash
 python -m benchmarks.benchmark_smollm2_mlp
+```
+
+The independent `"gqa_decode_attention"` category replaces the one-token
+cached-decode sequence—K/V repetition, QK, scaling/mask/softmax, and P@V—with
+a native operator that reads unexpanded `[B, KVH, capacity, D]` cache storage.
+DynamicCache decode uses the fused path at every supported length. StaticCache
+CUDA-Graph decode uses it above the measured 1280-token capacity crossover and
+retains the existing path below that point. Prefill is unchanged. The FP32
+CUDA head-dimension-64 path uses one shared-score block through 512 tokens and
+256-token online-softmax partials plus a max-rescaled reduction beyond 512;
+other supported head dimensions use the general single-block kernel.
+
+```python
+enable_flux_ops(
+    model,
+    operators=FLUX_OPERATOR_CATEGORIES | {"gqa_decode_attention"},
+)
+```
+
+Validate and benchmark isolated attention, a decoder layer, eager decode,
+CUDA-Graph replay, numerical behavior, kernel inventory, and memory with:
+
+```bash
+python benchmarks/benchmark_smollm2_gqa_decode_attention.py
 ```
 
 Validate and benchmark the retained production packed-QKV path, including

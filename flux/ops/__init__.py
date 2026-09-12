@@ -1,6 +1,11 @@
 """Custom operator interfaces for Flux."""
 
 from flux.ops.attention_score_softmax import attention_score_softmax
+from flux.ops.gqa_decode_attention import gqa_decode_attention
+from flux.ops.native_gqa_decode_attention import (
+    gqa_decode_attention_native,
+    native_gqa_decode_attention_is_available,
+)
 from flux.ops.native_attention_score_softmax import (
     attention_score_softmax_native,
     native_attention_score_softmax_is_available,
@@ -35,7 +40,10 @@ from flux.ops.softmax import softmax
 __all__ = [
     "attention_score_softmax",
     "attention_score_softmax_native",
+    "gqa_decode_attention",
+    "gqa_decode_attention_native",
     "native_attention_score_softmax_is_available",
+    "native_gqa_decode_attention_is_available",
     "native_packed_swiglu_is_available",
     "native_residual_rmsnorm_is_available",
     "native_rmsnorm_is_available",

@@ -8,12 +8,19 @@ import pytest
 import torch
 from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM
 
+from flux.model import smollm2_flux
+
 from flux.model.smollm2_cuda_graph import (
     FluxCUDAGraphDecode,
     cuda_graph_greedy_generate,
 )
-from flux.model.smollm2_flux import FLUX_OPERATOR_CATEGORIES, enable_flux_ops
+from flux.model.smollm2_flux import (
+    FLUX_GQA_DECODE_ATTENTION_CATEGORY,
+    FLUX_OPERATOR_CATEGORIES,
+    enable_flux_ops,
+)
 from flux.ops import (
+    native_gqa_decode_attention_is_available,
     native_packed_swiglu_is_available,
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
@@ -191,3 +198,64 @@ def test_eight_token_graph_greedy_continuation_matches_reference() -> None:
         )
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not (_NATIVE_CUDA_AVAILABLE and native_gqa_decode_attention_is_available()),
+    reason="CUDA and all Flux native operators including GQA decode are required",
+)
+def test_gqa_decode_cuda_graph_replay_matches_current_flux_and_preserves_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Force the fused operator for this tiny correctness model. Production
+    # retains the measured short-StaticCache fallback threshold.
+    monkeypatch.setattr(smollm2_flux, "_GQA_DECODE_GRAPH_MINIMUM_CAPACITY", 1)
+    current = _model().cuda()
+    fused = copy.deepcopy(current)
+    enable_flux_ops(current)
+    enable_flux_ops(
+        fused,
+        operators=FLUX_OPERATOR_CATEGORIES | {FLUX_GQA_DECODE_ATTENTION_CATEGORY},
+    )
+    prompt = torch.tensor([[1, 17, 42, 9, 3, 28, 11, 5]], device="cuda")
+
+    with torch.inference_mode():
+        current_state = FluxCUDAGraphDecode.capture(
+            current, prompt, max_decode_steps=8, warmup_steps=2
+        )
+        fused_state = FluxCUDAGraphDecode.capture(
+            fused, prompt, max_decode_steps=8, warmup_steps=2
+        )
+        token = current_state.prefill_logits.argmax(dim=-1)
+        addresses = fused_state.stable_addresses()
+        for step in range(8):
+            current_logits = current_state.replay(token)
+            fused_logits = fused_state.replay(token)
+            torch.testing.assert_close(
+                fused_logits, current_logits, rtol=2e-4, atol=2e-5
+            )
+            assert torch.equal(
+                fused_logits.argmax(dim=-1), current_logits.argmax(dim=-1)
+            )
+            expected_length = prompt.shape[1] + step + 1
+            assert fused_state.cache_position == expected_length
+            for layer_index, (fused_layer, current_layer) in enumerate(zip(
+                fused_state.cache.layers, current_state.cache.layers, strict=True
+            )):
+                relative_tolerance = 0 if layer_index == 0 else 2e-4
+                absolute_tolerance = 0 if layer_index == 0 else 2e-5
+                torch.testing.assert_close(
+                    fused_layer.keys[..., :expected_length, :],
+                    current_layer.keys[..., :expected_length, :],
+                    rtol=relative_tolerance,
+                    atol=absolute_tolerance,
+                )
+                torch.testing.assert_close(
+                    fused_layer.values[..., :expected_length, :],
+                    current_layer.values[..., :expected_length, :],
+                    rtol=relative_tolerance,
+                    atol=absolute_tolerance,
+                )
+            token = current_logits.argmax(dim=-1)
+
+    assert fused_state.stable_addresses() == addresses

@@ -35,6 +35,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
     attention_score_softmax_dir = ROOT / "csrc" / "attention_score_softmax"
     rope_dir = ROOT / "csrc" / "rope"
     packed_swiglu_dir = ROOT / "csrc" / "packed_swiglu"
+    gqa_decode_attention_dir = ROOT / "csrc" / "gqa_decode_attention"
     extension = CUDAExtension(
         name="flux._C",
         sources=[
@@ -55,6 +56,8 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(packed_swiglu_dir / "packed_swiglu_torch.cpp"),
             str(packed_swiglu_dir / "packed_swiglu.cpp"),
             str(packed_swiglu_dir / "packed_swiglu_cuda.cu"),
+            str(gqa_decode_attention_dir / "gqa_decode_attention_torch.cpp"),
+            str(gqa_decode_attention_dir / "gqa_decode_attention_cuda.cu"),
         ],
         include_dirs=[
             str(rmsnorm_dir),
@@ -63,6 +66,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(attention_score_softmax_dir),
             str(rope_dir),
             str(packed_swiglu_dir),
+            str(gqa_decode_attention_dir),
         ],
         extra_compile_args={
             "cxx": ["/W4", "/permissive-"],

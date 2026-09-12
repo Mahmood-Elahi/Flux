@@ -26,7 +26,9 @@ from transformers.models.llama.modeling_llama import (
 
 from flux.ops import (
     attention_score_softmax_native,
+    gqa_decode_attention_native,
     native_attention_score_softmax_is_available,
+    native_gqa_decode_attention_is_available,
     native_packed_swiglu_is_available,
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
@@ -46,11 +48,14 @@ FLUX_OPERATOR_CATEGORIES = frozenset(
 FLUX_PACKED_MLP_CATEGORY = "mlp"
 FLUX_PACKED_SWIGLU_CATEGORY = "packed_swiglu"
 FLUX_PACKED_QKV_CATEGORY = "qkv"
+FLUX_GQA_DECODE_ATTENTION_CATEGORY = "gqa_decode_attention"
 _SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
+    FLUX_GQA_DECODE_ATTENTION_CATEGORY,
     FLUX_PACKED_MLP_CATEGORY,
     FLUX_PACKED_SWIGLU_CATEGORY,
     FLUX_PACKED_QKV_CATEGORY,
 }
+_GQA_DECODE_GRAPH_MINIMUM_CAPACITY = 1281
 
 
 class FluxPackedLlamaMLP(nn.Module):
@@ -180,6 +185,7 @@ class FluxLlamaAttention(LlamaAttention):
         use_rope: bool = True,
         use_softmax: bool = True,
         fuse_attention_scores: bool = True,
+        use_gqa_decode_attention: bool = False,
         use_packed_qkv: bool = False,
     ) -> None:
         nn.Module.__init__(self)
@@ -193,6 +199,7 @@ class FluxLlamaAttention(LlamaAttention):
         self.use_rope = use_rope
         self.use_softmax = use_softmax
         self.fuse_attention_scores = fuse_attention_scores
+        self.use_gqa_decode_attention = use_gqa_decode_attention
         self.use_packed_qkv = use_packed_qkv
 
         projections = (source.q_proj, source.k_proj, source.v_proj)
@@ -329,7 +336,7 @@ class FluxLlamaAttention(LlamaAttention):
         attention_mask: torch.Tensor | None = None,
         past_key_values: Any | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if position_embeddings is None:
             raise ValueError("position_embeddings must be provided")
 
@@ -352,6 +359,65 @@ class FluxLlamaAttention(LlamaAttention):
                 value_states,
                 self.layer_idx,
             )
+
+        cache_length = None
+        if past_key_values is not None:
+            cache_layer = past_key_values.layers[self.layer_idx]
+            cache_length = getattr(cache_layer, "cumulative_length", None)
+
+        if (
+            self.use_gqa_decode_attention
+            and past_key_values is not None
+            and query_states.shape[-2] == 1
+            and query_states.dtype == torch.float32
+            and key_states.dtype == torch.float32
+            and value_states.dtype == torch.float32
+            and query_states.ndim == key_states.ndim == value_states.ndim == 4
+            and key_states.shape == value_states.shape
+            and query_states.shape[0] == key_states.shape[0]
+            and query_states.shape[-1] == key_states.shape[-1]
+            and key_states.shape[1] > 0
+            and query_states.shape[1] % key_states.shape[1] == 0
+            and key_states.shape[-2] <= 8192
+            and (
+                cache_length is None
+                or key_states.shape[-2] >= _GQA_DECODE_GRAPH_MINIMUM_CAPACITY
+            )
+            and (
+                attention_mask is None
+                or (
+                    attention_mask.ndim == 4
+                    and attention_mask.dtype == torch.float32
+                    and attention_mask.device == query_states.device
+                    and all(
+                        mask_size in (1, target_size)
+                        for mask_size, target_size in zip(
+                            attention_mask.shape,
+                            (
+                                query_states.shape[0],
+                                query_states.shape[1],
+                                1,
+                                key_states.shape[-2],
+                            ),
+                            strict=True,
+                        )
+                    )
+                )
+            )
+            and not kwargs.get("output_attentions", False)
+        ):
+            attn_output = gqa_decode_attention_native(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                self.scaling,
+                cache_length,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None
 
         # Preserve Llama eager attention exactly around the Flux softmax:
         # grouped-query expansion, scaled QK, additive mask, softmax, then V.
@@ -412,6 +478,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         use_rope: bool = True,
         use_softmax: bool = True,
         fuse_attention_scores: bool = True,
+        use_gqa_decode_attention: bool = False,
         use_packed_mlp: bool = False,
         use_packed_swiglu: bool = False,
         use_packed_qkv: bool = False,
@@ -424,9 +491,10 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
                 use_rope=use_rope,
                 use_softmax=use_softmax,
                 fuse_attention_scores=fuse_attention_scores,
+                use_gqa_decode_attention=use_gqa_decode_attention,
                 use_packed_qkv=use_packed_qkv,
             )
-            if use_softmax or use_rope or use_packed_qkv
+            if use_softmax or use_rope or use_gqa_decode_attention or use_packed_qkv
             else source.self_attn
         )
         self.mlp = (
@@ -539,6 +607,11 @@ def _check_native_ops(
         and not native_attention_score_softmax_is_available()
     ):
         missing.append("attention_score_softmax")
+    if (
+        FLUX_GQA_DECODE_ATTENTION_CATEGORY in operators
+        and not native_gqa_decode_attention_is_available()
+    ):
+        missing.append("gqa_decode_attention")
     if missing:
         raise RuntimeError(
             "Flux native operators are not built: "
@@ -562,9 +635,10 @@ def enable_flux_ops(
     returned object is the same model instance.
     Multi-token attention score post-processing is fused by default; pass
     ``fuse_attention_scores=False`` to retain the separate scale/mask/softmax
-    sequence. One-token decode always retains that established sequence. The
-    default categories intentionally exclude ``"qkv"`` and ``"mlp"`` so
-    existing Flux and ordinary Hugging Face behavior are unchanged.
+    sequence. The separately selected ``"gqa_decode_attention"`` category
+    fuses one-token cached decode over unexpanded K/V storage. The default
+    categories intentionally exclude structural and decode-attention fusions,
+    so existing Flux and ordinary Hugging Face behavior are unchanged.
     """
     selected = frozenset(operators)
     unknown = selected - _SUPPORTED_OPERATOR_CATEGORIES
@@ -597,6 +671,9 @@ def enable_flux_ops(
                 use_rope="rope" in selected,
                 use_softmax="softmax" in selected,
                 fuse_attention_scores=fuse_attention_scores,
+                use_gqa_decode_attention=(
+                    FLUX_GQA_DECODE_ATTENTION_CATEGORY in selected
+                ),
                 use_packed_mlp=FLUX_PACKED_MLP_CATEGORY in selected,
                 use_packed_swiglu=FLUX_PACKED_SWIGLU_CATEGORY in selected,
                 use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
@@ -607,12 +684,16 @@ def enable_flux_ops(
                 "softmax" in selected
                 or "rope" in selected
                 or FLUX_PACKED_QKV_CATEGORY in selected
+                or FLUX_GQA_DECODE_ATTENTION_CATEGORY in selected
             ):
                 layer.self_attn = FluxLlamaAttention(
                     layer.self_attn,
                     use_rope="rope" in selected,
                     use_softmax="softmax" in selected,
                     fuse_attention_scores=fuse_attention_scores,
+                    use_gqa_decode_attention=(
+                        FLUX_GQA_DECODE_ATTENTION_CATEGORY in selected
+                    ),
                     use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
                 )
             if "rmsnorm" in selected:
@@ -636,6 +717,9 @@ def enable_flux_ops(
     llama_model._flux_operator_categories = tuple(sorted(selected))
     llama_model._flux_attention_score_fusion_enabled = (
         "softmax" in selected and fuse_attention_scores
+    )
+    llama_model._flux_gqa_decode_attention_enabled = (
+        FLUX_GQA_DECODE_ATTENTION_CATEGORY in selected
     )
     llama_model._flux_packed_mlp_enabled = FLUX_PACKED_MLP_CATEGORY in selected
     llama_model._flux_packed_swiglu_enabled = (
@@ -664,11 +748,17 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
             isinstance(module, FluxLlamaAttention) and module.use_packed_qkv
             for module in model.modules()
         ),
+        "gqa_decode_attention_modules": sum(
+            isinstance(module, FluxLlamaAttention)
+            and module.use_gqa_decode_attention
+            for module in model.modules()
+        ),
     }
 
 
 __all__ = [
     "FLUX_OPERATOR_CATEGORIES",
+    "FLUX_GQA_DECODE_ATTENTION_CATEGORY",
     "FLUX_PACKED_MLP_CATEGORY",
     "FLUX_PACKED_QKV_CATEGORY",
     "FLUX_PACKED_SWIGLU_CATEGORY",
