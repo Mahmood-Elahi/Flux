@@ -130,6 +130,171 @@ def _causal_mask(sequence_length: int) -> torch.Tensor:
     return torch.triu(mask, diagonal=1)
 
 
+def _unique_parameter_storage_bytes(model: torch.nn.Module) -> int:
+    storages: dict[int, int] = {}
+    for parameter in model.parameters():
+        storage = parameter.untyped_storage()
+        storages.setdefault(storage.data_ptr(), storage.nbytes())
+    return sum(storages.values())
+
+
+@pytest.mark.parametrize("sequence_length", [1, 7, 32])
+def test_packed_mlp_projection_slices_and_output_match_reference(
+    sequence_length: int,
+) -> None:
+    source = _model(1).model.layers[0].mlp
+    reference = copy.deepcopy(source)
+    packed = smollm2_flux.FluxPackedLlamaMLP(source)
+    hidden_states = torch.randn(1, sequence_length, 32)
+
+    with torch.inference_mode():
+        expected_gate = reference.gate_proj(hidden_states)
+        expected_up = reference.up_proj(hidden_states)
+        gate_up = packed.gate_up_proj(hidden_states)
+        actual_gate, actual_up = gate_up.chunk(2, dim=-1)
+        expected_output = reference(hidden_states)
+        actual_output = packed(hidden_states)
+
+    assert actual_gate.untyped_storage().data_ptr() == gate_up.untyped_storage().data_ptr()
+    assert actual_up.untyped_storage().data_ptr() == gate_up.untyped_storage().data_ptr()
+    torch.testing.assert_close(actual_gate, expected_gate, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(actual_up, expected_up, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(actual_output, expected_output, rtol=2e-5, atol=2e-5)
+
+
+def test_packed_mlp_owns_one_weight_storage_and_preserves_standard_state_dict() -> None:
+    reference = _model(2)
+    standard_state = copy.deepcopy(reference.state_dict())
+    expected_parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in reference.parameters()
+    )
+    expected_storage_bytes = _unique_parameter_storage_bytes(reference)
+
+    packed = copy.deepcopy(reference)
+    smollm2_flux.enable_flux_ops(packed, operators=("mlp",))
+    packed_parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in packed.parameters()
+    )
+    first_mlp = packed.model.layers[0].mlp
+
+    assert isinstance(first_mlp, smollm2_flux.FluxPackedLlamaMLP)
+    assert tuple(first_mlp.gate_up_proj.weight.shape) == (128, 32)
+    assert not hasattr(first_mlp, "gate_proj")
+    assert not hasattr(first_mlp, "up_proj")
+    assert packed_parameter_bytes == expected_parameter_bytes
+    assert _unique_parameter_storage_bytes(packed) == expected_storage_bytes
+    assert set(packed.state_dict()) == set(standard_state)
+    assert not any("gate_up_proj" in key for key in packed.state_dict())
+
+    # A standard checkpoint loads strictly into the packed runtime form.
+    packed.load_state_dict(standard_state, strict=True)
+    # Export from the packed form also loads strictly into ordinary HF Llama.
+    exported = packed.state_dict()
+    restored_reference = _model(2)
+    restored_reference.load_state_dict(exported, strict=True)
+    for key, expected in standard_state.items():
+        torch.testing.assert_close(exported[key], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            restored_reference.state_dict()[key], expected, rtol=0, atol=0
+        )
+
+
+def test_packed_mlp_save_pretrained_exports_an_ordinary_checkpoint(tmp_path) -> None:
+    packed = _model(1)
+    standard_state = copy.deepcopy(packed.state_dict())
+    smollm2_flux.enable_flux_ops(packed, operators=("mlp",))
+
+    packed.save_pretrained(tmp_path, safe_serialization=True)
+    restored = LlamaForCausalLM.from_pretrained(tmp_path, local_files_only=True)
+
+    assert not isinstance(restored.model.layers[0].mlp, smollm2_flux.FluxPackedLlamaMLP)
+    assert set(restored.state_dict()) == set(standard_state)
+    for key, expected in standard_state.items():
+        torch.testing.assert_close(restored.state_dict()[key], expected, rtol=0, atol=0)
+
+
+def test_packed_mlp_layer_prefill_cache_decode_and_generation_match_reference(
+    python_flux_ops: dict[str, int],
+) -> None:
+    reference = _model(2)
+    packed = copy.deepcopy(reference)
+    selected = smollm2_flux.FLUX_OPERATOR_CATEGORIES | {
+        smollm2_flux.FLUX_PACKED_MLP_CATEGORY
+    }
+    smollm2_flux.enable_flux_ops(packed, operators=selected)
+
+    layer_input = torch.randn(1, 7, 32)
+    position_ids = torch.arange(7).unsqueeze(0)
+    position_embeddings = reference.model.rotary_emb(layer_input, position_ids)
+    causal_mask = _causal_mask(7)
+    input_ids = torch.tensor([[1, 17, 42, 9, 3]])
+    next_token = torch.tensor([[11]])
+
+    with torch.inference_mode():
+        expected_layer = reference.model.layers[0](
+            layer_input,
+            position_embeddings=position_embeddings,
+            attention_mask=causal_mask,
+        )
+        actual_layer = packed.model.layers[0](
+            layer_input,
+            position_embeddings=position_embeddings,
+            attention_mask=causal_mask,
+        )
+        expected_prefill = reference(input_ids, use_cache=True)
+        actual_prefill = packed(input_ids, use_cache=True)
+        expected_decode = reference(
+            next_token,
+            past_key_values=expected_prefill.past_key_values,
+            use_cache=True,
+        )
+        actual_decode = packed(
+            next_token,
+            past_key_values=actual_prefill.past_key_values,
+            use_cache=True,
+        )
+        expected_tokens = reference.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=4,
+            use_cache=True,
+        )
+        actual_tokens = packed.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=4,
+            use_cache=True,
+        )
+
+    torch.testing.assert_close(actual_layer, expected_layer, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(
+        actual_prefill.logits, expected_prefill.logits, rtol=2e-4, atol=2e-5
+    )
+    torch.testing.assert_close(
+        actual_decode.logits, expected_decode.logits, rtol=2e-4, atol=2e-5
+    )
+    assert actual_decode.past_key_values.get_seq_length() == input_ids.shape[1] + 1
+    for actual_cache_layer, expected_cache_layer in zip(
+        actual_decode.past_key_values.layers,
+        expected_decode.past_key_values.layers,
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_cache_layer.keys, expected_cache_layer.keys, rtol=2e-4, atol=2e-5
+        )
+        torch.testing.assert_close(
+            actual_cache_layer.values,
+            expected_cache_layer.values,
+            rtol=2e-4,
+            atol=2e-5,
+        )
+    assert torch.equal(actual_tokens, expected_tokens)
+    assert smollm2_flux.flux_operator_counts(packed)["packed_mlp_modules"] == 2
+    assert python_flux_ops["attention_score_softmax"] > 0
+
+
 def test_rmsnorm_substitution_reuses_weight_and_matches_reference(
     python_flux_ops: dict[str, int],
 ) -> None:
@@ -257,6 +422,7 @@ def test_enable_flux_ops_preserves_parameters_and_invokes_every_operator(
         "decoder_layers": 2,
         "rmsnorm_modules": 5,
         "attention_modules": 2,
+        "packed_mlp_modules": 0,
     }
     # Two input norms, two fused post-attention norms, and one final norm.
     assert python_flux_ops == {

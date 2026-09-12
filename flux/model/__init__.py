@@ -6,12 +6,19 @@ from flux.model.smollm2_cuda_graph import (
     FluxCUDAGraphDecode,
     cuda_graph_greedy_generate,
 )
-from flux.model.smollm2_flux import enable_flux_ops, flux_operator_counts
+from flux.model.smollm2_flux import (
+    FLUX_PACKED_MLP_CATEGORY,
+    FluxPackedLlamaMLP,
+    enable_flux_ops,
+    flux_operator_counts,
+)
 
 __all__ = [
     "FluxCUDAGraphDecode",
     "CUDAGraphMemory",
     "CUDAGraphSetupTiming",
+    "FLUX_PACKED_MLP_CATEGORY",
+    "FluxPackedLlamaMLP",
     "cuda_graph_greedy_generate",
     "enable_flux_ops",
     "flux_operator_counts",

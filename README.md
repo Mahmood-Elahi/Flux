@@ -2,7 +2,7 @@
 
 Flux is a long-term systems and machine-learning project for building a CUDA-accelerated transformer inference system around **SmolLM2-135M**. It uses Python, C++, CUDA C++, and PyTorch.
 
-Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, RoPE, attention softmax, and fused attention score post-processing now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining Hugging Face projections, grouped-query attention, MLPs, and KV-cache management.
+Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, RoPE, attention softmax, and fused attention score post-processing now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining Hugging Face projections, grouped-query attention, and KV-cache management. A separately opt-in MLP adapter combines the gate/up projections through one PyTorch/cuBLAS linear operation.
 
 The reference model remains unchanged as the numerical oracle. Call `enable_flux_ops(model)` explicitly on an evaluated FP32 `LlamaForCausalLM` to replace supported modules on that model instance; importing Flux never mutates a Hugging Face model or global Transformers behavior.
 
@@ -104,6 +104,25 @@ softmax after the QK matmul. Pass `fuse_attention_scores=False` to
 `enable_flux_ops` to retain the previous separate sequence for comparison. QK
 and P@V matmuls remain outside the operator; this is not a FlashAttention-style
 or fused-SDPA implementation.
+
+The packed MLP remains separately opt-in so the established Flux path is
+unchanged. It concatenates each layer's standard gate/up checkpoint weights
+once, releases their old runtime storage, splits the combined projection with
+views, and retains the Hugging Face SiLU, multiply, and down projection:
+
+```python
+from flux.model.smollm2_flux import FLUX_OPERATOR_CATEGORIES, enable_flux_ops
+
+enable_flux_ops(model, operators=FLUX_OPERATOR_CATEGORIES | {"mlp"})
+```
+
+Packed models continue to load and export the standard `gate_proj.weight` and
+`up_proj.weight` state-dict keys. Compare isolated projection/MLP latency,
+integrated prefill, cached decode, numerical error, and parameter storage with:
+
+```bash
+python benchmarks/benchmark_smollm2_mlp.py
+```
 
 Validate the pinned model and benchmark RoPE in isolation and in integrated
 prefill/cached-decode paths with:

@@ -12,7 +12,7 @@ from flux.model.smollm2_cuda_graph import (
     FluxCUDAGraphDecode,
     cuda_graph_greedy_generate,
 )
-from flux.model.smollm2_flux import enable_flux_ops
+from flux.model.smollm2_flux import FLUX_OPERATOR_CATEGORIES, enable_flux_ops
 from flux.ops import (
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
@@ -70,11 +70,17 @@ _NATIVE_CUDA_AVAILABLE = (
     not _NATIVE_CUDA_AVAILABLE,
     reason="CUDA and all Flux native custom operators are required",
 )
-def test_repeated_cuda_graph_decode_matches_eager_flux() -> None:
+@pytest.mark.parametrize("packed_mlp", [False, True])
+def test_repeated_cuda_graph_decode_matches_eager_flux(packed_mlp: bool) -> None:
     eager = _model().cuda()
     graph_model = copy.deepcopy(eager)
-    enable_flux_ops(eager)
-    enable_flux_ops(graph_model)
+    operators = (
+        FLUX_OPERATOR_CATEGORIES | {"mlp"}
+        if packed_mlp
+        else FLUX_OPERATOR_CATEGORIES
+    )
+    enable_flux_ops(eager, operators=operators)
+    enable_flux_ops(graph_model, operators=operators)
     prompt = torch.tensor([[1, 17, 42, 9, 3, 28, 11, 5]], device="cuda")
 
     with torch.inference_mode():

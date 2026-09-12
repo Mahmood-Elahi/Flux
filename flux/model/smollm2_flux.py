@@ -1,8 +1,9 @@
-"""Optional FP32 Flux custom-operator execution path for SmolLM2.
+"""Optional FP32 Flux execution path for SmolLM2.
 
 The adapter replaces modules only on the model instance passed to
-``enable_flux_ops``.  It reuses every learned parameter and leaves the
-Hugging Face reference loader and global Transformers behavior untouched.
+``enable_flux_ops``. It leaves the Hugging Face reference loader and global
+Transformers behavior untouched. Native operators reuse learned Parameters;
+the separately selected packed MLP representation repacks gate/up storage.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaDecoderLayer,
     LlamaForCausalLM,
+    LlamaMLP,
     LlamaRMSNorm,
     apply_rotary_pos_emb,
     repeat_kv,
@@ -38,6 +40,106 @@ from flux.ops import (
 FLUX_OPERATOR_CATEGORIES = frozenset(
     {"rmsnorm", "residual_rmsnorm", "rope", "softmax"}
 )
+FLUX_PACKED_MLP_CATEGORY = "mlp"
+_SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
+    FLUX_PACKED_MLP_CATEGORY
+}
+
+
+class FluxPackedLlamaMLP(nn.Module):
+    """Inference MLP with one canonical packed gate/up projection weight.
+
+    The runtime representation owns ``[gate; up]`` as one Parameter and no
+    longer owns the source gate/up Parameters. State dictionaries retain the
+    standard Llama ``gate_proj.weight`` and ``up_proj.weight`` interface.
+    """
+
+    def __init__(self, source: LlamaMLP) -> None:
+        super().__init__()
+        if source.gate_proj.bias is not None or source.up_proj.bias is not None:
+            raise ValueError("Flux packed MLP requires bias-free gate/up projections")
+        if source.gate_proj.weight.requires_grad != source.up_proj.weight.requires_grad:
+            raise ValueError("gate/up projection weights must agree on requires_grad")
+
+        self.config = source.config
+        self.hidden_size = source.hidden_size
+        self.intermediate_size = source.intermediate_size
+        self.act_fn = source.act_fn
+        self.down_proj = source.down_proj
+
+        # Constructing on meta avoids allocating an initialized throwaway
+        # [2 * intermediate_size, hidden_size] tensor. torch.cat is the sole
+        # packed allocation and runs only during explicit integration.
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size,
+            2 * self.intermediate_size,
+            bias=False,
+            device="meta",
+            dtype=source.gate_proj.weight.dtype,
+        )
+        packed_weight = torch.cat(
+            (source.gate_proj.weight, source.up_proj.weight),
+            dim=0,
+        )
+        self.gate_up_proj.weight = nn.Parameter(
+            packed_weight,
+            requires_grad=source.gate_proj.weight.requires_grad,
+        )
+
+        # Keep the checkpoint interface compatible with an ordinary LlamaMLP.
+        self.register_state_dict_post_hook(
+            FluxPackedLlamaMLP._unpack_state_dict_hook
+        )
+        self.register_load_state_dict_pre_hook(
+            FluxPackedLlamaMLP._pack_state_dict_hook
+        )
+
+    @staticmethod
+    def _unpack_state_dict_hook(
+        module: "FluxPackedLlamaMLP",
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        _local_metadata: dict[str, Any],
+    ) -> None:
+        packed_key = prefix + "gate_up_proj.weight"
+        if packed_key not in state_dict:
+            return
+        packed_weight = state_dict.pop(packed_key)
+        gate_weight, up_weight = packed_weight.split(
+            module.intermediate_size,
+            dim=0,
+        )
+        state_dict[prefix + "gate_proj.weight"] = gate_weight
+        state_dict[prefix + "up_proj.weight"] = up_weight
+
+    @staticmethod
+    def _pack_state_dict_hook(
+        _module: "FluxPackedLlamaMLP",
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        _local_metadata: dict[str, Any],
+        _strict: bool,
+        _missing_keys: list[str],
+        _unexpected_keys: list[str],
+        _error_msgs: list[str],
+    ) -> None:
+        packed_key = prefix + "gate_up_proj.weight"
+        gate_key = prefix + "gate_proj.weight"
+        up_key = prefix + "up_proj.weight"
+        if packed_key in state_dict or not (
+            gate_key in state_dict and up_key in state_dict
+        ):
+            return
+        state_dict[packed_key] = torch.cat(
+            (state_dict.pop(gate_key), state_dict.pop(up_key)),
+            dim=0,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(hidden_states)
+        # chunk returns views; it does not allocate separate gate/up tensors.
+        gate, up = gate_up.chunk(2, dim=-1)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 class FluxRMSNorm(LlamaRMSNorm):
@@ -179,6 +281,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         use_rope: bool = True,
         use_softmax: bool = True,
         fuse_attention_scores: bool = True,
+        use_packed_mlp: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = source.hidden_size
@@ -192,7 +295,9 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
             if use_softmax or use_rope
             else source.self_attn
         )
-        self.mlp = source.mlp
+        self.mlp = (
+            FluxPackedLlamaMLP(source.mlp) if use_packed_mlp else source.mlp
+        )
         self.input_layernorm = (
             FluxRMSNorm(source.input_layernorm)
             if use_rmsnorm
@@ -306,15 +411,19 @@ def enable_flux_ops(
 ) -> LlamaForCausalLM:
     """Replace supported modules on an evaluated FP32 Llama causal LM in place.
 
-    The model retains its embeddings, projections, MLPs, RoPE module, causal
-    mask construction, LM head, and cache machinery. Learned Parameters are
-    reused rather than copied. The returned object is the same model instance.
+    The model retains its embeddings, attention projections, RoPE module,
+    causal mask construction, LM head, and cache machinery. Learned Parameters
+    are reused except when the separately opt-in ``"mlp"`` category replaces
+    each gate/up pair with one canonical packed Parameter. The returned object
+    is the same model instance.
     Multi-token attention score post-processing is fused by default; pass
     ``fuse_attention_scores=False`` to retain the separate scale/mask/softmax
-    sequence. One-token decode always retains that established sequence.
+    sequence. One-token decode always retains that established sequence. The
+    default categories intentionally exclude ``"mlp"`` so existing Flux and
+    ordinary Hugging Face behavior are unchanged.
     """
     selected = frozenset(operators)
-    unknown = selected - FLUX_OPERATOR_CATEGORIES
+    unknown = selected - _SUPPORTED_OPERATOR_CATEGORIES
     if unknown:
         raise ValueError(f"unknown Flux operator categories: {sorted(unknown)}")
     if not selected:
@@ -327,19 +436,20 @@ def enable_flux_ops(
     )
 
     if "residual_rmsnorm" in selected:
-        llama_model.model.layers = nn.ModuleList(
-            [
-                FluxLlamaDecoderLayer(
-                    layer,
-                    use_rmsnorm="rmsnorm" in selected,
-                    use_residual_rmsnorm=True,
-                    use_rope="rope" in selected,
-                    use_softmax="softmax" in selected,
-                    fuse_attention_scores=fuse_attention_scores,
-                )
-                for layer in llama_model.model.layers
-            ]
-        )
+        # Replace one layer at a time. In packed-MLP mode this releases each
+        # source gate/up pair before packing the next layer, rather than
+        # transiently retaining a model-wide duplicate.
+        for layer_index in range(len(llama_model.model.layers)):
+            source_layer = llama_model.model.layers[layer_index]
+            llama_model.model.layers[layer_index] = FluxLlamaDecoderLayer(
+                source_layer,
+                use_rmsnorm="rmsnorm" in selected,
+                use_residual_rmsnorm=True,
+                use_rope="rope" in selected,
+                use_softmax="softmax" in selected,
+                fuse_attention_scores=fuse_attention_scores,
+                use_packed_mlp=FLUX_PACKED_MLP_CATEGORY in selected,
+            )
     else:
         for layer in llama_model.model.layers:
             if "softmax" in selected or "rope" in selected:
@@ -354,6 +464,8 @@ def enable_flux_ops(
                 layer.post_attention_layernorm = FluxRMSNorm(
                     layer.post_attention_layernorm
                 )
+            if FLUX_PACKED_MLP_CATEGORY in selected:
+                layer.mlp = FluxPackedLlamaMLP(layer.mlp)
     if "rmsnorm" in selected:
         llama_model.model.norm = FluxRMSNorm(llama_model.model.norm)
     # Transformers installs output-capture hooks lazily on the original layer
@@ -366,6 +478,7 @@ def enable_flux_ops(
     llama_model._flux_attention_score_fusion_enabled = (
         "softmax" in selected and fuse_attention_scores
     )
+    llama_model._flux_packed_mlp_enabled = FLUX_PACKED_MLP_CATEGORY in selected
     return llama_model
 
 
@@ -381,13 +494,18 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
         "attention_modules": sum(
             isinstance(module, FluxLlamaAttention) for module in model.modules()
         ),
+        "packed_mlp_modules": sum(
+            isinstance(module, FluxPackedLlamaMLP) for module in model.modules()
+        ),
     }
 
 
 __all__ = [
     "FLUX_OPERATOR_CATEGORIES",
+    "FLUX_PACKED_MLP_CATEGORY",
     "FluxLlamaAttention",
     "FluxLlamaDecoderLayer",
+    "FluxPackedLlamaMLP",
     "FluxRMSNorm",
     "enable_flux_ops",
     "flux_operator_counts",
