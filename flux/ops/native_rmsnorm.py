@@ -11,6 +11,8 @@ _NATIVE_LIBRARY: Path | None = None
 _NATIVE_LOAD_ERROR: OSError | None = None
 _RMSNORM_FAKE_REGISTERED = False
 _RESIDUAL_RMSNORM_FAKE_REGISTERED = False
+_RMSNORM_OUT_FAKE_REGISTERED = False
+_RESIDUAL_RMSNORM_OUT_FAKE_REGISTERED = False
 
 
 def _operator_is_registered(name: str) -> bool:
@@ -28,6 +30,7 @@ def _library_candidates() -> list[Path]:
 
 def _register_fakes() -> None:
     global _RMSNORM_FAKE_REGISTERED, _RESIDUAL_RMSNORM_FAKE_REGISTERED
+    global _RMSNORM_OUT_FAKE_REGISTERED, _RESIDUAL_RMSNORM_OUT_FAKE_REGISTERED
 
     if _operator_is_registered("rmsnorm") and not _RMSNORM_FAKE_REGISTERED:
 
@@ -55,6 +58,20 @@ def _register_fakes() -> None:
             return torch.empty_like(input, memory_format=torch.contiguous_format)
 
         _RMSNORM_FAKE_REGISTERED = True
+
+    if _operator_is_registered("rmsnorm_out") and not _RMSNORM_OUT_FAKE_REGISTERED:
+
+        @torch.library.register_fake("flux::rmsnorm_out")
+        def _rmsnorm_out_fake(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            epsilon: float,
+            output: torch.Tensor,
+        ) -> torch.Tensor:
+            del input, weight, epsilon
+            return output
+
+        _RMSNORM_OUT_FAKE_REGISTERED = True
 
     if (
         _operator_is_registered("residual_rmsnorm")
@@ -109,6 +126,25 @@ def _register_fakes() -> None:
 
         _RESIDUAL_RMSNORM_FAKE_REGISTERED = True
 
+    if (
+        _operator_is_registered("residual_rmsnorm_out")
+        and not _RESIDUAL_RMSNORM_OUT_FAKE_REGISTERED
+    ):
+
+        @torch.library.register_fake("flux::residual_rmsnorm_out")
+        def _residual_rmsnorm_out_fake(
+            hidden: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+            epsilon: float,
+            norm_out: torch.Tensor,
+            residual_out: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del hidden, residual, weight, epsilon
+            return norm_out, residual_out
+
+        _RESIDUAL_RMSNORM_OUT_FAKE_REGISTERED = True
+
 
 def _try_load_native_library() -> None:
     global _NATIVE_LIBRARY, _NATIVE_LOAD_ERROR
@@ -159,6 +195,19 @@ def rms_norm_native(
     return torch.ops.flux.rmsnorm(input, weight, epsilon)
 
 
+def rms_norm_native_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Write inference-only FP32 RMSNorm into a validated CUDA output."""
+    _try_load_native_library()
+    if not _operator_is_registered("rmsnorm_out"):
+        raise RuntimeError("Flux native RMSNorm out variant is not built")
+    return torch.ops.flux.rmsnorm_out(input, weight, epsilon, output)
+
+
 def native_residual_rmsnorm_is_available() -> bool:
     """Return whether the compiled ``flux::residual_rmsnorm`` operator is loaded."""
     _try_load_native_library()
@@ -188,6 +237,23 @@ def residual_rmsnorm_native(
     return torch.ops.flux.residual_rmsnorm(hidden, residual, weight, epsilon)
 
 
+def residual_rmsnorm_native_out(
+    hidden: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    norm_out: torch.Tensor,
+    residual_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write both fused residual-RMSNorm results into CUDA outputs."""
+    _try_load_native_library()
+    if not _operator_is_registered("residual_rmsnorm_out"):
+        raise RuntimeError("Flux native residual RMSNorm out variant is not built")
+    return torch.ops.flux.residual_rmsnorm_out(
+        hidden, residual, weight, epsilon, norm_out, residual_out
+    )
+
+
 _try_load_native_library()
 
 
@@ -196,5 +262,7 @@ __all__ = [
     "native_rmsnorm_is_available",
     "native_rmsnorm_load_error",
     "residual_rmsnorm_native",
+    "residual_rmsnorm_native_out",
     "rms_norm_native",
+    "rms_norm_native_out",
 ]

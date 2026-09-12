@@ -28,6 +28,7 @@ from transformers.models.llama.modeling_llama import (
 from flux.ops import (
     attention_score_softmax_native,
     gqa_decode_attention_native,
+    gqa_decode_attention_native_out,
     native_attention_score_softmax_is_available,
     native_gqa_decode_attention_is_available,
     native_packed_swiglu_is_available,
@@ -37,9 +38,13 @@ from flux.ops import (
     native_rmsnorm_is_available,
     native_softmax_is_available,
     packed_swiglu_native,
+    packed_swiglu_native_out,
     packed_qkv_rope_cache_native,
+    packed_qkv_rope_cache_native_out,
     residual_rmsnorm_native,
+    residual_rmsnorm_native_out,
     rms_norm_native,
+    rms_norm_native_out,
     rope_native,
     softmax_native,
 )
@@ -156,6 +161,11 @@ class FluxPackedLlamaMLP(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(hidden_states)
         if self.use_packed_swiglu:
+            scratch = getattr(self, "_flux_decode_scratch", None)
+            if scratch is not None:
+                return self.down_proj(
+                    packed_swiglu_native_out(gate_up, scratch.swiglu_output)
+                )
             return self.down_proj(packed_swiglu_native(gate_up))
         # chunk returns views; it does not allocate separate gate/up tensors.
         gate, up = gate_up.chunk(2, dim=-1)
@@ -173,6 +183,14 @@ class FluxRMSNorm(LlamaRMSNorm):
         self.variance_epsilon = source.variance_epsilon
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        scratch = getattr(self, "_flux_decode_scratch", None)
+        if scratch is not None:
+            return rms_norm_native_out(
+                hidden_states,
+                self.weight,
+                self.variance_epsilon,
+                scratch.norm_output,
+            )
         return rms_norm_native(
             hidden_states,
             self.weight,
@@ -405,14 +423,26 @@ class FluxLlamaAttention(LlamaAttention):
             and not kwargs.get("output_attentions", False)
         ):
             packed = self.packed_qkv(hidden_states)
-            query_states = packed_qkv_rope_cache_native(
-                packed,
-                cos,
-                sin,
-                cache_layer.keys,
-                cache_layer.values,
-                cache_length,
-            )
+            scratch = getattr(self, "_flux_decode_scratch", None)
+            if scratch is None:
+                query_states = packed_qkv_rope_cache_native(
+                    packed,
+                    cos,
+                    sin,
+                    cache_layer.keys,
+                    cache_layer.values,
+                    cache_length,
+                )
+            else:
+                query_states = packed_qkv_rope_cache_native_out(
+                    packed,
+                    cos,
+                    sin,
+                    cache_layer.keys,
+                    cache_layer.values,
+                    cache_length,
+                    scratch.query_output,
+                )
             del packed
             key_states = cache_layer.keys
             value_states = cache_layer.values
@@ -481,14 +511,27 @@ class FluxLlamaAttention(LlamaAttention):
             )
             and not kwargs.get("output_attentions", False)
         ):
-            attn_output = gqa_decode_attention_native(
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                self.scaling,
-                cache_length,
-            )
+            scratch = getattr(self, "_flux_decode_scratch", None)
+            if scratch is None:
+                attn_output = gqa_decode_attention_native(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    self.scaling,
+                    cache_length,
+                )
+            else:
+                attn_output = gqa_decode_attention_native_out(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    self.scaling,
+                    cache_length,
+                    scratch.attention_output,
+                    scratch.attention_workspace,
+                )
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = self.o_proj(attn_output)
@@ -625,12 +668,23 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         # by post_attention_layernorm. Both outputs are needed: the normalized
         # value enters the MLP and the unnormalized sum is its residual.
         if self.use_residual_rmsnorm:
-            hidden_states, residual = residual_rmsnorm_native(
-                attention_output,
-                residual,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
+            scratch = getattr(self, "_flux_decode_scratch", None)
+            if scratch is None:
+                hidden_states, residual = residual_rmsnorm_native(
+                    attention_output,
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states, residual = residual_rmsnorm_native_out(
+                    attention_output,
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                    scratch.norm_output,
+                    scratch.residual_output,
+                )
         else:
             residual = residual + attention_output
             hidden_states = self.post_attention_layernorm(residual)

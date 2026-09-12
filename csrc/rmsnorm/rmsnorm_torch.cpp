@@ -2,6 +2,7 @@
 #include "rmsnorm_cuda.h"
 
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/core/grad_mode.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -48,6 +49,28 @@ void validate_rmsnorm_arguments(
             (!input.requires_grad() && !weight.requires_grad()),
         "flux::rmsnorm is inference-only; use torch.no_grad() or "
         "torch.inference_mode() for tensors that require gradients");
+}
+
+void validate_rmsnorm_output(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& output) {
+    TORCH_CHECK(
+        input.is_contiguous() && weight.is_contiguous(),
+        "flux::rmsnorm_out: input and weight must be contiguous");
+    TORCH_CHECK(
+        output.defined() && output.sizes() == input.sizes(),
+        "flux::rmsnorm_out: output shape must match input");
+    TORCH_CHECK(
+        output.scalar_type() == at::kFloat && output.device() == input.device(),
+        "flux::rmsnorm_out: output must be float32 on the input device");
+    TORCH_CHECK(
+        output.is_contiguous(),
+        "flux::rmsnorm_out: output must be contiguous");
+    at::assert_no_internal_overlap(output);
+    TORCH_CHECK(
+        !output.is_alias_of(input) && !output.is_alias_of(weight),
+        "flux::rmsnorm_out: output must not alias an input");
 }
 
 at::Tensor rmsnorm_cpu(
@@ -102,11 +125,35 @@ at::Tensor rmsnorm_cuda(
     return output;
 }
 
+at::Tensor rmsnorm_cuda_out(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const double epsilon,
+    at::Tensor output) {
+    validate_rmsnorm_arguments(input, weight, epsilon);
+    TORCH_CHECK(input.is_cuda(), "flux::rmsnorm_out: CUDA dispatch requires CUDA tensors");
+    validate_rmsnorm_output(input, weight, output);
+    const c10::cuda::CUDAGuard device_guard(input.device());
+    const std::size_t hidden_size = static_cast<std::size_t>(input.size(-1));
+    const std::size_t num_rows =
+        static_cast<std::size_t>(input.numel() / input.size(-1));
+    const c10::cuda::CUDAStream stream =
+        c10::cuda::getCurrentCUDAStream(input.get_device());
+    C10_CUDA_CHECK(flux::rmsnorm_cuda_fp32(
+        input.const_data_ptr<float>(), weight.const_data_ptr<float>(),
+        output.mutable_data_ptr<float>(), num_rows, hidden_size,
+        static_cast<float>(epsilon), stream.stream()));
+    return output;
+}
+
 }  // namespace
 }  // namespace flux
 
 TORCH_LIBRARY(flux, library) {
     library.def("rmsnorm(Tensor input, Tensor weight, float epsilon) -> Tensor");
+    library.def(
+        "rmsnorm_out(Tensor input, Tensor weight, float epsilon, "
+        "Tensor(a!) output) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(flux, CPU, library) {
@@ -115,4 +162,5 @@ TORCH_LIBRARY_IMPL(flux, CPU, library) {
 
 TORCH_LIBRARY_IMPL(flux, CUDA, library) {
     library.impl("rmsnorm", TORCH_FN(flux::rmsnorm_cuda));
+    library.impl("rmsnorm_out", TORCH_FN(flux::rmsnorm_cuda_out));
 }

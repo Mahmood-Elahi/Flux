@@ -1,6 +1,7 @@
 #include "packed_qkv_rope_cache_cuda.h"
 
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/core/grad_mode.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -83,20 +84,37 @@ PackedQKVCacheStrides cache_strides(const at::Tensor& tensor) {
         tensor.stride(0), tensor.stride(1), tensor.stride(2), tensor.stride(3)};
 }
 
-at::Tensor packed_qkv_rope_cache_cuda(
+void validate_query_output(
     const at::Tensor& packed_qkv,
     const at::Tensor& cos,
     const at::Tensor& sin,
     const at::Tensor& key_cache,
     const at::Tensor& value_cache,
-    const at::Tensor& cache_length) {
-    validate_arguments(
-        packed_qkv, cos, sin, key_cache, value_cache, cache_length);
-    TORCH_CHECK(packed_qkv.is_cuda(),
-        "flux::packed_qkv_rope_cache: CUDA dispatch requires CUDA tensors");
-    const c10::cuda::CUDAGuard device_guard(packed_qkv.device());
-    at::Tensor query_output = at::empty(
-        {1, kQueryHeads, 1, kHeadDim}, packed_qkv.options());
+    const at::Tensor& cache_length,
+    const at::Tensor& query_output) {
+    TORCH_CHECK(query_output.defined() &&
+            query_output.sizes() == at::IntArrayRef({1, kQueryHeads, 1, kHeadDim}),
+        "flux::packed_qkv_rope_cache_out: query_output must have shape [1, 9, 1, 64]");
+    TORCH_CHECK(query_output.scalar_type() == at::kFloat &&
+            query_output.device() == packed_qkv.device() &&
+            query_output.is_contiguous(),
+        "flux::packed_qkv_rope_cache_out: query_output must be contiguous float32 on the input device");
+    at::assert_no_internal_overlap(query_output);
+    for (const at::Tensor* input :
+         {&packed_qkv, &cos, &sin, &key_cache, &value_cache, &cache_length}) {
+        TORCH_CHECK(!query_output.is_alias_of(*input),
+            "flux::packed_qkv_rope_cache_out: query_output must not alias an input");
+    }
+}
+
+at::Tensor launch_packed_qkv_rope_cache(
+    const at::Tensor& packed_qkv,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const at::Tensor& cache_length,
+    at::Tensor query_output) {
     const c10::cuda::CUDAStream stream =
         c10::cuda::getCurrentCUDAStream(packed_qkv.get_device());
     C10_CUDA_CHECK(packed_qkv_rope_cache_cuda_fp32(
@@ -112,6 +130,43 @@ at::Tensor packed_qkv_rope_cache_cuda(
     return query_output;
 }
 
+at::Tensor packed_qkv_rope_cache_cuda(
+    const at::Tensor& packed_qkv,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const at::Tensor& cache_length) {
+    validate_arguments(
+        packed_qkv, cos, sin, key_cache, value_cache, cache_length);
+    TORCH_CHECK(packed_qkv.is_cuda(),
+        "flux::packed_qkv_rope_cache: CUDA dispatch requires CUDA tensors");
+    const c10::cuda::CUDAGuard device_guard(packed_qkv.device());
+    at::Tensor query_output = at::empty(
+        {1, kQueryHeads, 1, kHeadDim}, packed_qkv.options());
+    return launch_packed_qkv_rope_cache(
+        packed_qkv, cos, sin, key_cache, value_cache, cache_length, query_output);
+}
+
+at::Tensor packed_qkv_rope_cache_cuda_out(
+    const at::Tensor& packed_qkv,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const at::Tensor& cache_length,
+    at::Tensor query_output) {
+    validate_arguments(
+        packed_qkv, cos, sin, key_cache, value_cache, cache_length);
+    TORCH_CHECK(packed_qkv.is_cuda(),
+        "flux::packed_qkv_rope_cache_out: CUDA dispatch requires CUDA tensors");
+    validate_query_output(
+        packed_qkv, cos, sin, key_cache, value_cache, cache_length, query_output);
+    const c10::cuda::CUDAGuard device_guard(packed_qkv.device());
+    return launch_packed_qkv_rope_cache(
+        packed_qkv, cos, sin, key_cache, value_cache, cache_length, query_output);
+}
+
 }  // namespace
 }  // namespace flux
 
@@ -120,9 +175,16 @@ TORCH_LIBRARY_FRAGMENT(flux, library) {
         "packed_qkv_rope_cache(Tensor packed_qkv, Tensor cos, Tensor sin, "
         "Tensor(a!) key_cache, Tensor(b!) value_cache, "
         "Tensor(c!) cache_length) -> Tensor");
+    library.def(
+        "packed_qkv_rope_cache_out(Tensor packed_qkv, Tensor cos, Tensor sin, "
+        "Tensor(a!) key_cache, Tensor(b!) value_cache, Tensor(c!) cache_length, "
+        "Tensor(d!) query_output) -> Tensor(d!)");
 }
 
 TORCH_LIBRARY_IMPL(flux, CUDA, library) {
     library.impl(
         "packed_qkv_rope_cache", TORCH_FN(flux::packed_qkv_rope_cache_cuda));
+    library.impl(
+        "packed_qkv_rope_cache_out",
+        TORCH_FN(flux::packed_qkv_rope_cache_cuda_out));
 }

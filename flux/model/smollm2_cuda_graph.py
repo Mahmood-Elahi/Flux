@@ -8,6 +8,7 @@ needed to capture one batch-preserving, single-token cached-decode step.
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,46 @@ class CUDAGraphMemory:
     static_cache_bytes: int
     graph_pool_bytes: int
     setup_peak_bytes: int
+    stable_scratch_bytes: int
+
+
+@dataclass(frozen=True)
+class CUDAGraphDecodeScratch:
+    """Small, explicitly owned outputs reused by sequential decode operators."""
+
+    norm_output: torch.Tensor
+    residual_output: torch.Tensor
+    query_output: torch.Tensor
+    attention_output: torch.Tensor
+    attention_workspace: torch.Tensor
+    swiglu_output: torch.Tensor
+
+    @property
+    def bytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                self.norm_output,
+                self.residual_output,
+                self.query_output,
+                self.attention_output,
+                self.attention_workspace,
+                self.swiglu_output,
+            )
+        )
+
+    def addresses(self) -> tuple[int, ...]:
+        return tuple(
+            tensor.data_ptr()
+            for tensor in (
+                self.norm_output,
+                self.residual_output,
+                self.query_output,
+                self.attention_output,
+                self.attention_workspace,
+                self.swiglu_output,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -58,6 +99,7 @@ class FluxCUDAGraphDecode:
         *,
         max_decode_steps: int,
         warmup_steps: int = 3,
+        use_stable_buffers: bool = True,
     ) -> FluxCUDAGraphDecode:
         """Prefill ``input_ids`` and capture a reusable one-token decode graph.
 
@@ -136,27 +178,33 @@ class FluxCUDAGraphDecode:
             device=self.device,
         )
         self._mask_min = mask_min
+        self.scratch = (
+            cls._allocate_decode_scratch(model, self.max_cache_len)
+            if use_stable_buffers
+            else None
+        )
 
         # CUDA Graphs require allocator warmup on a side stream.  Restore all
         # logical state after every warm step so setup never consumes a token.
         warmup_started = time.perf_counter()
-        if warmup_steps:
-            current_stream = torch.cuda.current_stream(self.device)
-            warmup_stream = torch.cuda.Stream(device=self.device)
-            warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream), torch.inference_mode():
-                for _ in range(warmup_steps):
-                    self._decode_body()
-                    self._restore_logical_state()
-            current_stream.wait_stream(warmup_stream)
-            current_stream.synchronize()
-        warmup_finished = time.perf_counter()
+        with cls._installed_decode_scratch(model, self.scratch):
+            if warmup_steps:
+                current_stream = torch.cuda.current_stream(self.device)
+                warmup_stream = torch.cuda.Stream(device=self.device)
+                warmup_stream.wait_stream(current_stream)
+                with torch.cuda.stream(warmup_stream), torch.inference_mode():
+                    for _ in range(warmup_steps):
+                        self._decode_body()
+                        self._restore_logical_state()
+                current_stream.wait_stream(warmup_stream)
+                current_stream.synchronize()
+            warmup_finished = time.perf_counter()
 
-        before_capture = torch.cuda.memory_allocated(self.device)
-        capture_started = time.perf_counter()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(self.graph):
-            self.logits = self._decode_body()
+            before_capture = torch.cuda.memory_allocated(self.device)
+            capture_started = time.perf_counter()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(self.graph):
+                self.logits = self._decode_body()
 
         # Capture executes the body once.  Its result is intentionally discarded
         # and the cache/mask/position are restored before the first real replay.
@@ -169,6 +217,7 @@ class FluxCUDAGraphDecode:
             static_cache_bytes=static_cache_bytes,
             graph_pool_bytes=max(0, after_capture - before_capture),
             setup_peak_bytes=max(0, setup_peak - setup_baseline),
+            stable_scratch_bytes=0 if self.scratch is None else self.scratch.bytes,
         )
         self.setup_timing = CUDAGraphSetupTiming(
             prefill_ms=(prefill_finished - setup_started) * 1000.0,
@@ -178,6 +227,76 @@ class FluxCUDAGraphDecode:
             total_ms=(capture_finished - setup_started) * 1000.0,
         )
         return self
+
+    @staticmethod
+    def _allocate_decode_scratch(
+        model: nn.Module, max_cache_len: int
+    ) -> CUDAGraphDecodeScratch | None:
+        """Allocate the proven-safe SmolLM2 one-token scratch set before capture."""
+        selected = set(getattr(model, "_flux_operator_categories", ()))
+        required = {
+            "rmsnorm",
+            "residual_rmsnorm",
+            "qkv",
+            "mlp",
+            "packed_swiglu",
+            "gqa_decode_attention",
+            "packed_qkv_rope_cache",
+        }
+        config = model.config
+        supported = (
+            required.issubset(selected)
+            and 1281 <= max_cache_len <= 8192
+            and getattr(config, "hidden_size", None) == 576
+            and getattr(config, "intermediate_size", None) == 1536
+            and getattr(config, "num_attention_heads", None) == 9
+            and getattr(config, "num_key_value_heads", None) == 3
+            and getattr(config, "head_dim", None) == 64
+            and next(model.parameters()).dtype == torch.float32
+        )
+        if not supported:
+            return None
+        device = next(model.parameters()).device
+        options = {"device": device, "dtype": torch.float32}
+        chunks = (max_cache_len + 255) // 256
+        return CUDAGraphDecodeScratch(
+            norm_output=torch.empty((1, 1, 576), **options),
+            residual_output=torch.empty((1, 1, 576), **options),
+            query_output=torch.empty((1, 9, 1, 64), **options),
+            attention_output=torch.empty((1, 9, 1, 64), **options),
+            attention_workspace=torch.empty((1, 9, chunks, 66), **options),
+            swiglu_output=torch.empty((1, 1, 1536), **options),
+        )
+
+    @staticmethod
+    @contextmanager
+    def _installed_decode_scratch(
+        model: nn.Module, scratch: CUDAGraphDecodeScratch | None
+    ) -> Any:
+        if scratch is None:
+            yield
+            return
+        from flux.model.smollm2_flux import (
+            FluxLlamaAttention,
+            FluxLlamaDecoderLayer,
+            FluxPackedLlamaMLP,
+            FluxRMSNorm,
+        )
+
+        supported_types = (
+            FluxLlamaAttention,
+            FluxLlamaDecoderLayer,
+            FluxPackedLlamaMLP,
+            FluxRMSNorm,
+        )
+        modules = [module for module in model.modules() if isinstance(module, supported_types)]
+        try:
+            for module in modules:
+                module._flux_decode_scratch = scratch
+            yield
+        finally:
+            for module in modules:
+                del module._flux_decode_scratch
 
     @staticmethod
     def _validate_capture_inputs(
@@ -328,6 +447,7 @@ class FluxCUDAGraphDecode:
             "logits": self.logits.data_ptr(),
             "keys": tuple(layer.keys.data_ptr() for layer in self.cache.layers),
             "values": tuple(layer.values.data_ptr() for layer in self.cache.layers),
+            "scratch": () if self.scratch is None else self.scratch.addresses(),
         }
 
 
@@ -363,6 +483,7 @@ def cuda_graph_greedy_generate(
 
 __all__ = [
     "CUDAGraphMemory",
+    "CUDAGraphDecodeScratch",
     "CUDAGraphSetupTiming",
     "FluxCUDAGraphDecode",
     "cuda_graph_greedy_generate",

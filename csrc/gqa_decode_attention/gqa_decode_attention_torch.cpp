@@ -1,6 +1,7 @@
 #include "gqa_decode_attention_cuda.h"
 
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/core/grad_mode.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -99,6 +100,95 @@ void validate_gqa_decode_attention_arguments(
 
 at::Tensor output_for(const at::Tensor& query) {
     return at::empty(query.sizes(), query.options());
+}
+
+void validate_cuda_outputs(
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const std::optional<at::Tensor>& additive_attention_mask,
+    const std::optional<at::Tensor>& cache_length,
+    const at::Tensor& output,
+    const at::Tensor& workspace) {
+    TORCH_CHECK(query.size(3) == 64 && key_cache.size(2) > 512,
+        "flux::gqa_decode_attention_out: stable workspace path requires head_dim=64 and capacity > 512");
+    TORCH_CHECK(output.defined() && output.sizes() == query.sizes(),
+        "flux::gqa_decode_attention_out: output shape must match query");
+    TORCH_CHECK(output.scalar_type() == at::kFloat &&
+            output.device() == query.device() && output.is_contiguous(),
+        "flux::gqa_decode_attention_out: output must be contiguous float32 on the query device");
+    const int64_t num_chunks = (key_cache.size(2) + 255) / 256;
+    const std::array<int64_t, 4> workspace_sizes = {
+        query.size(0), query.size(1), num_chunks, query.size(3) + 2};
+    TORCH_CHECK(workspace.defined() && workspace.sizes() == workspace_sizes,
+        "flux::gqa_decode_attention_out: workspace shape is incorrect");
+    TORCH_CHECK(workspace.scalar_type() == at::kFloat &&
+            workspace.device() == query.device() && workspace.is_contiguous(),
+        "flux::gqa_decode_attention_out: workspace must be contiguous float32 on the query device");
+    at::assert_no_internal_overlap(output);
+    at::assert_no_internal_overlap(workspace);
+    TORCH_CHECK(!output.is_alias_of(workspace),
+        "flux::gqa_decode_attention_out: output and workspace must not alias");
+    for (const at::Tensor* input : {&query, &key_cache, &value_cache}) {
+        TORCH_CHECK(!output.is_alias_of(*input) && !workspace.is_alias_of(*input),
+            "flux::gqa_decode_attention_out: outputs must not alias Q/K/V");
+    }
+    if (additive_attention_mask.has_value()) {
+        TORCH_CHECK(!output.is_alias_of(*additive_attention_mask) &&
+                !workspace.is_alias_of(*additive_attention_mask),
+            "flux::gqa_decode_attention_out: outputs must not alias the mask");
+    }
+    if (cache_length.has_value()) {
+        TORCH_CHECK(!output.is_alias_of(*cache_length) &&
+                !workspace.is_alias_of(*cache_length),
+            "flux::gqa_decode_attention_out: outputs must not alias cache_length");
+    }
+}
+
+at::Tensor launch_gqa_decode_attention_cuda(
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const std::optional<at::Tensor>& additive_attention_mask,
+    const double scale,
+    const std::optional<at::Tensor>& cache_length,
+    at::Tensor output,
+    float* workspace_data,
+    const int64_t num_chunks) {
+    const c10::cuda::CUDAStream stream =
+        c10::cuda::getCurrentCUDAStream(query.get_device());
+    const std::array<int64_t, 4> query_strides = {
+        query.stride(0), query.stride(1), query.stride(2), query.stride(3)};
+    const std::array<int64_t, 4> key_strides = {
+        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3)};
+    const std::array<int64_t, 4> value_strides = {
+        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3)};
+    std::array<int64_t, 4> mask_sizes = {1, 1, 1, 1};
+    std::array<int64_t, 4> mask_strides = {0, 0, 0, 0};
+    if (additive_attention_mask.has_value()) {
+        for (int64_t dimension = 0; dimension < 4; ++dimension) {
+            mask_sizes[dimension] = additive_attention_mask->size(dimension);
+            mask_strides[dimension] = additive_attention_mask->stride(dimension);
+        }
+    }
+    C10_CUDA_CHECK(gqa_decode_attention_cuda_fp32(
+        query.const_data_ptr<float>(), key_cache.const_data_ptr<float>(),
+        value_cache.const_data_ptr<float>(),
+        additive_attention_mask.has_value()
+            ? additive_attention_mask->const_data_ptr<float>() : nullptr,
+        cache_length.has_value()
+            ? cache_length->const_data_ptr<int64_t>() : nullptr,
+        output.mutable_data_ptr<float>(), workspace_data,
+        static_cast<float>(scale),
+        static_cast<std::size_t>(query.size(0)),
+        static_cast<std::size_t>(query.size(1)),
+        static_cast<std::size_t>(key_cache.size(1)),
+        static_cast<std::size_t>(key_cache.size(2)),
+        static_cast<std::size_t>(query.size(3)),
+        static_cast<std::size_t>(num_chunks),
+        query_strides.data(), key_strides.data(), value_strides.data(),
+        mask_sizes.data(), mask_strides.data(), stream.stream()));
+    return output;
 }
 
 at::Tensor gqa_decode_attention_cpu(
@@ -209,40 +299,34 @@ at::Tensor gqa_decode_attention_cuda(
             query.options());
         workspace_data = workspace.mutable_data_ptr<float>();
     }
-    const c10::cuda::CUDAStream stream =
-        c10::cuda::getCurrentCUDAStream(query.get_device());
-    const std::array<int64_t, 4> query_strides = {
-        query.stride(0), query.stride(1), query.stride(2), query.stride(3)};
-    const std::array<int64_t, 4> key_strides = {
-        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3)};
-    const std::array<int64_t, 4> value_strides = {
-        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3)};
-    std::array<int64_t, 4> mask_sizes = {1, 1, 1, 1};
-    std::array<int64_t, 4> mask_strides = {0, 0, 0, 0};
-    if (additive_attention_mask.has_value()) {
-        for (int64_t dimension = 0; dimension < 4; ++dimension) {
-            mask_sizes[dimension] = additive_attention_mask->size(dimension);
-            mask_strides[dimension] = additive_attention_mask->stride(dimension);
-        }
-    }
-    C10_CUDA_CHECK(gqa_decode_attention_cuda_fp32(
-        query.const_data_ptr<float>(), key_cache.const_data_ptr<float>(),
-        value_cache.const_data_ptr<float>(),
-        additive_attention_mask.has_value()
-            ? additive_attention_mask->const_data_ptr<float>() : nullptr,
-        cache_length.has_value()
-            ? cache_length->const_data_ptr<int64_t>() : nullptr,
-        output.mutable_data_ptr<float>(), workspace_data,
-        static_cast<float>(scale),
-        static_cast<std::size_t>(query.size(0)),
-        static_cast<std::size_t>(query.size(1)),
-        static_cast<std::size_t>(key_cache.size(1)),
-        static_cast<std::size_t>(key_cache.size(2)),
-        static_cast<std::size_t>(query.size(3)),
-        static_cast<std::size_t>(num_chunks),
-        query_strides.data(), key_strides.data(), value_strides.data(),
-        mask_sizes.data(), mask_strides.data(), stream.stream()));
-    return output;
+    return launch_gqa_decode_attention_cuda(
+        query, key_cache, value_cache, additive_attention_mask, scale,
+        cache_length, output, workspace_data, num_chunks);
+}
+
+at::Tensor gqa_decode_attention_cuda_out(
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const std::optional<at::Tensor>& additive_attention_mask,
+    const double scale,
+    const std::optional<at::Tensor>& cache_length,
+    at::Tensor output,
+    at::Tensor workspace) {
+    validate_gqa_decode_attention_arguments(
+        query, key_cache, value_cache, additive_attention_mask, scale, cache_length);
+    TORCH_CHECK(query.is_cuda(),
+        "flux::gqa_decode_attention_out: CUDA dispatch requires CUDA tensors");
+    TORCH_CHECK(key_cache.size(2) <= 8192,
+        "flux::gqa_decode_attention_out: CUDA cache capacity exceeds 8192 tokens");
+    validate_cuda_outputs(
+        query, key_cache, value_cache, additive_attention_mask, cache_length,
+        output, workspace);
+    const c10::cuda::CUDAGuard device_guard(query.device());
+    const int64_t num_chunks = (key_cache.size(2) + 255) / 256;
+    return launch_gqa_decode_attention_cuda(
+        query, key_cache, value_cache, additive_attention_mask, scale,
+        cache_length, output, workspace.mutable_data_ptr<float>(), num_chunks);
 }
 
 }  // namespace
@@ -252,6 +336,10 @@ TORCH_LIBRARY_FRAGMENT(flux, library) {
     library.def(
         "gqa_decode_attention(Tensor query, Tensor key_cache, Tensor value_cache, "
         "Tensor? additive_attention_mask, float scale, Tensor? cache_length=None) -> Tensor");
+    library.def(
+        "gqa_decode_attention_out(Tensor query, Tensor key_cache, Tensor value_cache, "
+        "Tensor? additive_attention_mask, float scale, Tensor? cache_length, "
+        "Tensor(a!) output, Tensor(b!) workspace) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(flux, CPU, library) {
@@ -260,4 +348,6 @@ TORCH_LIBRARY_IMPL(flux, CPU, library) {
 
 TORCH_LIBRARY_IMPL(flux, CUDA, library) {
     library.impl("gqa_decode_attention", TORCH_FN(flux::gqa_decode_attention_cuda));
+    library.impl(
+        "gqa_decode_attention_out", TORCH_FN(flux::gqa_decode_attention_cuda_out));
 }

@@ -206,6 +206,21 @@ and CUDA-Graph measurements plus cache, generation, launch, and memory checks:
 python benchmarks/benchmark_smollm2_packed_qkv_rope_cache.py
 ```
 
+For the fully fused FP32 `B=1`, one-token StaticCache graph path at capacities
+1281 through 8192, graph capture also preallocates a small state-owned scratch
+set. Narrow internal out variants reuse it for RMSNorm, residual RMSNorm,
+packed SwiGLU, packed-QKV post-processing, and native GQA attention. The
+buffers are shared only where producer/consumer lifetimes do not overlap,
+remain owned by the captured runtime object, and are not used by eager or
+unsupported paths. PyTorch deterministic algorithms and uninitialized-memory
+safety filling remain enabled; removing the captured `empty` allocations
+removes their redundant replay fills. Profile the fill attribution, launch
+breakdown, correctness, latency, and graph-pool behavior with:
+
+```bash
+python benchmarks/benchmark_smollm2_stable_buffers.py
+```
+
 Validate and benchmark the retained production packed-QKV path, including
 projection and attention-setup latency, prefill, eager and CUDA-Graph decode,
 view layouts, numerical error, and memory lifetime, with:

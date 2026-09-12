@@ -12,10 +12,11 @@ from flux.ops.native_rmsnorm import (
 
 
 _FAKE_REGISTERED = False
+_OUT_FAKE_REGISTERED = False
 
 
 def _register_fake() -> None:
-    global _FAKE_REGISTERED
+    global _FAKE_REGISTERED, _OUT_FAKE_REGISTERED
     if _operator_is_registered("packed_qkv_rope_cache") and not _FAKE_REGISTERED:
 
         @torch.library.register_fake("flux::packed_qkv_rope_cache")
@@ -107,6 +108,26 @@ def _register_fake() -> None:
 
         _FAKE_REGISTERED = True
 
+    if (
+        _operator_is_registered("packed_qkv_rope_cache_out")
+        and not _OUT_FAKE_REGISTERED
+    ):
+
+        @torch.library.register_fake("flux::packed_qkv_rope_cache_out")
+        def _packed_qkv_rope_cache_out_fake(
+            packed_qkv: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            key_cache: torch.Tensor,
+            value_cache: torch.Tensor,
+            cache_length: torch.Tensor,
+            query_output: torch.Tensor,
+        ) -> torch.Tensor:
+            del packed_qkv, cos, sin, key_cache, value_cache, cache_length
+            return query_output
+
+        _OUT_FAKE_REGISTERED = True
+
 
 def _try_load_native_packed_qkv_rope_cache() -> None:
     _try_load_native_library()
@@ -159,6 +180,30 @@ def packed_qkv_rope_cache_native(
     )
 
 
+def packed_qkv_rope_cache_native_out(
+    packed_qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    cache_length: torch.Tensor,
+    query_output: torch.Tensor,
+) -> torch.Tensor:
+    """Write the compact rotated query into a stable CUDA output."""
+    _try_load_native_packed_qkv_rope_cache()
+    if not _operator_is_registered("packed_qkv_rope_cache_out"):
+        raise RuntimeError("Flux native packed-QKV RoPE/cache out variant is not built")
+    return torch.ops.flux.packed_qkv_rope_cache_out(
+        packed_qkv,
+        cos,
+        sin,
+        key_cache,
+        value_cache,
+        cache_length,
+        query_output,
+    )
+
+
 _try_load_native_packed_qkv_rope_cache()
 
 
@@ -166,4 +211,5 @@ __all__ = [
     "native_packed_qkv_rope_cache_is_available",
     "native_packed_qkv_rope_cache_load_error",
     "packed_qkv_rope_cache_native",
+    "packed_qkv_rope_cache_native_out",
 ]

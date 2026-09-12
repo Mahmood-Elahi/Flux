@@ -2,6 +2,7 @@
 #include "packed_swiglu_cuda.h"
 
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/core/grad_mode.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -45,6 +46,19 @@ at::Tensor output_for(const at::Tensor& packed) {
     return at::empty(output_sizes, packed.options());
 }
 
+void validate_output(const at::Tensor& packed, const at::Tensor& output) {
+    std::vector<int64_t> expected(packed.sizes().begin(), packed.sizes().end());
+    expected.back() /= 2;
+    TORCH_CHECK(output.defined() && output.sizes() == expected,
+        "flux::packed_swiglu_out: output shape is incorrect");
+    TORCH_CHECK(output.scalar_type() == at::kFloat &&
+            output.device() == packed.device() && output.is_contiguous(),
+        "flux::packed_swiglu_out: output must be contiguous float32 on the input device");
+    at::assert_no_internal_overlap(output);
+    TORCH_CHECK(!output.is_alias_of(packed),
+        "flux::packed_swiglu_out: output must not alias packed");
+}
+
 at::Tensor packed_swiglu_cpu(const at::Tensor& packed) {
     validate_packed_swiglu_arguments(packed);
     TORCH_CHECK(
@@ -85,11 +99,33 @@ at::Tensor packed_swiglu_cuda(const at::Tensor& packed) {
     return output;
 }
 
+at::Tensor packed_swiglu_cuda_out(
+    const at::Tensor& packed,
+    at::Tensor output) {
+    validate_packed_swiglu_arguments(packed);
+    TORCH_CHECK(packed.is_cuda(),
+        "flux::packed_swiglu_out: CUDA dispatch requires a CUDA tensor");
+    validate_output(packed, output);
+    const c10::cuda::CUDAGuard device_guard(packed.device());
+    const std::size_t intermediate_size =
+        static_cast<std::size_t>(packed.size(-1) / 2);
+    const std::size_t num_rows = static_cast<std::size_t>(
+        packed.numel() / packed.size(-1));
+    const c10::cuda::CUDAStream stream =
+        c10::cuda::getCurrentCUDAStream(packed.get_device());
+    C10_CUDA_CHECK(packed_swiglu_cuda_fp32(
+        packed.const_data_ptr<float>(), output.mutable_data_ptr<float>(),
+        num_rows, intermediate_size, stream.stream()));
+    return output;
+}
+
 }  // namespace
 }  // namespace flux
 
 TORCH_LIBRARY_FRAGMENT(flux, library) {
     library.def("packed_swiglu(Tensor packed) -> Tensor");
+    library.def(
+        "packed_swiglu_out(Tensor packed, Tensor(a!) output) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(flux, CPU, library) {
@@ -98,4 +134,5 @@ TORCH_LIBRARY_IMPL(flux, CPU, library) {
 
 TORCH_LIBRARY_IMPL(flux, CUDA, library) {
     library.impl("packed_swiglu", TORCH_FN(flux::packed_swiglu_cuda));
+    library.impl("packed_swiglu_out", TORCH_FN(flux::packed_swiglu_cuda_out));
 }
