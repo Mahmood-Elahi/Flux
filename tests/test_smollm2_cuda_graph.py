@@ -73,7 +73,10 @@ _NATIVE_CUDA_AVAILABLE = (
     reason="CUDA and all Flux native custom operators are required",
 )
 @pytest.mark.parametrize("mlp_path", ["standard", "packed", "fused"])
-def test_repeated_cuda_graph_decode_matches_eager_flux(mlp_path: str) -> None:
+@pytest.mark.parametrize("packed_qkv", [False, True])
+def test_repeated_cuda_graph_decode_matches_eager_flux(
+    mlp_path: str, packed_qkv: bool
+) -> None:
     eager = _model().cuda()
     graph_model = copy.deepcopy(eager)
     operators = FLUX_OPERATOR_CATEGORIES
@@ -81,6 +84,8 @@ def test_repeated_cuda_graph_decode_matches_eager_flux(mlp_path: str) -> None:
         operators = operators | {"mlp"}
     if mlp_path == "fused":
         operators = operators | {"packed_swiglu"}
+    if packed_qkv:
+        operators = operators | {"qkv"}
     enable_flux_ops(eager, operators=operators)
     enable_flux_ops(graph_model, operators=operators)
     prompt = torch.tensor([[1, 17, 42, 9, 3, 28, 11, 5]], device="cuda")
@@ -103,6 +108,14 @@ def test_repeated_cuda_graph_decode_matches_eager_flux(mlp_path: str) -> None:
         )
         token = eager_output.logits.argmax(dim=-1)
         addresses = state.stable_addresses()
+        qkv_addresses = (
+            tuple(
+                layer.self_attn.packed_qkv.weight.data_ptr()
+                for layer in graph_model.model.layers
+            )
+            if packed_qkv
+            else ()
+        )
 
         for step in range(8):
             eager_output = eager(
@@ -143,6 +156,11 @@ def test_repeated_cuda_graph_decode_matches_eager_flux(mlp_path: str) -> None:
             token = eager_output.logits.argmax(dim=-1)
 
         assert state.stable_addresses() == addresses
+        if packed_qkv:
+            assert tuple(
+                layer.self_attn.packed_qkv.weight.data_ptr()
+                for layer in graph_model.model.layers
+            ) == qkv_addresses
         assert state.cache_bytes > 0
         with pytest.raises(RuntimeError, match="exhausted"):
             state.replay(token)

@@ -150,6 +150,226 @@ def _unique_parameter_storage_bytes(model: torch.nn.Module) -> int:
 
 
 @pytest.mark.parametrize("sequence_length", [1, 7, 32])
+def test_packed_qkv_projection_slices_shapes_strides_and_storage(
+    sequence_length: int,
+) -> None:
+    source = _model(1).model.layers[0].self_attn
+    reference = copy.deepcopy(source)
+    packed = smollm2_flux.FluxLlamaAttention(
+        source,
+        use_rope=False,
+        use_softmax=False,
+        use_packed_qkv=True,
+    )
+    hidden_states = torch.randn(1, sequence_length, 32)
+
+    with torch.inference_mode():
+        packed_output = packed.packed_qkv(hidden_states)
+        query, key, value = packed.project_qkv(hidden_states)
+        expected = (
+            reference.q_proj(hidden_states)
+            .view(1, sequence_length, 4, 8)
+            .transpose(1, 2),
+            reference.k_proj(hidden_states)
+            .view(1, sequence_length, 2, 8)
+            .transpose(1, 2),
+            reference.v_proj(hidden_states)
+            .view(1, sequence_length, 2, 8)
+            .transpose(1, 2),
+        )
+
+    assert tuple(packed.packed_qkv.weight.shape) == (64, 32)
+    torch.testing.assert_close(packed.packed_qkv.weight[:32], reference.q_proj.weight)
+    torch.testing.assert_close(packed.packed_qkv.weight[32:48], reference.k_proj.weight)
+    torch.testing.assert_close(packed.packed_qkv.weight[48:64], reference.v_proj.weight)
+    packed_storage = query.untyped_storage().data_ptr()
+    assert key.untyped_storage().data_ptr() == packed_storage
+    assert value.untyped_storage().data_ptr() == packed_storage
+    # A second call has a distinct packed output, but every returned Q/K/V
+    # tensor from that call is still a view of its one allocation.
+    assert packed_output.untyped_storage().data_ptr() != packed_storage
+    assert query.shape == (1, 4, sequence_length, 8)
+    assert key.shape == value.shape == (1, 2, sequence_length, 8)
+    if sequence_length == 1:
+        assert query.stride() == (32, 8, 32, 1)
+        assert key.stride() == value.stride() == (16, 8, 16, 1)
+    else:
+        assert query.stride() == (sequence_length * 64, 8, 64, 1)
+        assert key.stride() == value.stride() == (sequence_length * 64, 8, 64, 1)
+    for actual, wanted in zip((query, key, value), expected, strict=True):
+        torch.testing.assert_close(actual, wanted, rtol=2e-5, atol=2e-5)
+
+
+def test_packed_qkv_owns_one_weight_storage_and_preserves_standard_state_dict() -> None:
+    reference = _model(2)
+    standard_state = copy.deepcopy(reference.state_dict())
+    expected_parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in reference.parameters()
+    )
+    expected_storage_bytes = _unique_parameter_storage_bytes(reference)
+
+    packed = copy.deepcopy(reference)
+    smollm2_flux.enable_flux_ops(packed, operators=("qkv",))
+    attention = packed.model.layers[0].self_attn
+
+    assert isinstance(attention, smollm2_flux.FluxLlamaAttention)
+    assert attention.use_packed_qkv
+    assert not hasattr(attention, "q_proj")
+    assert not hasattr(attention, "k_proj")
+    assert not hasattr(attention, "v_proj")
+    assert sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in packed.parameters()
+    ) == expected_parameter_bytes
+    assert _unique_parameter_storage_bytes(packed) == expected_storage_bytes
+    assert set(packed.state_dict()) == set(standard_state)
+    assert not any("packed_qkv" in key for key in packed.state_dict())
+
+    packed.load_state_dict(standard_state, strict=True)
+    exported = packed.state_dict()
+    restored_reference = _model(2)
+    restored_reference.load_state_dict(exported, strict=True)
+    for key, expected in standard_state.items():
+        torch.testing.assert_close(exported[key], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            restored_reference.state_dict()[key], expected, rtol=0, atol=0
+        )
+
+
+def test_packed_qkv_save_pretrained_exports_an_ordinary_checkpoint(tmp_path) -> None:
+    packed = _model(1)
+    standard_state = copy.deepcopy(packed.state_dict())
+    smollm2_flux.enable_flux_ops(packed, operators=("qkv",))
+
+    packed.save_pretrained(tmp_path, safe_serialization=True)
+    restored = LlamaForCausalLM.from_pretrained(tmp_path, local_files_only=True)
+
+    assert not isinstance(
+        restored.model.layers[0].self_attn, smollm2_flux.FluxLlamaAttention
+    )
+    assert set(restored.state_dict()) == set(standard_state)
+    for key, expected in standard_state.items():
+        torch.testing.assert_close(
+            restored.state_dict()[key], expected, rtol=0, atol=0
+        )
+
+
+def test_packed_qkv_is_independently_opt_in_and_matches_reference(
+    python_flux_ops: dict[str, int],
+) -> None:
+    reference = _model(2)
+    packed = copy.deepcopy(reference)
+    smollm2_flux.enable_flux_ops(packed, operators=("qkv",))
+    input_ids = torch.tensor([[1, 17, 42, 9, 3]])
+
+    with torch.inference_mode():
+        expected_prefill = reference(input_ids, use_cache=True)
+        actual_prefill = packed(input_ids, use_cache=True)
+        next_token = torch.tensor([[11]])
+        expected_decode = reference(
+            next_token,
+            past_key_values=expected_prefill.past_key_values,
+            use_cache=True,
+        )
+        actual_decode = packed(
+            next_token,
+            past_key_values=actual_prefill.past_key_values,
+            use_cache=True,
+        )
+        expected_tokens = reference.generate(
+            input_ids, do_sample=False, max_new_tokens=4, use_cache=True
+        )
+        actual_tokens = packed.generate(
+            input_ids, do_sample=False, max_new_tokens=4, use_cache=True
+        )
+
+    torch.testing.assert_close(
+        actual_prefill.logits, expected_prefill.logits, rtol=2e-4, atol=2e-5
+    )
+    torch.testing.assert_close(
+        actual_decode.logits, expected_decode.logits, rtol=2e-4, atol=2e-5
+    )
+    for actual_layer, expected_layer in zip(
+        actual_decode.past_key_values.layers,
+        expected_decode.past_key_values.layers,
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_layer.keys, expected_layer.keys, rtol=2e-4, atol=2e-5
+        )
+        torch.testing.assert_close(
+            actual_layer.values, expected_layer.values, rtol=2e-4, atol=2e-5
+        )
+    assert torch.equal(actual_tokens, expected_tokens)
+    assert packed._flux_operator_categories == ("qkv",)
+    assert packed._flux_packed_qkv_enabled
+    assert smollm2_flux.flux_operator_counts(packed)["packed_qkv_modules"] == 2
+    assert not any(python_flux_ops.values())
+
+
+def test_packed_qkv_views_feed_flux_rope_directly(
+    python_flux_ops: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _model(1)
+    packed = copy.deepcopy(source)
+    observed: dict[str, object] = {}
+
+    def rope(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        python_flux_ops["rope"] += 1
+        observed["query_stride"] = query.stride()
+        observed["key_stride"] = key.stride()
+        observed["shared_storage"] = (
+            query.untyped_storage().data_ptr() == key.untyped_storage().data_ptr()
+        )
+        return smollm2_flux.apply_rotary_pos_emb(query, key, cos, sin)
+
+    monkeypatch.setattr(smollm2_flux, "rope_native", rope)
+    smollm2_flux.enable_flux_ops(packed, operators=("qkv", "rope"))
+    input_ids = torch.tensor([[1, 17, 42, 9, 3]])
+    with torch.inference_mode():
+        expected = source(input_ids, use_cache=False).logits
+        actual = packed(input_ids, use_cache=False).logits
+
+    assert observed == {
+        "query_stride": (320, 8, 64, 1),
+        "key_stride": (320, 8, 64, 1),
+        "shared_storage": True,
+    }
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+
+
+def test_packed_qkv_composes_with_all_retained_flux_categories(
+    python_flux_ops: dict[str, int],
+) -> None:
+    reference = _model(2)
+    packed = copy.deepcopy(reference)
+    operators = smollm2_flux.FLUX_OPERATOR_CATEGORIES | {
+        smollm2_flux.FLUX_PACKED_QKV_CATEGORY,
+        smollm2_flux.FLUX_PACKED_MLP_CATEGORY,
+        smollm2_flux.FLUX_PACKED_SWIGLU_CATEGORY,
+    }
+    smollm2_flux.enable_flux_ops(packed, operators=operators)
+    input_ids = torch.tensor([[1, 17, 42, 9, 3]])
+
+    with torch.inference_mode():
+        expected = reference(input_ids, use_cache=False).logits
+        actual = packed(input_ids, use_cache=False).logits
+
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+    assert packed._flux_packed_qkv_enabled
+    assert packed._flux_packed_mlp_enabled
+    assert packed._flux_packed_swiglu_enabled
+    assert python_flux_ops["rope"] == 2
+    assert python_flux_ops["attention_score_softmax"] == 2
+
+
+@pytest.mark.parametrize("sequence_length", [1, 7, 32])
 def test_packed_mlp_projection_slices_and_output_match_reference(
     sequence_length: int,
 ) -> None:
@@ -469,6 +689,7 @@ def test_enable_flux_ops_preserves_parameters_and_invokes_every_operator(
         "rmsnorm_modules": 5,
         "attention_modules": 2,
         "packed_mlp_modules": 0,
+        "packed_qkv_modules": 0,
     }
     # Two input norms, two fused post-attention norms, and one final norm.
     assert python_flux_ops == {

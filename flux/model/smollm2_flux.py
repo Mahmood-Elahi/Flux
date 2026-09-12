@@ -3,7 +3,8 @@
 The adapter replaces modules only on the model instance passed to
 ``enable_flux_ops``. It leaves the Hugging Face reference loader and global
 Transformers behavior untouched. Native operators reuse learned Parameters;
-the separately selected packed MLP representation repacks gate/up storage.
+the separately selected packed QKV and MLP representations repack projection
+storage.
 """
 
 from __future__ import annotations
@@ -44,9 +45,11 @@ FLUX_OPERATOR_CATEGORIES = frozenset(
 )
 FLUX_PACKED_MLP_CATEGORY = "mlp"
 FLUX_PACKED_SWIGLU_CATEGORY = "packed_swiglu"
+FLUX_PACKED_QKV_CATEGORY = "qkv"
 _SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
     FLUX_PACKED_MLP_CATEGORY,
     FLUX_PACKED_SWIGLU_CATEGORY,
+    FLUX_PACKED_QKV_CATEGORY,
 }
 
 
@@ -177,6 +180,7 @@ class FluxLlamaAttention(LlamaAttention):
         use_rope: bool = True,
         use_softmax: bool = True,
         fuse_attention_scores: bool = True,
+        use_packed_qkv: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.config = source.config
@@ -186,13 +190,137 @@ class FluxLlamaAttention(LlamaAttention):
         self.scaling = source.scaling
         self.attention_dropout = source.attention_dropout
         self.is_causal = source.is_causal
-        self.q_proj = source.q_proj
-        self.k_proj = source.k_proj
-        self.v_proj = source.v_proj
-        self.o_proj = source.o_proj
         self.use_rope = use_rope
         self.use_softmax = use_softmax
         self.fuse_attention_scores = fuse_attention_scores
+        self.use_packed_qkv = use_packed_qkv
+
+        projections = (source.q_proj, source.k_proj, source.v_proj)
+        if use_packed_qkv:
+            if any(projection.bias is not None for projection in projections):
+                raise ValueError("Flux packed QKV requires bias-free projections")
+            if len({projection.in_features for projection in projections}) != 1:
+                raise ValueError("Q/K/V projections must have the same input width")
+            if len({projection.weight.dtype for projection in projections}) != 1:
+                raise ValueError("Q/K/V projection weights must have the same dtype")
+            if len({projection.weight.device for projection in projections}) != 1:
+                raise ValueError("Q/K/V projection weights must be on the same device")
+            if (
+                len({projection.weight.requires_grad for projection in projections})
+                != 1
+            ):
+                raise ValueError("Q/K/V projection weights must agree on requires_grad")
+
+            self.query_width = source.q_proj.out_features
+            self.key_width = source.k_proj.out_features
+            self.value_width = source.v_proj.out_features
+            self.query_heads = self.query_width // self.head_dim
+            self.key_value_heads = self.key_width // self.head_dim
+            if self.query_width % self.head_dim or self.key_width % self.head_dim:
+                raise ValueError("Q/K projection widths must be divisible by head_dim")
+            if self.value_width != self.key_width:
+                raise ValueError("K/V projection widths must match")
+
+            output_width = self.query_width + self.key_width + self.value_width
+            # Avoid an initialized throwaway allocation. torch.cat is the sole
+            # packed allocation; replacing layers one at a time bounds the
+            # temporary Q/K/V duplication during explicit integration.
+            self.packed_qkv = nn.Linear(
+                source.q_proj.in_features,
+                output_width,
+                bias=False,
+                device="meta",
+                dtype=source.q_proj.weight.dtype,
+            )
+            packed_weight = torch.cat(
+                tuple(projection.weight for projection in projections), dim=0
+            )
+            self.packed_qkv.weight = nn.Parameter(
+                packed_weight,
+                requires_grad=source.q_proj.weight.requires_grad,
+            )
+            self.register_state_dict_post_hook(
+                FluxLlamaAttention._unpack_qkv_state_dict_hook
+            )
+            self.register_load_state_dict_pre_hook(
+                FluxLlamaAttention._pack_qkv_state_dict_hook
+            )
+        else:
+            self.q_proj = source.q_proj
+            self.k_proj = source.k_proj
+            self.v_proj = source.v_proj
+        self.o_proj = source.o_proj
+
+    @staticmethod
+    def _unpack_qkv_state_dict_hook(
+        module: "FluxLlamaAttention",
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        _local_metadata: dict[str, Any],
+    ) -> None:
+        packed_key = prefix + "packed_qkv.weight"
+        if packed_key not in state_dict:
+            return
+        packed_weight = state_dict.pop(packed_key)
+        query, key, value = packed_weight.split(
+            (module.query_width, module.key_width, module.value_width), dim=0
+        )
+        state_dict[prefix + "q_proj.weight"] = query
+        state_dict[prefix + "k_proj.weight"] = key
+        state_dict[prefix + "v_proj.weight"] = value
+
+    @staticmethod
+    def _pack_qkv_state_dict_hook(
+        _module: "FluxLlamaAttention",
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        _local_metadata: dict[str, Any],
+        _strict: bool,
+        _missing_keys: list[str],
+        _unexpected_keys: list[str],
+        _error_msgs: list[str],
+    ) -> None:
+        packed_key = prefix + "packed_qkv.weight"
+        standard_keys = tuple(
+            prefix + name
+            for name in ("q_proj.weight", "k_proj.weight", "v_proj.weight")
+        )
+        if packed_key in state_dict or not all(
+            key in state_dict for key in standard_keys
+        ):
+            return
+        state_dict[packed_key] = torch.cat(
+            tuple(state_dict.pop(key) for key in standard_keys), dim=0
+        )
+
+    def project_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project Q/K/V and return head-major allocation-free views."""
+        input_shape = hidden_states.shape[:-1]
+        if self.use_packed_qkv:
+            packed = self.packed_qkv(hidden_states)
+            query, key, value = packed.split(
+                (self.query_width, self.key_width, self.value_width), dim=-1
+            )
+            return (
+                query.view(
+                    *input_shape, self.query_heads, self.head_dim
+                ).transpose(1, 2),
+                key.view(
+                    *input_shape, self.key_value_heads, self.head_dim
+                ).transpose(1, 2),
+                value.view(
+                    *input_shape, self.key_value_heads, self.head_dim
+                ).transpose(1, 2),
+            )
+
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        return (
+            self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2),
+            self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2),
+            self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2),
+        )
 
     def forward(
         self,
@@ -206,11 +334,7 @@ class FluxLlamaAttention(LlamaAttention):
             raise ValueError("position_embeddings must be provided")
 
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states, key_states, value_states = self.project_qkv(hidden_states)
 
         cos, sin = position_embeddings
         if self.use_rope:
@@ -290,6 +414,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         fuse_attention_scores: bool = True,
         use_packed_mlp: bool = False,
         use_packed_swiglu: bool = False,
+        use_packed_qkv: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = source.hidden_size
@@ -299,8 +424,9 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
                 use_rope=use_rope,
                 use_softmax=use_softmax,
                 fuse_attention_scores=fuse_attention_scores,
+                use_packed_qkv=use_packed_qkv,
             )
-            if use_softmax or use_rope
+            if use_softmax or use_rope or use_packed_qkv
             else source.self_attn
         )
         self.mlp = (
@@ -431,14 +557,14 @@ def enable_flux_ops(
 
     The model retains its embeddings, attention projections, RoPE module,
     causal mask construction, LM head, and cache machinery. Learned Parameters
-    are reused except when the separately opt-in ``"mlp"`` category replaces
-    each gate/up pair with one canonical packed Parameter. The returned object
-    is the same model instance.
+    are reused except when the separately opt-in ``"qkv"`` and ``"mlp"``
+    categories replace projection groups with canonical packed Parameters. The
+    returned object is the same model instance.
     Multi-token attention score post-processing is fused by default; pass
     ``fuse_attention_scores=False`` to retain the separate scale/mask/softmax
     sequence. One-token decode always retains that established sequence. The
-    default categories intentionally exclude ``"mlp"`` so existing Flux and
-    ordinary Hugging Face behavior are unchanged.
+    default categories intentionally exclude ``"qkv"`` and ``"mlp"`` so
+    existing Flux and ordinary Hugging Face behavior are unchanged.
     """
     selected = frozenset(operators)
     unknown = selected - _SUPPORTED_OPERATOR_CATEGORIES
@@ -473,15 +599,21 @@ def enable_flux_ops(
                 fuse_attention_scores=fuse_attention_scores,
                 use_packed_mlp=FLUX_PACKED_MLP_CATEGORY in selected,
                 use_packed_swiglu=FLUX_PACKED_SWIGLU_CATEGORY in selected,
+                use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
             )
     else:
         for layer in llama_model.model.layers:
-            if "softmax" in selected or "rope" in selected:
+            if (
+                "softmax" in selected
+                or "rope" in selected
+                or FLUX_PACKED_QKV_CATEGORY in selected
+            ):
                 layer.self_attn = FluxLlamaAttention(
                     layer.self_attn,
                     use_rope="rope" in selected,
                     use_softmax="softmax" in selected,
                     fuse_attention_scores=fuse_attention_scores,
+                    use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
                 )
             if "rmsnorm" in selected:
                 layer.input_layernorm = FluxRMSNorm(layer.input_layernorm)
@@ -509,6 +641,7 @@ def enable_flux_ops(
     llama_model._flux_packed_swiglu_enabled = (
         FLUX_PACKED_SWIGLU_CATEGORY in selected
     )
+    llama_model._flux_packed_qkv_enabled = FLUX_PACKED_QKV_CATEGORY in selected
     return llama_model
 
 
@@ -527,12 +660,17 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
         "packed_mlp_modules": sum(
             isinstance(module, FluxPackedLlamaMLP) for module in model.modules()
         ),
+        "packed_qkv_modules": sum(
+            isinstance(module, FluxLlamaAttention) and module.use_packed_qkv
+            for module in model.modules()
+        ),
     }
 
 
 __all__ = [
     "FLUX_OPERATOR_CATEGORIES",
     "FLUX_PACKED_MLP_CATEGORY",
+    "FLUX_PACKED_QKV_CATEGORY",
     "FLUX_PACKED_SWIGLU_CATEGORY",
     "FluxLlamaAttention",
     "FluxLlamaDecoderLayer",

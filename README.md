@@ -2,7 +2,7 @@
 
 Flux is a long-term systems and machine-learning project for building a CUDA-accelerated transformer inference system around **SmolLM2-135M**. It uses Python, C++, CUDA C++, and PyTorch.
 
-Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, RoPE, attention softmax, fused attention score post-processing, and packed SwiGLU now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining Hugging Face projections, grouped-query attention, and KV-cache management. Separately opt-in MLP adapters combine the gate/up projections through one PyTorch/cuBLAS linear operation and optionally fuse the following SwiGLU elementwise sequence.
+Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, RoPE, attention softmax, fused attention score post-processing, and packed SwiGLU now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining grouped-query attention and Hugging Face KV-cache management. Separately opt-in structural adapters combine Q/K/V or gate/up projections through standard PyTorch/cuBLAS linear operations, and the MLP adapter can optionally fuse the following SwiGLU elementwise sequence.
 
 The reference model remains unchanged as the numerical oracle. Call `enable_flux_ops(model)` explicitly on an evaluated FP32 `LlamaForCausalLM` to replace supported modules on that model instance; importing Flux never mutates a Hugging Face model or global Transformers behavior.
 
@@ -116,6 +116,23 @@ from flux.model.smollm2_flux import FLUX_OPERATOR_CATEGORIES, enable_flux_ops
 enable_flux_ops(model, operators=FLUX_OPERATOR_CATEGORIES | {"mlp"})
 ```
 
+The independent `"qkv"` category similarly concatenates the bias-free Q, K,
+and V weights once in `[Q | K | V]` order and replaces the three projections
+with one standard `nn.Linear`/cuBLAS GEMM. For SmolLM2-135M its packed weight is
+`[960, 576]`. Allocation-free split, reshape, and transpose views feed the
+existing Flux RoPE and cache paths directly; no custom GEMM or RoPE change is
+involved:
+
+```python
+enable_flux_ops(model, operators=FLUX_OPERATOR_CATEGORIES | {"qkv"})
+```
+
+Packed QKV remains independently selectable from packed MLP, packed SwiGLU,
+RoPE, softmax, and CUDA-Graph decode. At runtime it is the sole Q/K/V weight
+storage, while strict loading, `state_dict()`, and `save_pretrained` retain the
+ordinary `q_proj.weight`, `k_proj.weight`, and `v_proj.weight` checkpoint
+interface.
+
 Add the separately controlled `"packed_swiglu"` category to replace the
 SiLU/multiply pair with `torch.ops.flux.packed_swiglu`. The operator consumes
 the original contiguous `[gate; up]` projection result directly, produces a
@@ -134,6 +151,14 @@ integrated prefill, cached decode, numerical error, and parameter storage with:
 
 ```bash
 python -m benchmarks.benchmark_smollm2_mlp
+```
+
+Validate and benchmark the retained production packed-QKV path, including
+projection and attention-setup latency, prefill, eager and CUDA-Graph decode,
+view layouts, numerical error, and memory lifetime, with:
+
+```bash
+python benchmarks/benchmark_smollm2_qkv.py
 ```
 
 Validate the pinned model and benchmark RoPE in isolation and in integrated

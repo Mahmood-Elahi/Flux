@@ -17,7 +17,8 @@ Flux is one continuous project progressing toward a single final outcome: an int
 13. **Completed:** Implement and integrate FP32 RoPE with CPU/CUDA dispatch, current-stream execution, GQA-aware Q/K rotation, positional-offset and cache-decode validation, and measured model-level gains.
 14. **Completed:** Profile the SmolLM2 MLP, retain a separately opt-in packed gate/up projection after correctness and end-to-end benchmarking, and preserve standard checkpoint compatibility.
 15. **Completed:** Implement and retain separately opt-in FP32 packed SwiGLU with CPU/CUDA dispatch, current-stream execution, FakeTensor/opcheck coverage, model and CUDA-Graph integration, and measured MLP/prefill/decode/memory results.
-16. Continue profiling and optimizing measured integrated-system bottlenecks.
-17. Reach the final integrated Flux inference system.
+16. **Completed:** Profile and retain separately opt-in packed QKV as a structural PyTorch/cuBLAS optimization, preserving standard checkpoints, allocation-free strided RoPE/cache views, CUDA-Graph decode, and unchanged parameter/cache storage.
+17. Continue profiling and optimizing measured integrated-system bottlenecks.
+18. Reach the final integrated Flux inference system.
 
 Each implementation and optimization milestone remains part of the same evolving codebase. Correctness against the reference path precedes performance work, and optimization decisions are driven by reproducible measurements.
