@@ -187,3 +187,43 @@ def test_cuda_graph_replay_reads_advancing_device_cache_length() -> None:
         )
         torch.testing.assert_close(output, expected, rtol=RTOL, atol=ATOL)
         assert output.data_ptr() == address
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    "capacity,valid_length",
+    [
+        (128, 91),
+        (512, 511),
+        (1024, 777),
+        (1280, 1279),
+        (1281, 913),
+        (2048, 2047),
+        (4096, 3073),
+        (8190, 8189),
+    ],
+)
+def test_smollm2_boundary_lengths_match_reference(
+    capacity: int, valid_length: int
+) -> None:
+    query, key, value, mask = _inputs("cuda", capacity)
+    # Exercise a head-specific mask as well as a device-resident partial length.
+    mask = mask.expand(1, 9, 1, capacity).clone()
+    length = torch.tensor(valid_length, device="cuda")
+    expected = gqa_decode_attention(query, key, value, mask, 0.125, length)
+    actual = gqa_decode_attention_native(query, key, value, mask, 0.125, length)
+    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("capacity", [1280, 1281, 4096, 8190])
+def test_extreme_finite_fp32_inputs_remain_stable(capacity: int) -> None:
+    query, key, value, mask = _inputs("cuda", capacity)
+    query.mul_(16.0)
+    key.mul_(16.0)
+    value.mul_(16.0)
+    mask.mul_(32.0)
+    expected = gqa_decode_attention(query, key, value, mask, 0.125)
+    actual = gqa_decode_attention_native(query, key, value, mask, 0.125)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)

@@ -374,7 +374,7 @@ def _attribution(capacity: int) -> tuple[tuple[str, int, int, int, float], ...]:
     query = torch.randn((1, 9, 1, 64), generator=generator, device="cuda")
     mask = torch.zeros((1, 1, 1, capacity), device="cuda")
     operations: tuple[tuple[str, int, int, Callable[[], object]], ...] = (
-        ("GQA output + workspace", 30, (9 * 64 + 9 * ((capacity + 255) // 256) * 66) * 4,
+        ("GQA output + workspace", 30, (9 * 64 + 9 * ((capacity + 127) // 128) * 66) * 4,
          lambda: gqa_decode_attention_native(query, keys, values, mask, 0.125, length)),
         ("residual RMSNorm outputs", 30, 2 * 576 * 4,
          lambda: residual_rmsnorm_native(hidden, residual, weight, 1e-5)),
@@ -574,8 +574,8 @@ def main() -> int:
 
     selected_bytes = sum(row[3] for row in attribution)
     stable_bytes = 0
-    if args.profile_capacity >= 1281:
-        stable_bytes = (2 * 576 + 2 * 9 * 64 + 9 * ((args.profile_capacity + 255) // 256) * 66 + 1536) * 4
+    if args.profile_capacity >= 513:
+        stable_bytes = (2 * 576 + 2 * 9 * 64 + 9 * ((args.profile_capacity + 127) // 128) * 66 + 1536) * 4
     print("\nMemory")
     print(f"  selected visible temporary allocations: baseline=211/token, stable=0/token")
     print(f"  selected temporary bytes: baseline={selected_bytes/MIB:.4f} MiB/token, stable=0")

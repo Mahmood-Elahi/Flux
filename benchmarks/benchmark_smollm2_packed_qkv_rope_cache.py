@@ -822,7 +822,7 @@ def main() -> int:
         f"fused={fused_pool / MIB:.3f} MiB"
     )
     print(
-        "  activation rule: StaticCache capacity >=1281 and <=8192; smaller graph "
+        "  activation rule: StaticCache capacity >=513 and <=8192; smaller graph "
         "capacities retain the measured native-GQA crossover fallback"
     )
     print(

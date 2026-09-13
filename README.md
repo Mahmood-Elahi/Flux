@@ -159,10 +159,12 @@ a native operator that reads unexpanded `[B, KVH, capacity, D]` cache storage.
 The initial native contract is FP32, batch size one, and query length one;
 unsupported inputs retain the existing attention path. DynamicCache decode
 uses the fused path at every supported length. StaticCache
-CUDA-Graph decode uses it above the measured 1280-token capacity crossover and
-retains the existing path below that point. Prefill is unchanged. The FP32
-CUDA head-dimension-64 path uses one shared-score block through 512 tokens and
-256-token online-softmax partials plus a max-rescaled reduction beyond 512;
+CUDA-Graph decode uses it above the measured 512-token capacity crossover and
+retains the existing shared-memory path through 512. Prefill is unchanged. The
+FP32 CUDA head-dimension-64 path uses one shared-score block through 512 tokens and
+128-token online-softmax partials plus a max-rescaled reduction beyond 512.
+Capacities through 4096 use query-head partials; larger SmolLM2 capacities use
+KV-head-grouped partials that reuse each K/V load across three query heads;
 other supported head dimensions use the general single-block kernel.
 
 ```python
@@ -187,9 +189,9 @@ returns compact head-major Q, and advances the device-resident cache length.
 It is CUDA-Graph safe and removes the separate RoPE/cache-update sequence
 without a workspace or graph-pool increase. It requires `"rope"`, `"qkv"`, and
 `"gqa_decode_attention"`; unsupported inputs use the retained path. As with
-native GQA attention, StaticCache capacities through 1280 retain the measured
-short-context crossover fallback. The specialized fused path supports
-capacities 1281 through 8192.
+native GQA attention, StaticCache capacities through 512 retain the measured
+short-context fallback. The specialized fused path supports capacities 513
+through 8192.
 
 ```python
 enable_flux_ops(
@@ -207,7 +209,7 @@ python benchmarks/benchmark_smollm2_packed_qkv_rope_cache.py
 ```
 
 For the fully fused FP32 `B=1`, one-token StaticCache graph path at capacities
-1281 through 8192, graph capture also preallocates a small state-owned scratch
+513 through 8192, graph capture also preallocates a small state-owned scratch
 set. Narrow internal out variants reuse it for RMSNorm, residual RMSNorm,
 packed SwiGLU, packed-QKV post-processing, and native GQA attention. The
 buffers are shared only where producer/consumer lifetimes do not overlap,

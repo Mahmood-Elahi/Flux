@@ -555,7 +555,7 @@ def main() -> int:
 
     repeated_bytes = 2 * HEADS * profile_context * HEAD_DIM * 4
     score_bytes = 2 * HEADS * profile_context * 4
-    workspace_bytes = HEADS * ((profile_context + 255) // 256) * (HEAD_DIM + 2) * 4
+    workspace_bytes = HEADS * ((profile_context + 127) // 128) * (HEAD_DIM + 2) * 4
     cache_bytes = 30 * 2 * KV_HEADS * profile_context * HEAD_DIM * 4
     repeat_copy_traffic = 2 * (KV_HEADS + HEADS) * profile_context * HEAD_DIM * 4
     print(f"\nProfiler and memory at context {profile_context}")
@@ -574,8 +574,32 @@ def main() -> int:
         f"  independent graph pool: current={current_pool/MIB:.3f} MiB, "
         f"fused={fused_pool/MIB:.3f} MiB"
     )
-    print("\nKernel design: 256-token partial online softmax + per-head max-rescaled reduction; "
-          "qh -> qh // 3; caller current stream; valid length read from StaticCache device scalar.")
+    print("\nKernel design: 128-token partial online softmax + per-head max-rescaled reduction; "
+          "KV-grouped stage 1 above capacity 4096; caller current stream; "
+          "valid length read from the StaticCache device scalar.")
+    print("\nNative GQA algorithmic traffic (requested bytes; hardware counters may differ)")
+    print(
+        f"{'L':>6} {'chunks':>7} {'KV minimum':>12} {'KV stage 1':>12} "
+        f"{'Q read':>10} {'mask':>10} {'workspace W/R':>24} {'output':>10}"
+    )
+    for context in (512, 1024, 1280, 2048, 4096, 8192):
+        chunks = (context + 127) // 128
+        logical_kv = 2 * KV_HEADS * context * HEAD_DIM * 4
+        stage1_kv = logical_kv if context > 4096 else 2 * HEADS * context * HEAD_DIM * 4
+        query_bytes = HEADS * chunks * HEAD_DIM * 4
+        mask_bytes = HEADS * context * 4
+        workspace_write = HEADS * chunks * (HEAD_DIM + 2) * 4
+        # The reduction issues three scalar-state reads and two reads per
+        # output dimension and chunk. Caches can reduce physical DRAM traffic.
+        workspace_read = HEADS * chunks * (3 + 2 * HEAD_DIM) * 4
+        output_bytes = HEADS * HEAD_DIM * 4
+        print(
+            f"{context:>6} {chunks:>7} {logical_kv/MIB:>11.3f}M "
+            f"{stage1_kv/MIB:>11.3f}M {query_bytes/1024:>9.1f}K "
+            f"{mask_bytes/1024:>9.1f}K "
+            f"{workspace_write/1024:>9.1f}K/{workspace_read/1024:<9.1f}K "
+            f"{output_bytes/1024:>9.2f}K"
+        )
     gc.collect()
     return 0
 

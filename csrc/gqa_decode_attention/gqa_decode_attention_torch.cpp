@@ -117,7 +117,9 @@ void validate_cuda_outputs(
     TORCH_CHECK(output.scalar_type() == at::kFloat &&
             output.device() == query.device() && output.is_contiguous(),
         "flux::gqa_decode_attention_out: output must be contiguous float32 on the query device");
-    const int64_t num_chunks = (key_cache.size(2) + 255) / 256;
+    constexpr int64_t chunk_size = 128;
+    const int64_t num_chunks =
+        (key_cache.size(2) + chunk_size - 1) / chunk_size;
     const std::array<int64_t, 4> workspace_sizes = {
         query.size(0), query.size(1), num_chunks, query.size(3) + 2};
     TORCH_CHECK(workspace.defined() && workspace.sizes() == workspace_sizes,
@@ -288,7 +290,7 @@ at::Tensor gqa_decode_attention_cuda(
         "flux::gqa_decode_attention: CUDA cache capacity exceeds 8192 tokens");
     const c10::cuda::CUDAGuard device_guard(query.device());
     at::Tensor output = output_for(query);
-    constexpr int64_t chunk_size = 256;
+    constexpr int64_t chunk_size = 128;
     const int64_t num_chunks =
         (key_cache.size(2) + chunk_size - 1) / chunk_size;
     at::Tensor workspace;
@@ -323,7 +325,7 @@ at::Tensor gqa_decode_attention_cuda_out(
         query, key_cache, value_cache, additive_attention_mask, cache_length,
         output, workspace);
     const c10::cuda::CUDAGuard device_guard(query.device());
-    const int64_t num_chunks = (key_cache.size(2) + 255) / 256;
+    const int64_t num_chunks = (key_cache.size(2) + 127) / 128;
     return launch_gqa_decode_attention_cuda(
         query, key_cache, value_cache, additive_attention_mask, scale,
         cache_length, output, workspace.mutable_data_ptr<float>(), num_chunks);

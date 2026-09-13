@@ -10,9 +10,14 @@ namespace {
 
 constexpr unsigned int kWarpSize = 32;
 constexpr unsigned int kBlockSize = 256;
-constexpr std::size_t kChunkSize = 256;
+constexpr std::size_t kChunkSize = 128;
+constexpr unsigned int kGroupedBlockSize = 128;
+constexpr std::size_t kGroupedChunkSize = 128;
 constexpr std::size_t kSingleBlockMaximum = 512;
 constexpr std::size_t kMaximumCacheCapacity = 8192;
+constexpr std::size_t kSmolLMQueryHeads = 9;
+constexpr std::size_t kSmolLMKvHeads = 3;
+constexpr std::size_t kSmolLMQueriesPerKvHead = 3;
 
 __device__ float warp_reduce_sum(float value) {
     for (unsigned int offset = kWarpSize / 2; offset > 0; offset /= 2) {
@@ -28,6 +33,7 @@ __device__ float warp_reduce_max(float value) {
     return value;
 }
 
+template <unsigned int BlockSize>
 __device__ float block_reduce_sum(float value, float* warp_values) {
     const unsigned int lane = threadIdx.x % kWarpSize;
     const unsigned int warp = threadIdx.x / kWarpSize;
@@ -37,7 +43,7 @@ __device__ float block_reduce_sum(float value, float* warp_values) {
     }
     __syncthreads();
     if (warp == 0) {
-        value = lane < kBlockSize / kWarpSize ? warp_values[lane] : 0.0F;
+        value = lane < BlockSize / kWarpSize ? warp_values[lane] : 0.0F;
         value = warp_reduce_sum(value);
         if (lane == 0) {
             warp_values[0] = value;
@@ -47,6 +53,7 @@ __device__ float block_reduce_sum(float value, float* warp_values) {
     return warp_values[0];
 }
 
+template <unsigned int BlockSize>
 __device__ float block_reduce_max(float value, float* warp_values) {
     const unsigned int lane = threadIdx.x % kWarpSize;
     const unsigned int warp = threadIdx.x / kWarpSize;
@@ -56,7 +63,7 @@ __device__ float block_reduce_max(float value, float* warp_values) {
     }
     __syncthreads();
     if (warp == 0) {
-        value = lane < kBlockSize / kWarpSize ? warp_values[lane] : -FLT_MAX;
+        value = lane < BlockSize / kWarpSize ? warp_values[lane] : -FLT_MAX;
         value = warp_reduce_max(value);
         if (lane == 0) {
             warp_values[0] = value;
@@ -154,14 +161,14 @@ __global__ void gqa_decode_attention_chunk_cuda_fp32_kernel(
     __syncthreads();
 
     float local_max = threadIdx.x < chunk_length ? scores[threadIdx.x] : -FLT_MAX;
-    const float chunk_max = block_reduce_max(local_max, reductions);
+    const float chunk_max = block_reduce_max<kBlockSize>(local_max, reductions);
     __syncthreads();
     float exponential = 0.0F;
     if (threadIdx.x < chunk_length) {
         exponential = expf(scores[threadIdx.x] - chunk_max);
         scores[threadIdx.x] = exponential;
     }
-    const float chunk_sum = block_reduce_sum(exponential, reductions);
+    const float chunk_sum = block_reduce_sum<kBlockSize>(exponential, reductions);
 
     constexpr unsigned int lanes_per_dimension = 4;
     const unsigned int dimension = threadIdx.x / lanes_per_dimension;
@@ -184,6 +191,183 @@ __global__ void gqa_decode_attention_chunk_cuda_fp32_kernel(
     }
     if (reduction_lane == 0) {
         workspace[workspace_offset + 2 + dimension] = weighted_value;
+    }
+}
+
+// SmolLM2's three query heads per KV head share each cache fetch.  K is loaded
+// once per lane while a warp forms all three independent dot products.  V is
+// loaded once per output dimension and used to update all three independently
+// normalized weighted-value accumulators.  The workspace layout deliberately
+// remains [batch, query_head, chunk, head_dim + 2].
+__global__ void gqa_decode_attention_grouped_chunk_cuda_fp32_kernel(
+    const float* query,
+    const float* key_cache,
+    const float* value_cache,
+    const float* mask,
+    const std::int64_t* cache_length,
+    float* workspace,
+    const float scale,
+    const std::size_t query_heads,
+    const std::size_t kv_heads,
+    const std::size_t cache_capacity,
+    const std::size_t num_chunks,
+    const std::int64_t q_s0,
+    const std::int64_t q_s1,
+    const std::int64_t q_s3,
+    const std::int64_t k_s0,
+    const std::int64_t k_s1,
+    const std::int64_t k_s2,
+    const std::int64_t k_s3,
+    const std::int64_t v_s0,
+    const std::int64_t v_s1,
+    const std::int64_t v_s2,
+    const std::int64_t v_s3,
+    const std::int64_t mask_b,
+    const std::int64_t mask_h,
+    const std::int64_t mask_k,
+    const std::int64_t mask_s0,
+    const std::int64_t mask_s1,
+    const std::int64_t mask_s3) {
+    __shared__ float shared_query[kSmolLMQueriesPerKvHead][64];
+    __shared__ float scores[kSmolLMQueriesPerKvHead][kGroupedChunkSize];
+    __shared__ float reductions[kGroupedBlockSize / kWarpSize];
+    // Two threads accumulate disjoint positions for each output dimension.
+    // A shared-memory transpose then combines those partials without turning
+    // the global V reads into 256-byte-strided scalar transactions.
+    __shared__ float value_partials[kSmolLMQueriesPerKvHead][2][64];
+
+    const std::size_t chunk = blockIdx.x % num_chunks;
+    const std::size_t kv_block = blockIdx.x / num_chunks;
+    const std::size_t batch = kv_block / kv_heads;
+    const std::size_t kv_head = kv_block % kv_heads;
+    const std::size_t first_query_head =
+        kv_head * kSmolLMQueriesPerKvHead;
+    const std::int64_t requested_length = cache_length == nullptr
+        ? static_cast<std::int64_t>(cache_capacity)
+        : *cache_length;
+    const std::size_t valid_length = static_cast<std::size_t>(
+        max(static_cast<std::int64_t>(1),
+            min(requested_length, static_cast<std::int64_t>(cache_capacity))));
+    const std::size_t chunk_start = chunk * kGroupedChunkSize;
+    const std::size_t chunk_length = chunk_start < valid_length
+        ? min(kGroupedChunkSize, valid_length - chunk_start)
+        : 0;
+
+    for (unsigned int index = threadIdx.x;
+         index < kSmolLMQueriesPerKvHead * 64; index += kGroupedBlockSize) {
+        const unsigned int group = index / 64;
+        const unsigned int dimension = index % 64;
+        shared_query[group][dimension] = query[
+            batch * q_s0 + (first_query_head + group) * q_s1 +
+            dimension * q_s3];
+    }
+    __syncthreads();
+
+    const unsigned int lane = threadIdx.x % kWarpSize;
+    const unsigned int warp = threadIdx.x / kWarpSize;
+    for (std::size_t local_position = warp; local_position < chunk_length;
+         local_position += kGroupedBlockSize / kWarpSize) {
+        const std::size_t position = chunk_start + local_position;
+        float dot0 = 0.0F;
+        float dot1 = 0.0F;
+        float dot2 = 0.0F;
+#pragma unroll
+        for (unsigned int dimension = lane; dimension < 64;
+             dimension += kWarpSize) {
+            const float key = key_cache[
+                batch * k_s0 + kv_head * k_s1 + position * k_s2 +
+                dimension * k_s3];
+            dot0 += shared_query[0][dimension] * key;
+            dot1 += shared_query[1][dimension] * key;
+            dot2 += shared_query[2][dimension] * key;
+        }
+        dot0 = warp_reduce_sum(dot0);
+        dot1 = warp_reduce_sum(dot1);
+        dot2 = warp_reduce_sum(dot2);
+        if (lane == 0) {
+            const std::size_t mask_batch = mask_b == 1 ? 0 : batch;
+            const std::size_t mask_position = mask_k == 1 ? 0 : position;
+            float score0 = dot0 * scale;
+            float score1 = dot1 * scale;
+            float score2 = dot2 * scale;
+            if (mask != nullptr) {
+                const std::size_t mask_head0 =
+                    mask_h == 1 ? 0 : first_query_head;
+                const std::size_t mask_head1 =
+                    mask_h == 1 ? 0 : first_query_head + 1;
+                const std::size_t mask_head2 =
+                    mask_h == 1 ? 0 : first_query_head + 2;
+                const std::size_t base =
+                    mask_batch * mask_s0 + mask_position * mask_s3;
+                score0 += mask[base + mask_head0 * mask_s1];
+                score1 += mask[base + mask_head1 * mask_s1];
+                score2 += mask[base + mask_head2 * mask_s1];
+            }
+            scores[0][local_position] = score0;
+            scores[1][local_position] = score1;
+            scores[2][local_position] = score2;
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (unsigned int group = 0; group < kSmolLMQueriesPerKvHead; ++group) {
+        float local_max =
+            threadIdx.x < chunk_length ? scores[group][threadIdx.x] : -FLT_MAX;
+        const float chunk_max =
+            block_reduce_max<kGroupedBlockSize>(local_max, reductions);
+        float exponential = 0.0F;
+        if (threadIdx.x < chunk_length) {
+            exponential = expf(scores[group][threadIdx.x] - chunk_max);
+            scores[group][threadIdx.x] = exponential;
+        }
+        const float chunk_sum =
+            block_reduce_sum<kGroupedBlockSize>(exponential, reductions);
+        if (threadIdx.x == 0) {
+            const std::size_t query_head = first_query_head + group;
+            const std::size_t offset =
+                (batch * query_heads + query_head) * num_chunks * 66 +
+                chunk * 66;
+            workspace[offset] = chunk_length == 0 ? -FLT_MAX : chunk_max;
+            workspace[offset + 1] = chunk_sum;
+        }
+        __syncthreads();
+    }
+
+    const unsigned int dimension = threadIdx.x % 64;
+    const unsigned int position_group = threadIdx.x / 64;
+    float value0 = 0.0F;
+    float value1 = 0.0F;
+    float value2 = 0.0F;
+    for (std::size_t local_position = position_group;
+         local_position < chunk_length; local_position += 2) {
+        const std::size_t position = chunk_start + local_position;
+        const float cached_value = value_cache[
+            batch * v_s0 + kv_head * v_s1 + position * v_s2 +
+            dimension * v_s3];
+        value0 += scores[0][local_position] * cached_value;
+        value1 += scores[1][local_position] * cached_value;
+        value2 += scores[2][local_position] * cached_value;
+    }
+    value_partials[0][position_group][dimension] = value0;
+    value_partials[1][position_group][dimension] = value1;
+    value_partials[2][position_group][dimension] = value2;
+    __syncthreads();
+
+    if (threadIdx.x < 64) {
+#pragma unroll
+        for (unsigned int group = 0; group < kSmolLMQueriesPerKvHead; ++group) {
+            float value = 0.0F;
+#pragma unroll
+            for (unsigned int partial = 0; partial < 2; ++partial) {
+                value += value_partials[group][partial][threadIdx.x];
+            }
+            const std::size_t query_head = first_query_head + group;
+            const std::size_t offset =
+                (batch * query_heads + query_head) * num_chunks * 66 +
+                chunk * 66;
+            workspace[offset + 2 + threadIdx.x] = value;
+        }
     }
 }
 
@@ -308,7 +492,7 @@ __global__ void gqa_decode_attention_cuda_fp32_kernel(
          position += blockDim.x) {
         local_max = fmaxf(local_max, scores[position]);
     }
-    const float row_max = block_reduce_max(local_max, reductions);
+    const float row_max = block_reduce_max<kBlockSize>(local_max, reductions);
     __syncthreads();
 
     float local_sum = 0.0F;
@@ -318,7 +502,7 @@ __global__ void gqa_decode_attention_cuda_fp32_kernel(
         scores[position] = exponential;
         local_sum += exponential;
     }
-    const float row_sum = block_reduce_sum(local_sum, reductions);
+    const float row_sum = block_reduce_sum<kBlockSize>(local_sum, reductions);
 
     if (head_dim == 64) {
         constexpr unsigned int lanes_per_dimension = 4;
@@ -394,16 +578,33 @@ cudaError_t gqa_decode_attention_cuda_fp32(
         if (workspace == nullptr) {
             return cudaErrorInvalidValue;
         }
-        const unsigned int chunk_blocks = static_cast<unsigned int>(
-            batch_size * query_heads * num_chunks);
-        gqa_decode_attention_chunk_cuda_fp32_kernel<<<
-            chunk_blocks, kBlockSize, 0, stream>>>(
-            query, key_cache, value_cache, additive_attention_mask, cache_length,
-            workspace, scale, query_heads, kv_heads, cache_capacity, head_dim,
-            num_chunks, query_strides[0], query_strides[1], query_strides[3],
-            key_strides[0], key_strides[1], key_strides[2], key_strides[3],
-            value_strides[0], value_strides[1], value_strides[2], value_strides[3],
-            sizes[0], sizes[1], sizes[3], strides[0], strides[1], strides[3]);
+        if (query_heads == kSmolLMQueryHeads && kv_heads == kSmolLMKvHeads &&
+            cache_capacity > 4096) {
+            const unsigned int chunk_blocks = static_cast<unsigned int>(
+                batch_size * kv_heads * num_chunks);
+            gqa_decode_attention_grouped_chunk_cuda_fp32_kernel<<<
+                chunk_blocks, kGroupedBlockSize, 0, stream>>>(
+                query, key_cache, value_cache, additive_attention_mask,
+                cache_length, workspace, scale, query_heads, kv_heads,
+                cache_capacity, num_chunks, query_strides[0], query_strides[1],
+                query_strides[3], key_strides[0], key_strides[1],
+                key_strides[2], key_strides[3], value_strides[0],
+                value_strides[1], value_strides[2], value_strides[3], sizes[0],
+                sizes[1], sizes[3], strides[0], strides[1], strides[3]);
+        } else {
+            const unsigned int chunk_blocks = static_cast<unsigned int>(
+                batch_size * query_heads * num_chunks);
+            gqa_decode_attention_chunk_cuda_fp32_kernel<<<
+                chunk_blocks, kBlockSize, 0, stream>>>(
+                query, key_cache, value_cache, additive_attention_mask,
+                cache_length, workspace, scale, query_heads, kv_heads,
+                cache_capacity, head_dim, num_chunks, query_strides[0],
+                query_strides[1], query_strides[3], key_strides[0],
+                key_strides[1], key_strides[2], key_strides[3],
+                value_strides[0], value_strides[1], value_strides[2],
+                value_strides[3], sizes[0], sizes[1], sizes[3], strides[0],
+                strides[1], strides[3]);
+        }
         cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) {
             return error;

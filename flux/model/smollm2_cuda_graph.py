@@ -246,7 +246,7 @@ class FluxCUDAGraphDecode:
         config = model.config
         supported = (
             required.issubset(selected)
-            and 1281 <= max_cache_len <= 8192
+            and 513 <= max_cache_len <= 8192
             and getattr(config, "hidden_size", None) == 576
             and getattr(config, "intermediate_size", None) == 1536
             and getattr(config, "num_attention_heads", None) == 9
@@ -258,7 +258,7 @@ class FluxCUDAGraphDecode:
             return None
         device = next(model.parameters()).device
         options = {"device": device, "dtype": torch.float32}
-        chunks = (max_cache_len + 255) // 256
+        chunks = (max_cache_len + 127) // 128
         return CUDAGraphDecodeScratch(
             norm_output=torch.empty((1, 1, 576), **options),
             residual_output=torch.empty((1, 1, 576), **options),

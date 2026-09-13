@@ -314,7 +314,7 @@ def test_fused_packed_qkv_rope_cache_graph_matches_retained_path() -> None:
     prompt = torch.tensor([[1, 17, 42, 9, 3, 28, 11, 5]], device="cuda")
 
     with torch.inference_mode():
-        # Capacity 1281 activates the retained native-GQA crossover and the
+        # Capacity 1281 activates the retained native-GQA path and the
         # specialized fused post-QKV path while keeping the logical context 8.
         current_state = FluxCUDAGraphDecode.capture(
             current, prompt, max_decode_steps=1273, warmup_steps=2
