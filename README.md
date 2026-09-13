@@ -223,6 +223,39 @@ breakdown, correctness, latency, and graph-pool behavior with:
 python benchmarks/benchmark_smollm2_stable_buffers.py
 ```
 
+The separately controlled `"cublaslt_projection"` category replaces only the
+FP32 one-token packed-QKV and attention-output projections inside the supported
+stable-buffer CUDA-Graph path. It uses a measured zero-workspace cuBLASLt
+configuration with caller-owned outputs; eager, short-cache, and unsupported
+paths retain `nn.Linear`. It requires `"packed_qkv_rope_cache"` and that
+category's dependencies.
+
+```python
+enable_flux_ops(
+    model,
+    operators=FLUX_OPERATOR_CATEGORIES
+    | {
+        "mlp",
+        "packed_swiglu",
+        "qkv",
+        "gqa_decode_attention",
+        "packed_qkv_rope_cache",
+        "cublaslt_projection",
+    },
+)
+```
+
+Reproduce the shape inventory, PyTorch API comparison, bounded cuBLASLt search,
+category ablation, decoder-layer timing, full CUDA-Graph sweep, eager fallback,
+correctness checks, and independent-process memory accounting with:
+
+```bash
+python benchmarks/benchmark_smollm2_projections.py --production --independent-memory --eager-production
+```
+
+See [the projection milestone report](docs/PROJECTION_MILESTONE.md) for the
+retention evidence and rejected candidates.
+
 Validate and benchmark the retained production packed-QKV path, including
 projection and attention-setup latency, prefill, eager and CUDA-Graph decode,
 view layouts, numerical error, and memory lifetime, with:

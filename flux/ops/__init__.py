@@ -11,6 +11,13 @@ from flux.ops.native_attention_score_softmax import (
     attention_score_softmax_native,
     native_attention_score_softmax_is_available,
 )
+from flux.ops.native_cublaslt_linear import (
+    CublasLtAlgorithm,
+    cublaslt_algorithms,
+    cublaslt_linear_config_out,
+    cublaslt_linear_out,
+    native_cublaslt_linear_is_available,
+)
 from flux.ops.native_packed_swiglu import (
     native_packed_swiglu_is_available,
     packed_swiglu_native,
@@ -48,12 +55,17 @@ from flux.ops.rope import rope
 from flux.ops.softmax import softmax
 
 __all__ = [
+    "CublasLtAlgorithm",
     "attention_score_softmax",
     "attention_score_softmax_native",
+    "cublaslt_algorithms",
+    "cublaslt_linear_config_out",
+    "cublaslt_linear_out",
     "gqa_decode_attention",
     "gqa_decode_attention_native",
     "gqa_decode_attention_native_out",
     "native_attention_score_softmax_is_available",
+    "native_cublaslt_linear_is_available",
     "native_gqa_decode_attention_is_available",
     "native_packed_swiglu_is_available",
     "native_packed_qkv_rope_cache_is_available",

@@ -15,6 +15,7 @@ from flux.model.smollm2_cuda_graph import (
     cuda_graph_greedy_generate,
 )
 from flux.model.smollm2_flux import (
+    FLUX_CUBLASLT_PROJECTION_CATEGORY,
     FLUX_GQA_DECODE_ATTENTION_CATEGORY,
     FLUX_OPERATOR_CATEGORIES,
     FLUX_PACKED_MLP_CATEGORY,
@@ -24,6 +25,7 @@ from flux.model.smollm2_flux import (
     enable_flux_ops,
 )
 from flux.ops import (
+    native_cublaslt_linear_is_available,
     native_gqa_decode_attention_is_available,
     native_packed_swiglu_is_available,
     native_packed_qkv_rope_cache_is_available,
@@ -69,7 +71,7 @@ def _model() -> LlamaForCausalLM:
 def _smollm2_geometry_model() -> LlamaForCausalLM:
     config = LlamaConfig(
         hidden_size=576,
-        intermediate_size=64,
+        intermediate_size=1536,
         num_hidden_layers=1,
         num_attention_heads=9,
         num_key_value_heads=3,
@@ -346,6 +348,96 @@ def test_fused_packed_qkv_rope_cache_graph_matches_retained_path() -> None:
 
     assert fused_state.stable_addresses() == addresses
     assert fused_state.cache_position == current_state.cache_position == 11
+
+
+@pytest.mark.skipif(
+    not (
+        _NATIVE_CUDA_AVAILABLE
+        and native_gqa_decode_attention_is_available()
+        and native_packed_qkv_rope_cache_is_available()
+        and native_cublaslt_linear_is_available()
+    ),
+    reason="CUDA and the retained projection path dependencies are required",
+)
+def test_cublaslt_projection_graph_matches_full_cache_retained_path() -> None:
+    current = _smollm2_geometry_model().cuda()
+    optimized = copy.deepcopy(current)
+    base_operators = _FULL_DECODE_OPERATORS | {
+        FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY
+    }
+    enable_flux_ops(current, operators=base_operators)
+    enable_flux_ops(
+        optimized,
+        operators=base_operators | {FLUX_CUBLASLT_PROJECTION_CATEGORY},
+    )
+    # A 510-token prompt plus three replay tokens reaches exact capacity 513,
+    # the first retained native-GQA/projection capacity.
+    prompt = ((torch.arange(510, device="cuda") * 17 + 11) % 128).unsqueeze(0)
+    current_layer_output: dict[str, torch.Tensor] = {}
+    optimized_layer_output: dict[str, torch.Tensor] = {}
+
+    def save_current(
+        module: torch.nn.Module, inputs: object, output: tuple[torch.Tensor, ...]
+    ) -> None:
+        del module, inputs
+        current_layer_output["value"] = output[0]
+
+    def save_optimized(
+        module: torch.nn.Module, inputs: object, output: tuple[torch.Tensor, ...]
+    ) -> None:
+        del module, inputs
+        optimized_layer_output["value"] = output[0]
+
+    current_hook = current.model.layers[0].register_forward_hook(save_current)
+    optimized_hook = optimized.model.layers[0].register_forward_hook(save_optimized)
+    try:
+        with torch.inference_mode():
+            current_state = FluxCUDAGraphDecode.capture(
+                current, prompt, max_decode_steps=3, warmup_steps=2
+            )
+            optimized_state = FluxCUDAGraphDecode.capture(
+                optimized, prompt, max_decode_steps=3, warmup_steps=0
+            )
+    finally:
+        current_hook.remove()
+        optimized_hook.remove()
+
+    assert optimized_state.scratch is not None
+    assert optimized_state.scratch.qkv_projection_output is not None
+    assert optimized_state.scratch.attention_projection_output is not None
+    addresses = optimized_state.stable_addresses()
+    token = current_state.prefill_logits.argmax(dim=-1)
+    with torch.inference_mode():
+        for step in range(3):
+            expected = current_state.replay(token)
+            actual = optimized_state.replay(token)
+            torch.testing.assert_close(actual, expected, rtol=2e-4, atol=5e-5)
+            torch.testing.assert_close(
+                optimized_layer_output["value"],
+                current_layer_output["value"],
+                rtol=2e-4,
+                atol=2e-5,
+            )
+            assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+            valid_length = 511 + step
+            torch.testing.assert_close(
+                optimized_state.cache.layers[0].keys[..., :valid_length, :],
+                current_state.cache.layers[0].keys[..., :valid_length, :],
+                rtol=2e-4,
+                atol=2e-5,
+            )
+            torch.testing.assert_close(
+                optimized_state.cache.layers[0].values[..., :valid_length, :],
+                current_state.cache.layers[0].values[..., :valid_length, :],
+                rtol=2e-4,
+                atol=2e-5,
+            )
+            token = expected.argmax(dim=-1)
+
+    assert current_state.cache_position == optimized_state.cache_position == 513
+    assert optimized_state.stable_addresses() == addresses
+    with pytest.raises(RuntimeError, match="exhausted"):
+        optimized_state.replay(token)
 
 
 @pytest.mark.skipif(

@@ -37,6 +37,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
     packed_swiglu_dir = ROOT / "csrc" / "packed_swiglu"
     gqa_decode_attention_dir = ROOT / "csrc" / "gqa_decode_attention"
     packed_qkv_rope_cache_dir = ROOT / "csrc" / "packed_qkv_rope_cache"
+    cublaslt_linear_dir = ROOT / "csrc" / "cublaslt_linear"
     extension = CUDAExtension(
         name="flux._C",
         sources=[
@@ -61,6 +62,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(gqa_decode_attention_dir / "gqa_decode_attention_cuda.cu"),
             str(packed_qkv_rope_cache_dir / "packed_qkv_rope_cache_torch.cpp"),
             str(packed_qkv_rope_cache_dir / "packed_qkv_rope_cache_cuda.cu"),
+            str(cublaslt_linear_dir / "cublaslt_linear_torch.cpp"),
         ],
         include_dirs=[
             str(rmsnorm_dir),
@@ -71,7 +73,9 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(packed_swiglu_dir),
             str(gqa_decode_attention_dir),
             str(packed_qkv_rope_cache_dir),
+            str(cublaslt_linear_dir),
         ],
+        libraries=["cublas", "cublasLt"],
         extra_compile_args={
             "cxx": ["/W4", "/permissive-"],
             "nvcc": [

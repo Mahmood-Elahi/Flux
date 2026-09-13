@@ -26,10 +26,13 @@ from transformers.models.llama.modeling_llama import (
 )
 
 from flux.ops import (
+    CublasLtAlgorithm,
     attention_score_softmax_native,
+    cublaslt_linear_config_out,
     gqa_decode_attention_native,
     gqa_decode_attention_native_out,
     native_attention_score_softmax_is_available,
+    native_cublaslt_linear_is_available,
     native_gqa_decode_attention_is_available,
     native_packed_swiglu_is_available,
     native_packed_qkv_rope_cache_is_available,
@@ -58,14 +61,51 @@ FLUX_PACKED_SWIGLU_CATEGORY = "packed_swiglu"
 FLUX_PACKED_QKV_CATEGORY = "qkv"
 FLUX_GQA_DECODE_ATTENTION_CATEGORY = "gqa_decode_attention"
 FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY = "packed_qkv_rope_cache"
+FLUX_CUBLASLT_PROJECTION_CATEGORY = "cublaslt_projection"
 _SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
     FLUX_GQA_DECODE_ATTENTION_CATEGORY,
     FLUX_PACKED_MLP_CATEGORY,
     FLUX_PACKED_SWIGLU_CATEGORY,
     FLUX_PACKED_QKV_CATEGORY,
     FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY,
+    FLUX_CUBLASLT_PROJECTION_CATEGORY,
 }
 _GQA_DECODE_GRAPH_MINIMUM_CAPACITY = 513
+_CUBLASLT_DECODE_PROJECTION_ALGORITHM = CublasLtAlgorithm(
+    index=-1,
+    algorithm_id=13,
+    tile_id=0,
+    split_k=1,
+    reduction_scheme=0,
+    cta_swizzle=0,
+    custom_option=91,
+    stages_id=0,
+    workspace_bytes=0,
+    waves_count=0.0,
+)
+_CUBLASLT_DECODE_PROJECTION_ALGORITHMS = {
+    (960, 576): _CUBLASLT_DECODE_PROJECTION_ALGORITHM,
+    (576, 576): _CUBLASLT_DECODE_PROJECTION_ALGORITHM,
+}
+
+
+def _cublaslt_decode_projection_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    workspace: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch only exact projection shapes retained on the target system."""
+    algorithm = _CUBLASLT_DECODE_PROJECTION_ALGORITHMS.get(tuple(weight.shape))
+    if algorithm is None:
+        return torch.nn.functional.linear(input, weight)
+    return cublaslt_linear_config_out(
+        input,
+        weight,
+        output,
+        workspace,
+        algorithm,
+    )
 
 
 class FluxPackedLlamaMLP(nn.Module):
@@ -211,6 +251,7 @@ class FluxLlamaAttention(LlamaAttention):
         use_gqa_decode_attention: bool = False,
         use_packed_qkv: bool = False,
         use_packed_qkv_rope_cache: bool = False,
+        use_cublaslt_projection: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.config = source.config
@@ -226,6 +267,7 @@ class FluxLlamaAttention(LlamaAttention):
         self.use_gqa_decode_attention = use_gqa_decode_attention
         self.use_packed_qkv = use_packed_qkv
         self.use_packed_qkv_rope_cache = use_packed_qkv_rope_cache
+        self.use_cublaslt_projection = use_cublaslt_projection
 
         projections = (source.q_proj, source.k_proj, source.v_proj)
         if use_packed_qkv:
@@ -422,8 +464,21 @@ class FluxLlamaAttention(LlamaAttention):
             )
             and not kwargs.get("output_attentions", False)
         ):
-            packed = self.packed_qkv(hidden_states)
             scratch = getattr(self, "_flux_decode_scratch", None)
+            if (
+                self.use_cublaslt_projection
+                and scratch is not None
+                and scratch.qkv_projection_output is not None
+                and scratch.projection_workspace is not None
+            ):
+                packed = _cublaslt_decode_projection_out(
+                    hidden_states,
+                    self.packed_qkv.weight,
+                    scratch.qkv_projection_output,
+                    scratch.projection_workspace,
+                )
+            else:
+                packed = self.packed_qkv(hidden_states)
             if scratch is None:
                 query_states = packed_qkv_rope_cache_native(
                     packed,
@@ -534,7 +589,20 @@ class FluxLlamaAttention(LlamaAttention):
                 )
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            attn_output = self.o_proj(attn_output)
+            if (
+                self.use_cublaslt_projection
+                and scratch is not None
+                and scratch.attention_projection_output is not None
+                and scratch.projection_workspace is not None
+            ):
+                attn_output = _cublaslt_decode_projection_out(
+                    attn_output,
+                    self.o_proj.weight,
+                    scratch.attention_projection_output,
+                    scratch.projection_workspace,
+                )
+            else:
+                attn_output = self.o_proj(attn_output)
             return attn_output, None
 
         if fused_post_qkv:
@@ -603,6 +671,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         fuse_attention_scores: bool = True,
         use_gqa_decode_attention: bool = False,
         use_packed_qkv_rope_cache: bool = False,
+        use_cublaslt_projection: bool = False,
         use_packed_mlp: bool = False,
         use_packed_swiglu: bool = False,
         use_packed_qkv: bool = False,
@@ -617,6 +686,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
                 fuse_attention_scores=fuse_attention_scores,
                 use_gqa_decode_attention=use_gqa_decode_attention,
                 use_packed_qkv_rope_cache=use_packed_qkv_rope_cache,
+                use_cublaslt_projection=use_cublaslt_projection,
                 use_packed_qkv=use_packed_qkv,
             )
             if use_softmax or use_rope or use_gqa_decode_attention or use_packed_qkv
@@ -753,6 +823,11 @@ def _check_native_ops(
         and not native_packed_qkv_rope_cache_is_available()
     ):
         missing.append("packed_qkv_rope_cache")
+    if (
+        FLUX_CUBLASLT_PROJECTION_CATEGORY in operators
+        and not native_cublaslt_linear_is_available()
+    ):
+        missing.append("cublaslt_projection")
     if missing:
         raise RuntimeError(
             "Flux native operators are not built: "
@@ -783,6 +858,10 @@ def enable_flux_ops(
     one-token Q/K RoPE and StaticCache K/V update and requires ``"rope"``,
     ``"qkv"``, and ``"gqa_decode_attention"``. Existing Flux and ordinary
     Hugging Face behavior remain unchanged unless these categories are selected.
+    The separately selected ``"cublaslt_projection"`` category uses the
+    measured zero-workspace cuBLASLt configuration for packed QKV and attention
+    output projections only in the supported stable-buffer CUDA-Graph path;
+    eager and unsupported paths retain ``nn.Linear``.
     """
     selected = frozenset(operators)
     unknown = selected - _SUPPORTED_OPERATOR_CATEGORIES
@@ -806,6 +885,13 @@ def enable_flux_ops(
                 '"packed_qkv_rope_cache" requires the "rope", "qkv", and '
                 '"gqa_decode_attention" operator categories'
             )
+    if (
+        FLUX_CUBLASLT_PROJECTION_CATEGORY in selected
+        and FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY not in selected
+    ):
+        raise ValueError(
+            '"cublaslt_projection" requires the "packed_qkv_rope_cache" operator category'
+        )
 
     llama_model = _check_model(model)
     _check_native_ops(
@@ -832,6 +918,9 @@ def enable_flux_ops(
                 use_packed_qkv_rope_cache=(
                     FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY in selected
                 ),
+                use_cublaslt_projection=(
+                    FLUX_CUBLASLT_PROJECTION_CATEGORY in selected
+                ),
                 use_packed_mlp=FLUX_PACKED_MLP_CATEGORY in selected,
                 use_packed_swiglu=FLUX_PACKED_SWIGLU_CATEGORY in selected,
                 use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
@@ -854,6 +943,9 @@ def enable_flux_ops(
                     ),
                     use_packed_qkv_rope_cache=(
                         FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY in selected
+                    ),
+                    use_cublaslt_projection=(
+                        FLUX_CUBLASLT_PROJECTION_CATEGORY in selected
                     ),
                     use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
                 )
@@ -890,6 +982,9 @@ def enable_flux_ops(
     llama_model._flux_packed_qkv_rope_cache_enabled = (
         FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY in selected
     )
+    llama_model._flux_cublaslt_projection_enabled = (
+        FLUX_CUBLASLT_PROJECTION_CATEGORY in selected
+    )
     return llama_model
 
 
@@ -922,11 +1017,17 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
             and module.use_packed_qkv_rope_cache
             for module in model.modules()
         ),
+        "cublaslt_projection_modules": sum(
+            isinstance(module, FluxLlamaAttention)
+            and module.use_cublaslt_projection
+            for module in model.modules()
+        ),
     }
 
 
 __all__ = [
     "FLUX_OPERATOR_CATEGORIES",
+    "FLUX_CUBLASLT_PROJECTION_CATEGORY",
     "FLUX_GQA_DECODE_ATTENTION_CATEGORY",
     "FLUX_PACKED_MLP_CATEGORY",
     "FLUX_PACKED_QKV_CATEGORY",

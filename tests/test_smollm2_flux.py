@@ -717,6 +717,7 @@ def test_enable_flux_ops_preserves_parameters_and_invokes_every_operator(
         "packed_qkv_modules": 0,
         "gqa_decode_attention_modules": 0,
         "packed_qkv_rope_cache_modules": 0,
+        "cublaslt_projection_modules": 0,
     }
     # Two input norms, two fused post-attention norms, and one final norm.
     assert python_flux_ops == {
@@ -831,6 +832,18 @@ def test_packed_qkv_rope_cache_requires_all_retained_dependencies(
         smollm2_flux.enable_flux_ops(
             model,
             operators=(smollm2_flux.FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY,),
+        )
+
+
+def test_cublaslt_projection_requires_fused_post_qkv_dependency(
+    python_flux_ops: dict[str, int],
+) -> None:
+    del python_flux_ops
+    model = _model(1)
+    with pytest.raises(ValueError, match='requires the "packed_qkv_rope_cache"'):
+        smollm2_flux.enable_flux_ops(
+            model,
+            operators=(smollm2_flux.FLUX_CUBLASLT_PROJECTION_CATEGORY,),
         )
 
 

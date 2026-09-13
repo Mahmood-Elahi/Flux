@@ -37,6 +37,9 @@ class CUDAGraphDecodeScratch:
     attention_output: torch.Tensor
     attention_workspace: torch.Tensor
     swiglu_output: torch.Tensor
+    qkv_projection_output: torch.Tensor | None = None
+    attention_projection_output: torch.Tensor | None = None
+    projection_workspace: torch.Tensor | None = None
 
     @property
     def bytes(self) -> int:
@@ -49,7 +52,11 @@ class CUDAGraphDecodeScratch:
                 self.attention_output,
                 self.attention_workspace,
                 self.swiglu_output,
+                self.qkv_projection_output,
+                self.attention_projection_output,
+                self.projection_workspace,
             )
+            if tensor is not None
         )
 
     def addresses(self) -> tuple[int, ...]:
@@ -62,7 +69,11 @@ class CUDAGraphDecodeScratch:
                 self.attention_output,
                 self.attention_workspace,
                 self.swiglu_output,
+                self.qkv_projection_output,
+                self.attention_projection_output,
+                self.projection_workspace,
             )
+            if tensor is not None
         )
 
 
@@ -183,6 +194,7 @@ class FluxCUDAGraphDecode:
             if use_stable_buffers
             else None
         )
+        cls._initialize_projection_plans(model, self.scratch)
 
         # CUDA Graphs require allocator warmup on a side stream.  Restore all
         # logical state after every warm step so setup never consumes a token.
@@ -244,6 +256,7 @@ class FluxCUDAGraphDecode:
             "packed_qkv_rope_cache",
         }
         config = model.config
+        projection_enabled = "cublaslt_projection" in selected
         supported = (
             required.issubset(selected)
             and 513 <= max_cache_len <= 8192
@@ -259,14 +272,66 @@ class FluxCUDAGraphDecode:
         device = next(model.parameters()).device
         options = {"device": device, "dtype": torch.float32}
         chunks = (max_cache_len + 127) // 128
+        hidden = int(config.hidden_size)
+        head_dim = int(getattr(config, "head_dim", hidden // int(config.num_attention_heads)))
+        packed_qkv = hidden + 2 * int(config.num_key_value_heads) * head_dim
         return CUDAGraphDecodeScratch(
-            norm_output=torch.empty((1, 1, 576), **options),
-            residual_output=torch.empty((1, 1, 576), **options),
-            query_output=torch.empty((1, 9, 1, 64), **options),
-            attention_output=torch.empty((1, 9, 1, 64), **options),
-            attention_workspace=torch.empty((1, 9, chunks, 66), **options),
-            swiglu_output=torch.empty((1, 1, 1536), **options),
+            norm_output=torch.empty((1, 1, hidden), **options),
+            residual_output=torch.empty((1, 1, hidden), **options),
+            query_output=torch.empty(
+                (1, int(config.num_attention_heads), 1, head_dim), **options
+            ),
+            attention_output=torch.empty(
+                (1, int(config.num_attention_heads), 1, head_dim), **options
+            ),
+            attention_workspace=torch.empty(
+                (1, int(config.num_attention_heads), chunks, head_dim + 2), **options
+            ),
+            swiglu_output=torch.empty((1, 1, int(config.intermediate_size)), **options),
+            qkv_projection_output=(
+                torch.empty((1, 1, packed_qkv), **options)
+                if projection_enabled else None
+            ),
+            attention_projection_output=(
+                torch.empty((1, 1, hidden), **options)
+                if projection_enabled else None
+            ),
+            projection_workspace=(
+                torch.empty(0, dtype=torch.uint8, device=device)
+                if projection_enabled else None
+            ),
         )
+
+    @staticmethod
+    def _initialize_projection_plans(
+        model: nn.Module, scratch: CUDAGraphDecodeScratch | None
+    ) -> None:
+        """Validate and cache retained cuBLASLt plans before graph capture."""
+        if (
+            scratch is None
+            or scratch.qkv_projection_output is None
+            or scratch.attention_projection_output is None
+            or scratch.projection_workspace is None
+        ):
+            return
+        from flux.model.smollm2_flux import _cublaslt_decode_projection_out
+
+        attention = model.model.layers[0].self_attn
+        scratch.norm_output.zero_()
+        with torch.inference_mode():
+            _cublaslt_decode_projection_out(
+                scratch.norm_output,
+                attention.packed_qkv.weight,
+                scratch.qkv_projection_output,
+                scratch.projection_workspace,
+            )
+            _cublaslt_decode_projection_out(
+                scratch.norm_output,
+                attention.o_proj.weight,
+                scratch.attention_projection_output,
+                scratch.projection_workspace,
+            )
+        torch.cuda.synchronize(scratch.norm_output.device)
 
     @staticmethod
     @contextmanager
@@ -341,6 +406,7 @@ class FluxCUDAGraphDecode:
             "packed_swiglu",
             "gqa_decode_attention",
             "packed_qkv_rope_cache",
+            "cublaslt_projection",
         }
         if not required.issubset(selected) or selected - required - optional:
             raise ValueError(
