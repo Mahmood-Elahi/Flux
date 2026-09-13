@@ -407,6 +407,7 @@ class FluxCUDAGraphDecode:
             "gqa_decode_attention",
             "packed_qkv_rope_cache",
             "cublaslt_projection",
+            "fused_gate_up_swiglu",
         }
         if not required.issubset(selected) or selected - required - optional:
             raise ValueError(

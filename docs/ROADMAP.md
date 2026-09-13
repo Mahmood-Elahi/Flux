@@ -22,7 +22,8 @@ Flux is one continuous project progressing toward a single final outcome: an int
 18. **Completed:** Profile and retain a separately opt-in FP32 one-token packed-QKV post-projection CUDA path that applies Q/K RoPE, writes K/V directly into unexpanded StaticCache storage, emits compact Q for native GQA attention, advances graph-resident cache length, and measurably reduces long-context eager and CUDA-Graph decode latency without increasing peak or graph-pool memory.
 19. **Completed:** Attribute remaining fully optimized fixed-shape decode launches, prove PyTorch deterministic uninitialized-memory filling as the source of 214 captured FP32 fill kernels, and retain graph-owned stable outputs for the five Flux producers responsible for 211 of them, without disabling deterministic safety globally or changing eager/general fallbacks.
 20. **Completed:** Systematically characterize all FP32 one-token SmolLM2 projection and LM-head shapes, add a narrow current-stream and CUDA-Graph-safe cuBLASLt tuning interface, and retain only the measured zero-workspace packed-QKV and attention-output configurations after isolated, category, layer, full-decode, correctness, launch, and independent-memory validation.
-21. Continue profiling and optimizing measured integrated-system bottlenecks.
-22. Reach the final integrated Flux inference system.
+21. **Completed:** Design and evaluate exact-shape FP32 one-token packed gate/up GEMV kernels; reject standalone/shared/vector variants in favor of a separately opt-in fused gate/up GEMV + SwiGLU CUDA-Graph path that removes 30 launches and the packed projection intermediate with a reproducible integrated decode gain.
+22. Continue profiling and optimizing measured integrated-system bottlenecks.
+23. Reach the final integrated Flux inference system.
 
 Each implementation and optimization milestone remains part of the same evolving codebase. Correctness against the reference path precedes performance work, and optimization decisions are driven by reproducible measurements.

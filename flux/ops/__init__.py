@@ -23,6 +23,10 @@ from flux.ops.native_packed_swiglu import (
     packed_swiglu_native,
     packed_swiglu_native_out,
 )
+from flux.ops.native_packed_gate_up_gemv import (
+    native_packed_gate_up_gemv_is_available,
+    packed_gate_up_swiglu_native_out,
+)
 from flux.ops.native_packed_qkv_rope_cache import (
     native_packed_qkv_rope_cache_is_available,
     native_packed_qkv_rope_cache_load_error,
@@ -68,6 +72,7 @@ __all__ = [
     "native_cublaslt_linear_is_available",
     "native_gqa_decode_attention_is_available",
     "native_packed_swiglu_is_available",
+    "native_packed_gate_up_gemv_is_available",
     "native_packed_qkv_rope_cache_is_available",
     "native_packed_qkv_rope_cache_load_error",
     "native_residual_rmsnorm_is_available",
@@ -80,6 +85,7 @@ __all__ = [
     "packed_swiglu",
     "packed_swiglu_native",
     "packed_swiglu_native_out",
+    "packed_gate_up_swiglu_native_out",
     "packed_qkv_rope_cache_native",
     "packed_qkv_rope_cache_native_out",
     "residual_rmsnorm",

@@ -70,6 +70,11 @@ def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     )
     monkeypatch.setattr(
         smollm2_flux,
+        "native_packed_gate_up_gemv_is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        smollm2_flux,
         "native_attention_score_softmax_is_available",
         lambda: True,
     )
@@ -586,6 +591,45 @@ def test_packed_swiglu_requires_packed_mlp_category(
         )
 
 
+def test_fused_gate_up_swiglu_is_separately_opt_in_and_eager_falls_back(
+    python_flux_ops: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _model(1)
+    baseline = copy.deepcopy(source)
+    fused = copy.deepcopy(source)
+    required = {
+        smollm2_flux.FLUX_PACKED_MLP_CATEGORY,
+        smollm2_flux.FLUX_PACKED_SWIGLU_CATEGORY,
+    }
+    smollm2_flux.enable_flux_ops(baseline, operators=required)
+    smollm2_flux.enable_flux_ops(
+        fused,
+        operators=required | {smollm2_flux.FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY},
+    )
+    monkeypatch.setattr(
+        smollm2_flux,
+        "packed_gate_up_swiglu_native_out",
+        lambda *_args, **_kwargs: pytest.fail("eager path called graph-only GEMV"),
+    )
+    input_ids = torch.tensor([[1, 17, 42]])
+    with torch.inference_mode():
+        expected = baseline(input_ids=input_ids, use_cache=False).logits
+        actual = fused(input_ids=input_ids, use_cache=False).logits
+    assert fused.model.layers[0].mlp.fuse_gate_up_swiglu
+    assert fused._flux_fused_gate_up_swiglu_enabled
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fused_gate_up_swiglu_requires_packed_mlp_and_swiglu(
+    python_flux_ops: dict[str, int],
+) -> None:
+    with pytest.raises(ValueError, match="requires.*mlp.*packed_swiglu"):
+        smollm2_flux.enable_flux_ops(
+            _model(1),
+            operators=(smollm2_flux.FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY,),
+        )
+
+
 def test_rmsnorm_substitution_reuses_weight_and_matches_reference(
     python_flux_ops: dict[str, int],
 ) -> None:
@@ -718,6 +762,7 @@ def test_enable_flux_ops_preserves_parameters_and_invokes_every_operator(
         "gqa_decode_attention_modules": 0,
         "packed_qkv_rope_cache_modules": 0,
         "cublaslt_projection_modules": 0,
+        "fused_gate_up_swiglu_modules": 0,
     }
     # Two input norms, two fused post-attention norms, and one final norm.
     assert python_flux_ops == {

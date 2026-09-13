@@ -35,6 +35,7 @@ from flux.ops import (
     native_cublaslt_linear_is_available,
     native_gqa_decode_attention_is_available,
     native_packed_swiglu_is_available,
+    native_packed_gate_up_gemv_is_available,
     native_packed_qkv_rope_cache_is_available,
     native_residual_rmsnorm_is_available,
     native_rope_is_available,
@@ -42,6 +43,7 @@ from flux.ops import (
     native_softmax_is_available,
     packed_swiglu_native,
     packed_swiglu_native_out,
+    packed_gate_up_swiglu_native_out,
     packed_qkv_rope_cache_native,
     packed_qkv_rope_cache_native_out,
     residual_rmsnorm_native,
@@ -62,6 +64,7 @@ FLUX_PACKED_QKV_CATEGORY = "qkv"
 FLUX_GQA_DECODE_ATTENTION_CATEGORY = "gqa_decode_attention"
 FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY = "packed_qkv_rope_cache"
 FLUX_CUBLASLT_PROJECTION_CATEGORY = "cublaslt_projection"
+FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY = "fused_gate_up_swiglu"
 _SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
     FLUX_GQA_DECODE_ATTENTION_CATEGORY,
     FLUX_PACKED_MLP_CATEGORY,
@@ -69,6 +72,7 @@ _SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
     FLUX_PACKED_QKV_CATEGORY,
     FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY,
     FLUX_CUBLASLT_PROJECTION_CATEGORY,
+    FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY,
 }
 _GQA_DECODE_GRAPH_MINIMUM_CAPACITY = 513
 _CUBLASLT_DECODE_PROJECTION_ALGORITHM = CublasLtAlgorithm(
@@ -116,7 +120,13 @@ class FluxPackedLlamaMLP(nn.Module):
     standard Llama ``gate_proj.weight`` and ``up_proj.weight`` interface.
     """
 
-    def __init__(self, source: LlamaMLP, *, use_packed_swiglu: bool = False) -> None:
+    def __init__(
+        self,
+        source: LlamaMLP,
+        *,
+        use_packed_swiglu: bool = False,
+        fuse_gate_up_swiglu: bool = False,
+    ) -> None:
         super().__init__()
         if source.gate_proj.bias is not None or source.up_proj.bias is not None:
             raise ValueError("Flux packed MLP requires bias-free gate/up projections")
@@ -129,6 +139,7 @@ class FluxPackedLlamaMLP(nn.Module):
         self.act_fn = source.act_fn
         self.down_proj = source.down_proj
         self.use_packed_swiglu = use_packed_swiglu
+        self.fuse_gate_up_swiglu = fuse_gate_up_swiglu
 
         # Constructing on meta avoids allocating an initialized throwaway
         # [2 * intermediate_size, hidden_size] tensor. torch.cat is the sole
@@ -199,9 +210,17 @@ class FluxPackedLlamaMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        scratch = getattr(self, "_flux_decode_scratch", None)
+        if self.fuse_gate_up_swiglu and scratch is not None:
+            return self.down_proj(
+                packed_gate_up_swiglu_native_out(
+                    hidden_states,
+                    self.gate_up_proj.weight,
+                    scratch.swiglu_output,
+                )
+            )
         gate_up = self.gate_up_proj(hidden_states)
         if self.use_packed_swiglu:
-            scratch = getattr(self, "_flux_decode_scratch", None)
             if scratch is not None:
                 return self.down_proj(
                     packed_swiglu_native_out(gate_up, scratch.swiglu_output)
@@ -674,6 +693,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
         use_cublaslt_projection: bool = False,
         use_packed_mlp: bool = False,
         use_packed_swiglu: bool = False,
+        fuse_gate_up_swiglu: bool = False,
         use_packed_qkv: bool = False,
     ) -> None:
         nn.Module.__init__(self)
@@ -696,6 +716,7 @@ class FluxLlamaDecoderLayer(LlamaDecoderLayer):
             FluxPackedLlamaMLP(
                 source.mlp,
                 use_packed_swiglu=use_packed_swiglu,
+                fuse_gate_up_swiglu=fuse_gate_up_swiglu,
             )
             if use_packed_mlp
             else source.mlp
@@ -828,6 +849,11 @@ def _check_native_ops(
         and not native_cublaslt_linear_is_available()
     ):
         missing.append("cublaslt_projection")
+    if (
+        FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY in operators
+        and not native_packed_gate_up_gemv_is_available()
+    ):
+        missing.append("gate_up_gemv")
     if missing:
         raise RuntimeError(
             "Flux native operators are not built: "
@@ -862,6 +888,10 @@ def enable_flux_ops(
     measured zero-workspace cuBLASLt configuration for packed QKV and attention
     output projections only in the supported stable-buffer CUDA-Graph path;
     eager and unsupported paths retain ``nn.Linear``.
+    The separately selected ``"fused_gate_up_swiglu"`` category replaces the
+    exact SmolLM2 FP32 one-token packed gate/up projection and its immediate
+    SwiGLU consumer only when supported CUDA-Graph scratch is installed. Eager,
+    prefill, and unsupported geometry retain the packed ``nn.Linear`` path.
     """
     selected = frozenset(operators)
     unknown = selected - _SUPPORTED_OPERATOR_CATEGORIES
@@ -891,6 +921,13 @@ def enable_flux_ops(
     ):
         raise ValueError(
             '"cublaslt_projection" requires the "packed_qkv_rope_cache" operator category'
+        )
+    if FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY in selected and not {
+            FLUX_PACKED_MLP_CATEGORY,
+            FLUX_PACKED_SWIGLU_CATEGORY,
+        }.issubset(selected):
+        raise ValueError(
+            '"fused_gate_up_swiglu" requires the "mlp" and "packed_swiglu" operator categories'
         )
 
     llama_model = _check_model(model)
@@ -923,6 +960,7 @@ def enable_flux_ops(
                 ),
                 use_packed_mlp=FLUX_PACKED_MLP_CATEGORY in selected,
                 use_packed_swiglu=FLUX_PACKED_SWIGLU_CATEGORY in selected,
+                fuse_gate_up_swiglu=FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY in selected,
                 use_packed_qkv=FLUX_PACKED_QKV_CATEGORY in selected,
             )
     else:
@@ -958,6 +996,7 @@ def enable_flux_ops(
                 layer.mlp = FluxPackedLlamaMLP(
                     layer.mlp,
                     use_packed_swiglu=FLUX_PACKED_SWIGLU_CATEGORY in selected,
+                    fuse_gate_up_swiglu=FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY in selected,
                 )
     if "rmsnorm" in selected:
         llama_model.model.norm = FluxRMSNorm(llama_model.model.norm)
@@ -984,6 +1023,9 @@ def enable_flux_ops(
     )
     llama_model._flux_cublaslt_projection_enabled = (
         FLUX_CUBLASLT_PROJECTION_CATEGORY in selected
+    )
+    llama_model._flux_fused_gate_up_swiglu_enabled = (
+        FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY in selected
     )
     return llama_model
 
@@ -1022,6 +1064,11 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
             and module.use_cublaslt_projection
             for module in model.modules()
         ),
+        "fused_gate_up_swiglu_modules": sum(
+            isinstance(module, FluxPackedLlamaMLP)
+            and module.fuse_gate_up_swiglu
+            for module in model.modules()
+        ),
     }
 
 
@@ -1029,6 +1076,7 @@ __all__ = [
     "FLUX_OPERATOR_CATEGORIES",
     "FLUX_CUBLASLT_PROJECTION_CATEGORY",
     "FLUX_GQA_DECODE_ATTENTION_CATEGORY",
+    "FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY",
     "FLUX_PACKED_MLP_CATEGORY",
     "FLUX_PACKED_QKV_CATEGORY",
     "FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY",

@@ -241,6 +241,7 @@ enable_flux_ops(
         "gqa_decode_attention",
         "packed_qkv_rope_cache",
         "cublaslt_projection",
+        "fused_gate_up_swiglu",
     },
 )
 ```
@@ -255,6 +256,24 @@ python benchmarks/benchmark_smollm2_projections.py --production --independent-me
 
 See [the projection milestone report](docs/PROJECTION_MILESTONE.md) for the
 retention evidence and rejected candidates.
+
+The separately controlled `"fused_gate_up_swiglu"` category owns only the
+FP32 SmolLM2 one-token packed gate/up shape `[1,1,576] @ [3072,576].T`. In the
+supported fixed-shape CUDA-Graph path it computes matched gate/up dot products,
+applies SwiGLU, and writes directly to the existing stable 1,536-element MLP
+activation buffer. Eager, prefill, non-FP32, non-unit batch/query, and other
+geometry use the existing packed `nn.Linear` plus packed-SwiGLU fallback.
+
+Add `"fused_gate_up_swiglu"` to the fully optimized category set shown above.
+Reproduce the retained benchmark with:
+
+```bash
+python benchmarks/benchmark_smollm2_gate_up_gemv.py
+```
+
+See [the gate/up GEMV milestone report](docs/GATE_UP_GEMV_MILESTONE.md) for the
+bounded standalone and fused experiments, correctness, launch, traffic, and
+memory results.
 
 Validate and benchmark the retained production packed-QKV path, including
 projection and attention-setup latency, prefill, eager and CUDA-Graph decode,
