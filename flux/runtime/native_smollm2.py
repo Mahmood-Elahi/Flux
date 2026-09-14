@@ -29,7 +29,7 @@ _ADDRESS_NAMES = (
 _PREFILL_ADDRESS_NAMES = (
     "prefill_logits",
     "prefill_workspace",
-    "attention_scores",
+    "streaming_attention_output",
     "final_hidden",
 ) + _ADDRESS_NAMES
 

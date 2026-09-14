@@ -3,6 +3,7 @@
 #include "packed_swiglu_cuda.h"
 #include "residual_rmsnorm_cuda.h"
 #include "rmsnorm_cuda.h"
+#include "streaming_prefill_gqa_cuda.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -31,6 +32,10 @@ constexpr std::int64_t kPackedQKVWidth = 960;
 constexpr std::int64_t kPackedGateUpWidth = 3072;
 constexpr std::int64_t kMaximumCapacity = 8192;
 constexpr int kThreads = 256;
+
+bool use_bounded_legacy_attention(const std::int64_t sequence_length) {
+    return sequence_length > 128 && sequence_length <= 1024;
+}
 
 void check_cuda(const cudaError_t status, const char* operation) {
     TORCH_CHECK(status == cudaSuccess, "flux native prefill: ", operation,
@@ -155,22 +160,22 @@ __global__ void packed_qkv_rope_cache_prefill_fp32_kernel(
     }
 }
 
-__device__ __forceinline__ float warp_max(float value) {
-    for (int offset = 16; offset > 0; offset /= 2) {
+__device__ __forceinline__ float legacy_warp_max(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
         value = fmaxf(value, __shfl_down_sync(0xffffffffU, value, offset));
     }
     return value;
 }
 
-__device__ __forceinline__ float warp_sum(float value) {
-    for (int offset = 16; offset > 0; offset /= 2) {
+__device__ __forceinline__ float legacy_warp_sum(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_down_sync(0xffffffffU, value, offset);
     }
     return value;
 }
 
-__device__ float block_max(float value, float* reductions) {
-    value = warp_max(value);
+__device__ float legacy_block_max(float value, float* reductions) {
+    value = legacy_warp_max(value);
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     if (lane == 0) {
@@ -179,7 +184,7 @@ __device__ float block_max(float value, float* reductions) {
     __syncthreads();
     value = threadIdx.x < blockDim.x / 32 ? reductions[lane] : -FLT_MAX;
     if (warp == 0) {
-        value = warp_max(value);
+        value = legacy_warp_max(value);
         if (lane == 0) {
             reductions[0] = value;
         }
@@ -188,8 +193,8 @@ __device__ float block_max(float value, float* reductions) {
     return reductions[0];
 }
 
-__device__ float block_sum(float value, float* reductions) {
-    value = warp_sum(value);
+__device__ float legacy_block_sum(float value, float* reductions) {
+    value = legacy_warp_sum(value);
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     if (lane == 0) {
@@ -198,7 +203,7 @@ __device__ float block_sum(float value, float* reductions) {
     __syncthreads();
     value = threadIdx.x < blockDim.x / 32 ? reductions[lane] : 0.0F;
     if (warp == 0) {
-        value = warp_sum(value);
+        value = legacy_warp_sum(value);
         if (lane == 0) {
             reductions[0] = value;
         }
@@ -207,7 +212,7 @@ __device__ float block_sum(float value, float* reductions) {
     return reductions[0];
 }
 
-__global__ void causal_softmax_prefill_fp32_kernel(
+__global__ void bounded_legacy_causal_softmax_fp32_kernel(
     float* scores,
     const float scale,
     const std::int64_t sequence_length) {
@@ -215,26 +220,24 @@ __global__ void causal_softmax_prefill_fp32_kernel(
     const std::int64_t row = blockIdx.x;
     const std::int64_t query_position = row % sequence_length;
     float* values = scores + row * sequence_length;
-    float local_max = -FLT_MAX;
+    float local_maximum = -FLT_MAX;
     for (std::int64_t key = threadIdx.x; key <= query_position;
          key += blockDim.x) {
-        const float value = values[key] * scale;
-        values[key] = value;
-        local_max = fmaxf(local_max, value);
+        values[key] *= scale;
+        local_maximum = fmaxf(local_maximum, values[key]);
     }
     for (std::int64_t key = query_position + 1 + threadIdx.x;
          key < sequence_length; key += blockDim.x) {
         values[key] = 0.0F;
     }
-    const float maximum = block_max(local_max, reductions);
+    const float maximum = legacy_block_max(local_maximum, reductions);
     float local_sum = 0.0F;
     for (std::int64_t key = threadIdx.x; key <= query_position;
          key += blockDim.x) {
-        const float value = expf(values[key] - maximum);
-        values[key] = value;
-        local_sum += value;
+        values[key] = expf(values[key] - maximum);
+        local_sum += values[key];
     }
-    const float row_sum = block_sum(local_sum, reductions);
+    const float row_sum = legacy_block_sum(local_sum, reductions);
     for (std::int64_t key = threadIdx.x; key <= query_position;
          key += blockDim.x) {
         values[key] /= row_sum;
@@ -333,7 +336,7 @@ void linear_fp32(
         &beta, output, static_cast<int>(output_width)), operation);
 }
 
-void grouped_prefill_attention(
+void bounded_legacy_grouped_attention(
     cublasHandle_t handle,
     const float* query,
     const float* key,
@@ -358,15 +361,14 @@ void grouped_prefill_attention(
             static_cast<int>(kHeadDim), query_stride, &beta,
             scores + kv_head * kQueriesPerKeyValue * score_stride,
             static_cast<int>(sequence_length), score_stride,
-            static_cast<int>(kQueriesPerKeyValue)), "launching grouped QK GEMM");
+            static_cast<int>(kQueriesPerKeyValue)), "launching bounded legacy QK");
     }
-    const int softmax_threads = sequence_length == 4096
-        ? 512
-        : (sequence_length == 512 || sequence_length == 1024 ? 128 : kThreads);
-    causal_softmax_prefill_fp32_kernel<<<
+    const int softmax_threads = sequence_length == 512 || sequence_length == 1024
+        ? 128 : kThreads;
+    bounded_legacy_causal_softmax_fp32_kernel<<<
         static_cast<unsigned int>(kQueryHeads * sequence_length),
         softmax_threads, 0, stream>>>(scores, scale, sequence_length);
-    check_cuda(cudaGetLastError(), "launching causal softmax");
+    check_cuda(cudaGetLastError(), "launching bounded legacy causal softmax");
     for (std::int64_t kv_head = 0; kv_head < kKeyValueHeads; ++kv_head) {
         check_cublas(cublasSgemmStridedBatched(
             handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -377,7 +379,7 @@ void grouped_prefill_attention(
             static_cast<int>(sequence_length), score_stride, &beta,
             output + kv_head * kQueriesPerKeyValue * query_stride,
             static_cast<int>(kHeadDim), query_stride,
-            static_cast<int>(kQueriesPerKeyValue)), "launching grouped probability-V GEMM");
+            static_cast<int>(kQueriesPerKeyValue)), "launching bounded legacy PV");
     }
 }
 
@@ -519,12 +521,13 @@ public:
 
     void allocate_workspace(const at::TensorOptions& options) {
         const std::int64_t s = sequence_length_;
+        const std::int64_t score_elements =
+            use_bounded_legacy_attention(s) ? kQueryHeads * s * s : 0;
         const std::array<std::int64_t, 12> sizes{
             s * kHiddenSize, s * kHiddenSize, s * kHiddenSize,
             s * kHiddenSize, s * kPackedQKVWidth,
             s * kQueryHeads * kHeadDim,
-            s * s * kQueryHeads,
-            s * kQueryHeads * kHeadDim, s * kHiddenSize,
+            s * kQueryHeads * kHeadDim, score_elements, s * kHiddenSize,
             s * kPackedGateUpWidth, s * kIntermediateSize,
             s * kHiddenSize};
         std::int64_t total = kHiddenSize;
@@ -545,10 +548,12 @@ public:
         qkv_output_ = take(s * kPackedQKVWidth).view({1, s, kPackedQKVWidth});
         query_output_ = take(s * kQueryHeads * kHeadDim)
             .view({kQueryHeads, s, kHeadDim});
-        attention_scores_ = take(s * s * kQueryHeads)
-            .view({kQueryHeads, s, s});
         attention_heads_ = take(s * kQueryHeads * kHeadDim)
             .view({kQueryHeads, s, kHeadDim});
+        if (score_elements != 0) {
+            attention_scores_ = take(score_elements)
+                .view({kQueryHeads, s, s});
+        }
         attention_projection_ = take(s * kHiddenSize).view({1, s, kHiddenSize});
         packed_gate_up_ = take(s * kPackedGateUpWidth)
             .view({1, s, kPackedGateUpWidth});
@@ -608,11 +613,23 @@ public:
                 query_output_.mutable_data_ptr<float>(), layer_keys, layer_values,
                 sequence_length_, capacity_);
             check_cuda(cudaGetLastError(), "launching packed QKV/RoPE/cache fill");
-            grouped_prefill_attention(
-                blas_handle_, query_output_.const_data_ptr<float>(), layer_keys,
-                layer_values, attention_scores_.mutable_data_ptr<float>(),
-                attention_heads_.mutable_data_ptr<float>(), layer.attention_scale,
-                sequence_length_, capacity_, stream);
+            if (use_bounded_legacy_attention(sequence_length_)) {
+                bounded_legacy_grouped_attention(
+                    blas_handle_, query_output_.const_data_ptr<float>(),
+                    layer_keys, layer_values,
+                    attention_scores_.mutable_data_ptr<float>(),
+                    attention_heads_.mutable_data_ptr<float>(),
+                    layer.attention_scale, sequence_length_, capacity_, stream);
+            } else {
+                const StreamingPrefillGQAVariant attention_variant =
+                    select_streaming_prefill_gqa_variant(sequence_length_);
+                check_cuda(streaming_prefill_gqa_cuda_fp32(
+                    query_output_.const_data_ptr<float>(), layer_keys,
+                    layer_values, attention_heads_.mutable_data_ptr<float>(),
+                    layer.attention_scale, sequence_length_, capacity_,
+                    attention_variant, stream),
+                    "launching streaming grouped-GQA attention");
+            }
             attention_heads_to_rows_fp32_kernel<<<
                 blocks_for(sequence_length_ * kHiddenSize), kThreads, 0, stream>>>(
                 attention_heads_.const_data_ptr<float>(),
@@ -695,8 +712,8 @@ public:
     at::Tensor residual_output_;
     at::Tensor qkv_output_;
     at::Tensor query_output_;
-    at::Tensor attention_scores_;
     at::Tensor attention_heads_;
+    at::Tensor attention_scores_;
     at::Tensor attention_projection_;
     at::Tensor packed_gate_up_;
     at::Tensor swiglu_output_;
@@ -757,7 +774,7 @@ std::vector<std::int64_t> NativeSmolLM2Prefill::addresses() const {
     std::vector<std::int64_t> result{
         reinterpret_cast<std::int64_t>(impl_->prefill_logits_.data_ptr()),
         reinterpret_cast<std::int64_t>(impl_->workspace_.data_ptr()),
-        reinterpret_cast<std::int64_t>(impl_->attention_scores_.data_ptr()),
+        reinterpret_cast<std::int64_t>(impl_->attention_heads_.data_ptr()),
         reinterpret_cast<std::int64_t>(impl_->final_hidden_.data_ptr())};
     const std::vector<std::int64_t> decode = impl_->decode_->addresses();
     result.insert(result.end(), decode.begin(), decode.end());

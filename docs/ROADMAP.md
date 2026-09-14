@@ -61,16 +61,22 @@ independent finish lines.
     long-context validation; retire superseded Python executable wrappers,
     operator-only benchmarks, CLIs, and the historical one-layer benchmark
     while retaining all PyTorch/Hugging Face integration coverage.
-30. **Next:** Replace native prefill's full quadratic score materialization
+30. **Completed:** Replace native prefill's full quadratic score materialization
     with tiled/streaming FP32 grouped-GQA attention using online softmax,
-    compact three-head K/V, and no `repeat_kv`; validate memory, correctness,
-    and performance through length 8192 without changing decode semantics.
+    compact three-head K/V, and no `repeat_kv`; retain a measured 36 MiB-bounded
+    short-context fallback, remove the 2.25 GiB length-8192 score matrix, and
+    validate memory, correctness, and performance through length 8192 without
+    changing decode semantics.
+31. **Next:** Reassess the remaining integrated architecture and source balance
+    from the retained streaming-prefill profile without adding unnecessary
+    attention complexity or replacing performant library GEMMs for accounting.
 
-Milestone 29 source totals are Python 550,093 B, CUDA 272,017 B, C++ 132,894 B,
-and headers 15,701 B. CUDA is 28.022623% of these sources and remains 426,671 B
-short of equal CUDA/non-CUDA bytes under the required exact metric. The native
-validation milestone made 139,719 bytes of exact progress without padding,
-duplication, or Linguist overrides.
+Milestone 30 source totals are Python 551,695 B, CUDA 306,421 B, C++ 132,894 B,
+and headers 16,553 B. CUDA is 30.412093% of these sources and remains 394,721 B
+short of equal CUDA/non-CUDA bytes under the required exact metric. This
+milestone makes 31,950 bytes of net progress (`34,404` CUDA bytes added minus
+`2,454` non-CUDA bytes added) without padding, duplication, or Linguist
+overrides.
 
 The operator-optimization roadmap through milestone 24 is complete. The final
 native-runtime phase continues the same integrated codebase; rejected experiments

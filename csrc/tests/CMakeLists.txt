@@ -26,6 +26,11 @@ flux_add_cuda_test(
 flux_add_cuda_test(flux_test_softmax ../softmax/test_softmax_cuda.cu)
 flux_add_cuda_test(flux_test_transformer_ops test_transformer_ops.cu)
 flux_add_cuda_test(flux_test_decode_ops test_decode_ops.cu)
+flux_add_cuda_test(
+    flux_test_streaming_prefill_gqa
+    test_streaming_prefill_gqa.cu)
+find_package(CUDAToolkit REQUIRED)
+target_link_libraries(flux_test_streaming_prefill_gqa PRIVATE CUDA::cublas)
 
 if(FLUX_BUILD_NATIVE_RUNTIME_TESTS)
     find_package(Torch QUIET)

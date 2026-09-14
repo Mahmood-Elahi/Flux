@@ -53,6 +53,8 @@ class Result:
     maximum_python_flux_value_error: float
     maximum_key_layer: int
     maximum_value_layer: int
+    maximum_key_index: tuple[int, ...]
+    maximum_value_index: tuple[int, ...]
     cache_position: int
     cache_length: int
     continuation_tokens: int
@@ -92,6 +94,13 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--audit-length", type=int, default=1024)
     parser.add_argument("--audit-repetitions", type=int, default=5)
     parser.add_argument("--skip-audit", action="store_true")
+    parser.add_argument(
+        "--report-cache-drift",
+        action="store_true",
+        help=("record reordered long-context cache deltas without applying the "
+              "elementwise Flux-cache assertion; logits and continuation "
+              "checks remain enforced"),
+    )
     parser.add_argument("--json-output", type=Path)
     result = parser.parse_args()
     if result.warmup < 0 or result.samples < 1:
@@ -135,17 +144,26 @@ def _cache_errors(
     length: int,
     *,
     assert_close: bool = True,
-) -> tuple[float, int]:
+) -> tuple[float, int, tuple[int, ...]]:
     maximum = 0.0
     maximum_layer = 0
+    maximum_index: tuple[int, ...] = ()
     for index, expected in enumerate(expected_layers):
-        error = _maximum_error(
-            native[index, ..., :length, :], expected, assert_close=assert_close
-        )
+        actual = native[index, ..., :length, :]
+        difference = (actual - expected).abs()
+        error = float(difference.max().item())
+        if assert_close:
+            torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
         if error > maximum:
             maximum = error
             maximum_layer = index
-    return maximum, maximum_layer
+            flat_index = int(difference.argmax().item())
+            coordinates = []
+            for size in reversed(difference.shape):
+                coordinates.append(flat_index % size)
+                flat_index //= size
+            maximum_index = tuple(reversed(coordinates))
+    return maximum, maximum_layer, maximum_index
 
 
 def _validate_and_time(
@@ -155,6 +173,7 @@ def _validate_and_time(
     warmup: int,
     samples: int,
     requested_continuation: int,
+    report_cache_drift: bool = False,
 ) -> tuple[Result, NativeSmolLM2Prefill]:
     input_ids = deterministic_input_ids(length, reference.config.vocab_size)
     continuation = min(requested_continuation, 8192 - length)
@@ -176,23 +195,29 @@ def _validate_and_time(
     # GEMMs have different FP32 accumulation orders.  Record the HF deltas, but
     # assert the native caches against Flux without changing the repository's
     # established tolerances.
-    hf_key, hf_key_layer = _cache_errors(
+    hf_key, hf_key_layer, hf_key_index = _cache_errors(
         native.key_cache,
         [layer.keys for layer in reference_output.past_key_values.layers],
         length,
         assert_close=False,
     )
-    hf_value, hf_value_layer = _cache_errors(
+    hf_value, hf_value_layer, hf_value_index = _cache_errors(
         native.value_cache,
         [layer.values for layer in reference_output.past_key_values.layers],
         length,
         assert_close=False,
     )
-    flux_key, flux_key_layer = _cache_errors(
-        native.key_cache, [layer.keys for layer in flux_output.past_key_values.layers], length
+    flux_key, flux_key_layer, flux_key_index = _cache_errors(
+        native.key_cache,
+        [layer.keys for layer in flux_output.past_key_values.layers],
+        length,
+        assert_close=not report_cache_drift,
     )
-    flux_value, flux_value_layer = _cache_errors(
-        native.value_cache, [layer.values for layer in flux_output.past_key_values.layers], length
+    flux_value, flux_value_layer, flux_value_index = _cache_errors(
+        native.value_cache,
+        [layer.values for layer in flux_output.past_key_values.layers],
+        length,
+        assert_close=not report_cache_drift,
     )
 
     native_hf_continuation = 0.0
@@ -272,6 +297,12 @@ def _validate_and_time(
         maximum_key_layer=(hf_key_layer if hf_key >= flux_key else flux_key_layer),
         maximum_value_layer=(
             hf_value_layer if hf_value >= flux_value else flux_value_layer
+        ),
+        maximum_key_index=(
+            hf_key_index if hf_key >= flux_key else flux_key_index
+        ),
+        maximum_value_index=(
+            hf_value_index if hf_value >= flux_value else flux_value_index
         ),
         cache_position=native.cache_position,
         cache_length=native.cache_length,
@@ -403,6 +434,7 @@ def main() -> int:
             args.warmup,
             args.samples,
             args.continuation_tokens,
+            args.report_cache_drift,
         )
         results.append(result)
         if length == args.audit_length:
@@ -430,6 +462,7 @@ def main() -> int:
                 "warmup": args.warmup,
                 "samples": args.samples,
                 "statistic": "CUDA-event median",
+                "report_cache_drift": args.report_cache_drift,
             },
             "results": [asdict(result) for result in results],
             "audit": None if audit is None else asdict(audit),

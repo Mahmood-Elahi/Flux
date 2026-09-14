@@ -80,7 +80,13 @@ logits = runtime.replay(token)
 The native object owns all 30 compact K/V caches, prompt/decode workspaces,
 device position/cache length, stable logits, stream/event resources, and the
 decode graph. Prefill never constructs a Python cache, expands GQA K/V, or
-copies cache storage at handoff. See [the native prefill milestone](docs/NATIVE_PREFILL_RUNTIME_MILESTONE.md),
+copies cache storage at handoff. Long-context prefill now uses tiled online
+softmax directly over compact three-head K/V, eliminating the former 2.25 GiB
+score matrix at length 8192 and reducing measured native prefill from 548.288
+ms to 283.349 ms on the target RTX 5070 Ti. A benchmark-selected fallback for
+lengths 129--1024 caps retained score storage at 36 MiB. See
+[the streaming prefill GQA milestone](docs/STREAMING_PREFILL_GQA_MILESTONE.md),
+[the native prefill milestone](docs/NATIVE_PREFILL_RUNTIME_MILESTONE.md),
 [the full native decode milestone](docs/NATIVE_FULL_DECODE_RUNTIME_MILESTONE.md),
 and [runtime design](docs/NATIVE_DECODE_RUNTIME_DESIGN.md). Reproduce the
 prefill correctness, direct continuation, launch, memory, and three-path timing

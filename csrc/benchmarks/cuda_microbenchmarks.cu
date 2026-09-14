@@ -9,6 +9,7 @@
 #include "rmsnorm_cuda.h"
 #include "rope_cuda.h"
 #include "softmax_cuda.h"
+#include "streaming_prefill_gqa_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -367,6 +368,69 @@ void benchmark_gqa(const Options& options, Stream& stream) {
     time_case(options, "gqa_decode_b1_h9_kv3_s8192", stream.get(), operation);
 }
 
+void benchmark_streaming_prefill_gqa(
+    const Options& options, Stream& stream) {
+    constexpr std::size_t query_heads = 9;
+    constexpr std::size_t kv_heads = 3;
+    constexpr std::size_t dimension = 64;
+    constexpr float scale = 0.125F;
+    constexpr std::array<std::size_t, 10> lengths{
+        128, 192, 256, 384, 448, 512, 1024, 2048, 4096, 8192};
+    constexpr std::array<flux::StreamingPrefillGQAVariant, 3> variants{
+        flux::StreamingPrefillGQAVariant::kQueryTile8,
+        flux::StreamingPrefillGQAVariant::kQueryTile32,
+        flux::StreamingPrefillGQAVariant::kQueryTile128};
+    constexpr std::array<const char*, 3> names{
+        "query_tile_8", "query_tile_32", "query_tile_128"};
+    for (const std::size_t sequence : lengths) {
+        std::vector<float> query(query_heads * sequence * dimension, 0.0F);
+        std::vector<float> key = deterministic_values(
+            kv_heads * sequence * dimension, 0.5F, 0.0F,
+            static_cast<std::uint32_t>(41 + sequence));
+        std::vector<float> value = deterministic_values(
+            kv_heads * sequence * dimension, 1.0F, 0.0F,
+            static_cast<std::uint32_t>(59 + sequence));
+        DeviceBuffer<float> d_query(query.size());
+        DeviceBuffer<float> d_key(key.size());
+        DeviceBuffer<float> d_value(value.size());
+        DeviceBuffer<float> d_output(query.size());
+        copy_to_device(d_query, query, stream.get());
+        copy_to_device(d_key, key, stream.get());
+        copy_to_device(d_value, value, stream.get());
+        for (std::size_t index = 0; index < variants.size(); ++index) {
+            const std::string case_name =
+                "streaming_prefill_gqa_s" + std::to_string(sequence) +
+                "_" + names[index];
+            const auto operation = [&] {
+                check_cuda(flux::streaming_prefill_gqa_cuda_fp32(
+                    d_query.get(), d_key.get(), d_value.get(), d_output.get(),
+                    scale, sequence, sequence, variants[index], stream.get()),
+                    "benchmark streaming prefill GQA launch");
+            };
+            operation();
+            if (sequence == lengths.front()) {
+                const std::vector<float> actual =
+                    copy_to_host(d_output, stream.get());
+                for (std::size_t head = 0; head < query_heads; ++head) {
+                    const std::size_t kv_head = head / 3;
+                    double prefix = 0.0;
+                    for (std::size_t row = 0; row < sequence; ++row) {
+                        prefix += value[(kv_head * sequence + row) * dimension];
+                        const float expected =
+                            static_cast<float>(prefix / (row + 1));
+                        const float observed =
+                            actual[(head * sequence + row) * dimension];
+                        expect(std::abs(observed - expected) <=
+                                   2.0e-5F + 2.0e-4F * std::abs(expected),
+                               "benchmark streaming GQA correctness failed");
+                    }
+                }
+            }
+            time_case(options, case_name, stream.get(), operation);
+        }
+    }
+}
+
 void benchmark_gate_up(const Options& options, Stream& stream) {
     constexpr std::size_t input_width = 576;
     constexpr std::size_t output_width = 1536;
@@ -426,6 +490,7 @@ int main(int argc, char** argv) {
         benchmark_packed_swiglu(options, stream);
         benchmark_packed_qkv(options, stream);
         benchmark_gqa(options, stream);
+        benchmark_streaming_prefill_gqa(options, stream);
         benchmark_gate_up(options, stream);
         return 0;
     } catch (const std::exception& error) {
