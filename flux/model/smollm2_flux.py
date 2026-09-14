@@ -74,6 +74,10 @@ _SUPPORTED_OPERATOR_CATEGORIES = FLUX_OPERATOR_CATEGORIES | {
     FLUX_CUBLASLT_PROJECTION_CATEGORY,
     FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY,
 }
+# Canonical production configuration for the completed integrated system.
+# Keep this explicit and public so validation, benchmarks, and users do not
+# have to reconstruct the retained set from historical milestone documents.
+FINAL_FLUX_OPERATOR_CATEGORIES = _SUPPORTED_OPERATOR_CATEGORIES
 _GQA_DECODE_GRAPH_MINIMUM_CAPACITY = 513
 _CUBLASLT_DECODE_PROJECTION_ALGORITHM = CublasLtAlgorithm(
     index=-1,
@@ -1073,6 +1077,7 @@ def flux_operator_counts(model: nn.Module) -> dict[str, int]:
 
 
 __all__ = [
+    "FINAL_FLUX_OPERATOR_CATEGORIES",
     "FLUX_OPERATOR_CATEGORIES",
     "FLUX_CUBLASLT_PROJECTION_CATEGORY",
     "FLUX_GQA_DECODE_ATTENTION_CATEGORY",

@@ -44,6 +44,22 @@ def _model(num_hidden_layers: int = 2) -> LlamaForCausalLM:
     return LlamaForCausalLM(_config(num_hidden_layers)).float().eval()
 
 
+def test_final_flux_configuration_is_the_complete_retained_set() -> None:
+    assert smollm2_flux.FINAL_FLUX_OPERATOR_CATEGORIES == {
+        "rmsnorm",
+        "residual_rmsnorm",
+        "rope",
+        "softmax",
+        "mlp",
+        "packed_swiglu",
+        "qkv",
+        "gqa_decode_attention",
+        "packed_qkv_rope_cache",
+        "cublaslt_projection",
+        "fused_gate_up_swiglu",
+    }
+
+
 @pytest.fixture
 def python_flux_ops(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Use exact Python formulations while exercising the model adapter."""

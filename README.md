@@ -1,10 +1,62 @@
 # Flux
 
-Flux is a long-term systems and machine-learning project for building a CUDA-accelerated transformer inference system around **SmolLM2-135M**. It uses Python, C++, CUDA C++, and PyTorch.
+Flux is a completed, integrated FP32 CUDA inference path for
+**SmolLM2-135M**. It combines explicit PyTorch model adapters with custom
+C++/CUDA operators, packed checkpoint-compatible projections, native
+one-token grouped-query attention, and fixed-shape CUDA-Graph decode. The
+ordinary pinned Hugging Face/PyTorch model remains unchanged as the numerical
+and performance reference; Flux is enabled only on the model instance passed
+to `enable_flux_ops` and never monkey-patches Transformers globally.
 
-Development began with reproducible PyTorch reference inference and progressively replaces important transformer operations with custom native and CUDA implementations. FP32 RMSNorm, fused residual + RMSNorm, RoPE, attention softmax, fused attention score post-processing, packed SwiGLU, and one-token GQA decode attention now have validated native PyTorch operators with CPU and CUDA dispatch. An optional integrated SmolLM2 path uses those operators while retaining Hugging Face KV-cache management. Separately opt-in structural adapters combine Q/K/V or gate/up projections through standard PyTorch/cuBLAS linear operations, and the MLP adapter can optionally fuse the following SwiGLU elementwise sequence.
+## Final integrated system
 
-The reference model remains unchanged as the numerical oracle. Call `enable_flux_ops(model)` explicitly on an evaluated FP32 `LlamaForCausalLM` to replace supported modules on that model instance; importing Flux never mutates a Hugging Face model or global Transformers behavior.
+The canonical production category set is exported as
+`FINAL_FLUX_OPERATOR_CATEGORIES`:
+
+```python
+from flux.model import FINAL_FLUX_OPERATOR_CATEGORIES, enable_flux_ops
+
+model = enable_flux_ops(
+    model,
+    operators=FINAL_FLUX_OPERATOR_CATEGORIES,
+    fuse_attention_scores=True,
+)
+```
+
+It retains FP32 RMSNorm, fused residual-RMSNorm, RoPE, fused attention score
+processing/softmax, packed QKV and MLP storage, packed SwiGLU, native one-token
+GQA, fused packed-QKV/RoPE/StaticCache update, tuned zero-workspace cuBLASLt
+QKV/output projections, and fused gate/up GEMV+SwiGLU. Fixed-shape graph decode
+uses stable caller-owned buffers, device-resident cache position/mask state, and
+unexpanded 3-head K/V storage; it never materializes `repeat_kv` in the
+optimized 513--8192-capacity path.
+
+On the target RTX 5070 Ti, the final 30-sample run measured 1.435, 1.464,
+1.707, and 2.053 ms/token at effective attention lengths 1024, 2048, 4096,
+and 8192. These are 16.82x, 16.12x, 13.62x, and 10.92x faster than the ordinary
+Hugging Face/PyTorch reference path. A 4096-capacity replay contains 315 GPU
+launches (181 Flux, 92 cuBLAS/cuBLASLt, 42 remaining framework), grows PyTorch
+allocated memory by zero bytes, and preserves all graph tensor addresses.
+Reference, Flux eager, and Flux graph greedy tokens matched through every
+tested continuation; the largest observed end-to-end logit difference was
+`8.965e-5` under the established FP32 tolerance.
+
+Rebuild, validate, and reproduce the final matrix with:
+
+```powershell
+$env:FLUX_BUILD_NATIVE='1'
+build\python3119\python.exe setup.py build_ext --inplace --parallel 8
+build\python3119\python.exe -m pytest -q
+build\python3119\python.exe benchmarks\benchmark_final_system.py `
+  --json-output build\final_system_results.json
+```
+
+The benchmark covers 128--8192-token prefill, steady one-token decode,
+32-token generation, exact state-dict compatibility, logits/KV/cache state,
+stable addresses, and replay launch/allocation behavior. See
+[the final system milestone](docs/FINAL_SYSTEM_MILESTONE.md) for the complete
+configuration, methodology, tables, bottleneck interpretation, limitations,
+and optimization history.
 
 ## Development setup
 
@@ -274,6 +326,28 @@ python benchmarks/benchmark_smollm2_gate_up_gemv.py
 See [the gate/up GEMV milestone report](docs/GATE_UP_GEMV_MILESTONE.md) for the
 bounded standalone and fused experiments, correctness, launch, traffic, and
 memory results.
+
+The subsequent retained-system re-profile found the LM head to be the largest
+individual remaining library kernel. A bounded FP32 M=1 custom GEMV experiment
+produced only a marginal isolated win and regressed integrated graph decode at
+the primary and longer capacities, so no LM-head operator or dispatch was
+retained. See [the LM-head GEMV milestone report](docs/LM_HEAD_GEMV_MILESTONE.md)
+for the fresh category profile, rejected architectures, correctness, traffic,
+resource, graph, eager, and memory results.
+
+The follow-up long-context GQA investigation retained shared per-chunk
+rescaling in the final reduction, reducing redundant workspace reads and
+rescaling exponentials without changing launches or operator semantics. A
+coalesced stage-1 candidate was removed after its isolated 4096 win regressed
+the integrated graph. Reproduce the retained kernel/stage benchmark with:
+
+```bash
+python benchmarks/benchmark_gqa_long_context.py
+```
+
+See [the GQA reduction milestone report](docs/GQA_REDUCTION_MILESTONE.md) for
+the baseline structure, traffic/resource analysis, alternating full-graph A/B
+results, rejected experiment, correctness, and recommendation.
 
 Validate and benchmark the retained production packed-QKV path, including
 projection and attention-setup latency, prefill, eager and CUDA-Graph decode,

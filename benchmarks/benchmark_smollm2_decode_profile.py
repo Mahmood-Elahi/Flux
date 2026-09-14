@@ -6,9 +6,10 @@ Run from the repository root after building the Flux native extension:
 
 The benchmark keeps production execution unchanged. Uninstrumented CUDA-event
 medians establish eager decode, CUDA-Graph replay, and prefill latency. A single
-profiler pass then inventories natural full-model launches. Phase estimates use
-non-overlapping outer operators from that pass and are corroborated by batched
-isolated phase timings, avoiding CUDA events between operations in a live layer.
+profiler pass inventories natural full-model launches. Repeated natural replays
+provide semantic component and launch-owner attribution, and phase estimates
+are corroborated by batched isolated timings. No CUDA events are inserted
+between operations in a live layer.
 """
 
 from __future__ import annotations
@@ -32,15 +33,23 @@ from transformers.models.llama.modeling_llama import repeat_kv
 from flux.model.smollm2 import MODEL_ID, MODEL_REVISION, inspect_config, load_model
 from flux.model.smollm2_cuda_graph import FluxCUDAGraphDecode
 from flux.model.smollm2_flux import (
+    FLUX_CUBLASLT_PROJECTION_CATEGORY,
+    FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY,
+    FLUX_GQA_DECODE_ATTENTION_CATEGORY,
     FLUX_OPERATOR_CATEGORIES,
     FLUX_PACKED_MLP_CATEGORY,
     FLUX_PACKED_QKV_CATEGORY,
+    FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY,
     FLUX_PACKED_SWIGLU_CATEGORY,
     enable_flux_ops,
     flux_operator_counts,
 )
 from flux.ops import (
     native_attention_score_softmax_is_available,
+    native_cublaslt_linear_is_available,
+    native_gqa_decode_attention_is_available,
+    native_packed_gate_up_gemv_is_available,
+    native_packed_qkv_rope_cache_is_available,
     native_packed_swiglu_is_available,
     native_residual_rmsnorm_is_available,
     native_rmsnorm_is_available,
@@ -54,11 +63,16 @@ from flux.ops import (
 
 
 DECODE_CONTEXTS = (128, 512, 1024, 2048, 4096)
+GRAPH_CAPACITIES = (128, 512, 1024, 2048, 4096, 8192)
 PREFILL_LENGTHS = (512, 1024, 4096)
 ALL_OPERATORS = FLUX_OPERATOR_CATEGORIES | {
     FLUX_PACKED_QKV_CATEGORY,
     FLUX_PACKED_MLP_CATEGORY,
     FLUX_PACKED_SWIGLU_CATEGORY,
+    FLUX_GQA_DECODE_ATTENTION_CATEGORY,
+    FLUX_PACKED_QKV_ROPE_CACHE_CATEGORY,
+    FLUX_CUBLASLT_PROJECTION_CATEGORY,
+    FLUX_FUSED_GATE_UP_SWIGLU_CATEGORY,
 }
 SEED = 0
 MIB = 1024.0**2
@@ -91,6 +105,17 @@ class ProfileSummary:
 
 
 @dataclass(frozen=True)
+class ComponentProfile:
+    workload: str
+    size: int
+    baseline_ms: float
+    kernel_ms: float
+    kernel_launches: int
+    components: tuple[PhaseRow, ...]
+    owners: tuple[PhaseRow, ...]
+
+
+@dataclass(frozen=True)
 class IntermediateRow:
     name: str
     shape: tuple[int, ...]
@@ -113,10 +138,17 @@ def _parse_int_list(value: str) -> tuple[int, ...]:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--decode-contexts", type=_parse_int_list, default=DECODE_CONTEXTS)
+    parser.add_argument(
+        "--graph-capacities",
+        type=_parse_int_list,
+        default=GRAPH_CAPACITIES,
+        help="exact fixed cache capacities for graph timing and repeated attribution",
+    )
     parser.add_argument("--prefill-lengths", type=_parse_int_list, default=PREFILL_LENGTHS)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repetitions", type=int, default=30)
     parser.add_argument("--graph-replays", type=int, default=30)
+    parser.add_argument("--component-profile-replays", type=int, default=10)
     parser.add_argument("--stabilization-iterations", type=int, default=50)
     parser.add_argument(
         "--profile-contexts",
@@ -126,11 +158,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-profiler", action="store_true")
     parser.add_argument("--skip-microbenchmarks", action="store_true")
+    parser.add_argument("--skip-component-profile", action="store_true")
     args = parser.parse_args()
     if args.warmup < 0 or args.repetitions < 1 or args.graph_replays < 1:
         parser.error("warmup may be zero; repetitions and graph replays must be positive")
     if args.stabilization_iterations < 0:
         parser.error("stabilization iterations must be non-negative")
+    if args.component_profile_replays < 1:
+        parser.error("component-profile-replays must be positive")
     return args
 
 
@@ -224,6 +259,20 @@ def _make_graph(model: torch.nn.Module, context: int, steps: int) -> FluxCUDAGra
     return graph
 
 
+def _make_capacity_graph(
+    model: torch.nn.Module, capacity: int, replay_budget: int
+) -> FluxCUDAGraphDecode:
+    if capacity < 2:
+        raise ValueError("graph capacity must be at least two tokens")
+    steps = min(capacity - 1, replay_budget + 16)
+    prompt = _input_ids(capacity - steps, model.config.vocab_size)
+    graph = FluxCUDAGraphDecode.capture(model, prompt, max_decode_steps=steps)
+    del prompt
+    if graph.max_cache_len != capacity:
+        raise AssertionError("captured graph capacity does not match request")
+    return graph
+
+
 def _time_graph_decode(
     model: torch.nn.Module, context: int, warmup: int, repetitions: int
 ) -> float:
@@ -236,6 +285,29 @@ def _time_graph_decode(
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         graph.replay()
+        end.record()
+        samples.append((start, end))
+    samples[-1][1].synchronize()
+    result = statistics.median(start.elapsed_time(end) for start, end in samples)
+    del graph
+    return result
+
+
+def _time_graph_capacity(
+    model: torch.nn.Module,
+    capacity: int,
+    warmup: int,
+    repetitions: int,
+) -> float:
+    graph = _make_capacity_graph(model, capacity, warmup + repetitions)
+    for _ in range(warmup):
+        graph.graph.replay()
+    samples = []
+    for _ in range(repetitions):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.graph.replay()
         end.record()
         samples.append((start, end))
     samples[-1][1].synchronize()
@@ -288,6 +360,12 @@ def _phase_for_event(event: Any, config: Any, workload: str) -> str | None:
         return "score scale/mask/softmax"
     if name == "flux::packed_swiglu":
         return "packed SwiGLU"
+    if name == "flux::packed_gate_up_swiglu_out":
+        return "fused gate/up GEMV + SwiGLU"
+    if name == "flux::packed_qkv_rope_cache_out":
+        return "fused QKV/RoPE/cache update"
+    if name in {"flux::gqa_decode_attention", "flux::gqa_decode_attention_out"}:
+        return "native GQA attention"
     if name == "aten::linear" and len(second) == 2:
         output_width, input_width = second
         if (output_width, input_width) == (q_width + 2 * kv_width, hidden):
@@ -320,8 +398,16 @@ def _phase_for_event(event: Any, config: Any, workload: str) -> str | None:
 
 
 def _short_kernel_name(name: str) -> str:
+    lowered = name.lower()
+    if "gemv2t_kernel_val" in lowered and "li4eli4" in lowered:
+        return "LM-head GEMV"
     for marker, short in (
         ("fill", "deterministic/safety fill"),
+        ("packed_gate_up_swiglu_cuda_fp32_kernel", "Flux fused gate/up + SwiGLU"),
+        ("packed_qkv_rope_cache_cuda_fp32_kernel", "Flux fused QKV/RoPE/cache"),
+        ("gqa_decode_attention_grouped_chunk_cuda_fp32_kernel", "Flux GQA grouped chunk"),
+        ("gqa_decode_attention_chunk_cuda_fp32_kernel", "Flux GQA chunk"),
+        ("gqa_decode_attention_reduce_cuda_fp32_kernel", "Flux GQA reduce"),
         ("residual_rmsnorm_cuda_fp32_kernel", "Flux residual-RMSNorm"),
         ("rmsnorm_cuda_fp32_kernel", "Flux RMSNorm"),
         ("rope_cuda_fp32_kernel", "Flux RoPE"),
@@ -333,10 +419,11 @@ def _short_kernel_name(name: str) -> str:
         ("index_copy", "index_copy"),
         ("CatArrayBatchedCopy", "cat copy"),
         ("Li5ELb0", "packed gate/up GEMV"),
+        ("Li8ELb0", "packed QKV/o_proj GEMV"),
         ("Li9ELb0", "down_proj GEMV"),
         ("Li2ELi2", "packed QKV/o_proj GEMV"),
-        ("Li4ELi4", "LM-head GEMV"),
-        ("Li6ELb0", "attention x V batched GEMV"),
+        ("Li7ELb0", "attention x V batched GEMV"),
+        ("Li6ELb0", "QK^T batched GEMV"),
         ("Li6ELb1", "QK^T batched GEMV"),
         ("gemv", "GEMV"),
         ("elementwise_kernel", "elementwise"),
@@ -491,6 +578,231 @@ def _profile_prefill(
         lambda: model(input_ids=input_ids, use_cache=True, logits_to_keep=1),
     )
     del input_ids
+    return result
+
+
+def _kernel_owner(name: str) -> str:
+    lowered = name.lower()
+    if "_zn4flux" in lowered or "flux" in lowered:
+        return "custom Flux CUDA"
+    if "cublas" in lowered or "gemm" in lowered or "gemv" in lowered:
+        return "cuBLAS/cuBLASLt"
+    return "framework CUDA"
+
+
+def _owner_rows(profiler: Any, replays: int) -> tuple[PhaseRow, ...]:
+    times: dict[str, float] = defaultdict(float)
+    counts: Counter[str] = Counter()
+    for event in profiler.events():
+        if event.device_type != DeviceType.CUDA:
+            continue
+        owner = _kernel_owner(event.name)
+        times[owner] += float(event.self_device_time_total) / 1000.0 / replays
+        counts[owner] += 1
+    return tuple(
+        PhaseRow(name, round(counts[name] / replays), times[name])
+        for name in ("custom Flux CUDA", "cuBLAS/cuBLASLt", "framework CUDA")
+    )
+
+
+def _profile_eager_components(
+    model: torch.nn.Module,
+    context: int,
+    baseline_ms: float,
+    replays: int,
+) -> ComponentProfile:
+    context_ids = _input_ids(context, model.config.vocab_size)
+    token = _input_ids(context + 1, model.config.vocab_size)[:, -1:]
+    cache = _prefill_cache(model, context_ids)
+    output = None
+    for _ in range(5):
+        output = model(
+            input_ids=token,
+            past_key_values=cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+    torch.cuda.synchronize()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+    ) as profiler:
+        for _ in range(replays):
+            output = model(
+                input_ids=token,
+                past_key_values=cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+        torch.cuda.synchronize()
+
+    phase_times: dict[str, float] = defaultdict(float)
+    phase_counts: Counter[str] = Counter()
+    cat_count = 0
+    for event in profiler.events():
+        if event.device_type != DeviceType.CPU or event.device_time_total <= 0:
+            continue
+        if event.name == "aten::cat":
+            phase_name = (
+                "input/mask/position setup" if cat_count % 61 == 0 else "KV cache update"
+            )
+            cat_count += 1
+        else:
+            phase_name = _phase_for_event(event, model.config, "eager decode")
+        if phase_name is not None:
+            phase_times[phase_name] += float(event.device_time_total) / 1000.0 / replays
+            phase_counts[phase_name] += 1
+
+    groups = {
+        "LM-head projection": ("LM head",),
+        "attention / native GQA": ("native GQA attention",),
+        "QKV projection + RoPE": ("packed QKV projection", "RoPE"),
+        "attention output projection": ("o_proj",),
+        "MLP gate/up + SwiGLU": ("packed gate/up projection", "packed SwiGLU"),
+        "MLP down projection": ("down_proj",),
+        "RMSNorm / residual RMSNorm": ("RMSNorm", "residual + RMSNorm"),
+        "KV-cache / memory management": ("KV cache update",),
+        "remaining elementwise/framework": (
+            "residual add",
+            "input embedding",
+            "input/mask/position setup",
+        ),
+    }
+    components = []
+    for name, phases in groups.items():
+        components.append(
+            PhaseRow(
+                name,
+                round(sum(phase_counts[phase] for phase in phases) / replays),
+                sum(phase_times[phase] for phase in phases),
+            )
+        )
+    kernel_ms = sum(row.milliseconds for row in _owner_rows(profiler, replays))
+    attributed_ms = sum(row.milliseconds for row in components)
+    components.append(
+        PhaseRow(
+            "other/unattributed device kernels",
+            0,
+            max(0.0, kernel_ms - attributed_ms),
+        )
+    )
+    kernel_launches = sum(
+        1 for event in profiler.events() if event.device_type == DeviceType.CUDA
+    )
+    result = ComponentProfile(
+        "eager decode",
+        context,
+        baseline_ms,
+        kernel_ms,
+        round(kernel_launches / replays),
+        tuple(components),
+        _owner_rows(profiler, replays),
+    )
+    del output, context_ids, token, cache
+    return result
+
+
+def _graph_component_for_index(index: int, optimized: bool) -> str:
+    if optimized:
+        if index < 3 or index == 314:
+            return "cache/state management"
+        if index < 12:
+            return "embedding / position / RoPE framework"
+        if index == 312:
+            return "RMSNorm / residual RMSNorm"
+        if index == 313:
+            return "LM-head projection"
+        relative = (index - 12) % 10
+        return (
+            "RMSNorm / residual RMSNorm",
+            "packed QKV projection",
+            "fused QKV/RoPE/cache update",
+            "attention / native GQA",
+            "attention / native GQA",
+            "attention output projection",
+            "RMSNorm / residual RMSNorm",
+            "MLP gate/up/SwiGLU",
+            "MLP down projection",
+            "remaining elementwise kernels",
+        )[relative]
+
+    if index < 12:
+        return (
+            "cache/state management"
+            if index < 3
+            else "embedding / position / RoPE framework"
+        )
+    if index == 1812 or index == 1813:
+        return "RMSNorm / residual RMSNorm"
+    if index == 1814:
+        return "LM-head projection"
+    if index == 1815:
+        return "cache/state management"
+    relative = (index - 12) % 60
+    if relative in (0, 1, 52, 53, 54):
+        return "RMSNorm / residual RMSNorm"
+    if 2 <= relative <= 5:
+        return "QKV projection + RoPE"
+    if 6 <= relative <= 44:
+        return "KV-cache / framework memory management"
+    if 45 <= relative <= 50:
+        return "attention / PyTorch GQA fallback"
+    if relative == 51:
+        return "attention output projection"
+    if 55 <= relative <= 57:
+        return "MLP gate/up + SwiGLU fallback"
+    if relative == 58:
+        return "MLP down projection"
+    return "remaining elementwise kernels"
+
+
+def _profile_graph_components(
+    model: torch.nn.Module,
+    capacity: int,
+    baseline_ms: float,
+    replays: int,
+) -> ComponentProfile:
+    prewarm = 5
+    graph = _make_capacity_graph(model, capacity, prewarm + replays)
+    for _ in range(prewarm):
+        graph.graph.replay()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as profiler:
+        for _ in range(replays):
+            graph.graph.replay()
+        torch.cuda.synchronize()
+
+    events = [
+        event for event in profiler.events() if event.device_type == DeviceType.CUDA
+    ]
+    optimized = capacity >= 513
+    launches_per_replay = 315 if optimized else 1816
+    if len(events) != launches_per_replay * replays:
+        raise AssertionError(
+            f"unexpected graph launch count at capacity {capacity}: "
+            f"{len(events)} for {replays} replays"
+        )
+    times: dict[str, float] = defaultdict(float)
+    counts: Counter[str] = Counter()
+    for ordinal, event in enumerate(events):
+        component = _graph_component_for_index(ordinal % launches_per_replay, optimized)
+        times[component] += float(event.self_device_time_total) / 1000.0 / replays
+        counts[component] += 1
+    components = tuple(
+        PhaseRow(name, round(counts[name] / replays), times[name])
+        for name in sorted(times, key=times.get, reverse=True)
+    )
+    owner_rows = _owner_rows(profiler, replays)
+    result = ComponentProfile(
+        "graph replay" if optimized else "graph replay (fallback)",
+        capacity,
+        baseline_ms,
+        sum(row.milliseconds for row in owner_rows),
+        launches_per_replay,
+        components,
+        owner_rows,
+    )
+    del graph
     return result
 
 
@@ -747,6 +1059,36 @@ def _print_profiles(profiles: Sequence[ProfileSummary], layers: int) -> None:
             print("  fill/uninitialized-data kernels: none observed")
 
 
+def _print_component_profiles(profiles: Sequence[ComponentProfile]) -> None:
+    for item in profiles:
+        host_gap = max(0.0, item.baseline_ms - item.kernel_ms)
+        print(f"\nRepeated component profile: {item.workload}, size={item.size}")
+        print(
+            f"  unprofiled median={item.baseline_ms:.4f} ms; "
+            f"summed kernels={item.kernel_ms:.4f} ms; "
+            f"launches={item.kernel_launches}; "
+            f"host/launch gap~={host_gap:.4f} ms "
+            f"({100.0 * host_gap / item.baseline_ms:.2f}%)"
+        )
+        print(
+            f"  {'component':<40} {'events':>8} {'ms/token':>11} "
+            f"{'model %':>9} {'device %':>10}"
+        )
+        for row in item.components:
+            print(
+                f"  {row.name:<40} {row.calls:>8} {row.milliseconds:>11.4f} "
+                f"{100.0 * row.milliseconds / item.baseline_ms:>8.2f}% "
+                f"{100.0 * row.milliseconds / item.kernel_ms:>9.2f}%"
+            )
+        print("  launch ownership:")
+        for row in item.owners:
+            print(
+                f"    {row.name:<24} {row.calls:>4} launches "
+                f"{row.milliseconds:>8.4f} ms "
+                f"({100.0 * row.milliseconds / item.kernel_ms:>5.2f}% device)"
+            )
+
+
 def _print_microbenchmarks(context: int, rows: Sequence[PhaseRow]) -> None:
     print(f"\nIsolated layer-0 phase corroboration at context {context}")
     print("  Each ordinary phase is the median of 30-call batches, divided by 30.")
@@ -781,7 +1123,8 @@ def _print_gemm_inventory(config: Any, decode_contexts: Sequence[int], prefill_l
     print(f"  gate/up:    30 x [M,{hidden}] @ [{hidden},{2 * intermediate}]")
     print(f"  down_proj:  30 x [M,{intermediate}] @ [{intermediate},{hidden}]")
     print(f"  LM head:     1 x [1,{hidden}] @ [{hidden},{int(config.vocab_size)}]")
-    print("  Total: 181 GEMM/GEMV launches per forward (120 projections + 60 attention + 1 LM head).")
+    print("  Total: 181 logical matrix operations (120 projections + 60 attention + 1 LM head).")
+    print("  Retained graph decode replaces gate/up and GQA library work with Flux kernels; it has 92 library matrix launches.")
     print(f"  eager decode attention lengths: {tuple(context + 1 for context in decode_contexts)}")
     print("  graph attention length equals context + captured replay capacity; masked future slots are still multiplied.")
     print(f"  prefill M/attention lengths: {tuple(prefill_lengths)}")
@@ -789,11 +1132,13 @@ def _print_gemm_inventory(config: Any, decode_contexts: Sequence[int], prefill_l
 
 def _print_custom_inventory(prefill: bool) -> None:
     print("\nFlux custom operator inventory per complete forward")
-    print("  RMSNorm=31; residual-RMSNorm=30; RoPE=30; packed SwiGLU=30")
     if prefill:
+        print("  Prefill: RMSNorm=31; residual-RMSNorm=30; RoPE=30; packed SwiGLU=30")
         print("  fused attention-score softmax=30; total custom calls/kernels=151")
     else:
-        print("  softmax=30 (scale and optional mask add remain separate); total custom calls/kernels=151")
+        print("  Retained graph decode: RMSNorm=31; residual-RMSNorm=30; fused QKV/RoPE/cache=30")
+        print("  GQA=30 calls/60 kernels; fused gate/up + SwiGLU=30; total custom kernels=181")
+        print("  Eager decode retains the category-specific general fallbacks where stable graph scratch is required.")
 
 
 def _required_ops_available() -> bool:
@@ -805,6 +1150,10 @@ def _required_ops_available() -> bool:
             native_softmax_is_available(),
             native_attention_score_softmax_is_available(),
             native_packed_swiglu_is_available(),
+            native_gqa_decode_attention_is_available(),
+            native_packed_qkv_rope_cache_is_available(),
+            native_cublaslt_linear_is_available(),
+            native_packed_gate_up_gemv_is_available(),
         )
     )
 
@@ -825,9 +1174,16 @@ def main() -> int:
         for value in args.decode_contexts
         if value + args.warmup + decode_window <= maximum
     )
+    graph_capacities = tuple(
+        value for value in args.graph_capacities if 2 <= value <= maximum
+    )
     prefill_lengths = tuple(value for value in args.prefill_lengths if value <= maximum)
-    if not decode_contexts or not prefill_lengths:
+    if not decode_contexts or not graph_capacities or not prefill_lengths:
         raise RuntimeError("all requested workloads exceed max_position_embeddings")
+    if args.warmup + args.graph_replays > min(graph_capacities) - 1:
+        raise RuntimeError(
+            "warmup + graph replays exceed the smallest exact graph capacity"
+        )
 
     print("\nStabilizing clocks with untimed optimized prefill and graph decode...", flush=True)
     if args.stabilization_iterations:
@@ -848,6 +1204,7 @@ def main() -> int:
 
     eager_rows = []
     graph_rows = []
+    graph_capacity_rows = []
     prefill_rows = []
     with torch.inference_mode():
         for context in decode_contexts:
@@ -855,12 +1212,23 @@ def main() -> int:
             eager_rows.append(TimingRow(context, _time_eager_decode(model, context, args.warmup, args.repetitions)))
             print(f"Timing graph replay at context {context}...", flush=True)
             graph_rows.append(TimingRow(context, _time_graph_decode(model, context, args.warmup, args.graph_replays)))
+        for capacity in graph_capacities:
+            print(f"Timing exact graph capacity {capacity}...", flush=True)
+            graph_capacity_rows.append(
+                TimingRow(
+                    capacity,
+                    _time_graph_capacity(
+                        model, capacity, args.warmup, args.graph_replays
+                    ),
+                )
+            )
         for length in prefill_lengths:
             print(f"Timing prefill length {length}...", flush=True)
             prefill_rows.append(TimingRow(length, _time_prefill(model, length, args.warmup, args.repetitions)))
 
     _print_timings("One-token eager cached decode", eager_rows)
     _print_timings("Fixed-shape CUDA-Graph pure replay", graph_rows)
+    _print_timings("Exact fixed-cache CUDA-Graph pure replay", graph_capacity_rows)
     _print_timings("Optimized prefill (logits_to_keep=1)", prefill_rows)
 
     profiles: list[ProfileSummary] = []
@@ -886,6 +1254,43 @@ def main() -> int:
                 print(f"Profiling prefill length {row.size}...", flush=True)
                 profiles.append(_profile_prefill(model, row.size, row.milliseconds))
         _print_profiles(profiles, int(model.config.num_hidden_layers))
+
+    if not args.skip_component_profile:
+        eager_baseline = {row.size: row.milliseconds for row in eager_rows}
+        graph_capacity_baseline = {
+            row.size: row.milliseconds for row in graph_capacity_rows
+        }
+        component_profiles: list[ComponentProfile] = []
+        with torch.inference_mode():
+            for context in args.profile_contexts:
+                if context not in eager_baseline:
+                    continue
+                print(
+                    f"Repeated component profiling eager decode at context {context}...",
+                    flush=True,
+                )
+                component_profiles.append(
+                    _profile_eager_components(
+                        model,
+                        context,
+                        eager_baseline[context],
+                        args.component_profile_replays,
+                    )
+                )
+            for capacity in graph_capacities:
+                print(
+                    f"Repeated component profiling exact graph capacity {capacity}...",
+                    flush=True,
+                )
+                component_profiles.append(
+                    _profile_graph_components(
+                        model,
+                        capacity,
+                        graph_capacity_baseline[capacity],
+                        args.component_profile_replays,
+                    )
+                )
+        _print_component_profiles(component_profiles)
 
     if not args.skip_microbenchmarks:
         with torch.inference_mode():

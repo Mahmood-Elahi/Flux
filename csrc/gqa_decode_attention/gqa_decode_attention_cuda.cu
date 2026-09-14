@@ -378,6 +378,7 @@ __global__ void gqa_decode_attention_reduce_cuda_fp32_kernel(
     const std::size_t num_chunks) {
     __shared__ float global_max;
     __shared__ float global_sum;
+    __shared__ float chunk_scales[kMaximumCacheCapacity / kChunkSize];
     const std::size_t workspace_offset =
         static_cast<std::size_t>(blockIdx.x) * num_chunks * (head_dim + 2);
     if (threadIdx.x == 0) {
@@ -386,12 +387,21 @@ __global__ void gqa_decode_attention_reduce_cuda_fp32_kernel(
             maximum = fmaxf(maximum, workspace[
                 workspace_offset + chunk * (head_dim + 2)]);
         }
+        global_max = maximum;
+    }
+    __syncthreads();
+    if (threadIdx.x < num_chunks) {
+        const std::size_t offset =
+            workspace_offset + threadIdx.x * (head_dim + 2);
+        chunk_scales[threadIdx.x] = expf(workspace[offset] - global_max);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
         float sum = 0.0F;
         for (std::size_t chunk = 0; chunk < num_chunks; ++chunk) {
             const std::size_t offset = workspace_offset + chunk * (head_dim + 2);
-            sum += workspace[offset + 1] * expf(workspace[offset] - maximum);
+            sum += workspace[offset + 1] * chunk_scales[chunk];
         }
-        global_max = maximum;
         global_sum = sum;
     }
     __syncthreads();
@@ -400,8 +410,7 @@ __global__ void gqa_decode_attention_reduce_cuda_fp32_kernel(
         float value = 0.0F;
         for (std::size_t chunk = 0; chunk < num_chunks; ++chunk) {
             const std::size_t offset = workspace_offset + chunk * (head_dim + 2);
-            value += workspace[offset + 2 + dimension] *
-                expf(workspace[offset] - global_max);
+            value += workspace[offset + 2 + dimension] * chunk_scales[chunk];
         }
         output[static_cast<std::size_t>(blockIdx.x) * head_dim + dimension] =
             value / global_sum;

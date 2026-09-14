@@ -7,6 +7,7 @@ from flux.model.smollm2_cuda_graph import (
     cuda_graph_greedy_generate,
 )
 from flux.model.smollm2_flux import (
+    FINAL_FLUX_OPERATOR_CATEGORIES,
     FLUX_PACKED_MLP_CATEGORY,
     FLUX_PACKED_QKV_CATEGORY,
     FLUX_PACKED_SWIGLU_CATEGORY,
@@ -20,6 +21,7 @@ __all__ = [
     "FluxCUDAGraphDecode",
     "CUDAGraphMemory",
     "CUDAGraphSetupTiming",
+    "FINAL_FLUX_OPERATOR_CATEGORIES",
     "FLUX_PACKED_MLP_CATEGORY",
     "FLUX_PACKED_QKV_CATEGORY",
     "FLUX_PACKED_SWIGLU_CATEGORY",
