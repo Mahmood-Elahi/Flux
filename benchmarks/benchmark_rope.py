@@ -16,12 +16,12 @@ import statistics
 import torch
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
-from benchmarks.benchmark_smollm2 import (
-    _benchmark_decode,
-    _benchmark_full_or_prefill,
-    _configure_runtime,
-    _event_latencies,
-    _input_ids,
+from benchmarks.smollm2_benchmark_utils import (
+    alternating_event_medians,
+    benchmark_decode,
+    benchmark_full_or_prefill,
+    configure_runtime,
+    deterministic_input_ids,
 )
 from flux.model.smollm2 import load_model
 from flux.model.smollm2_cuda_graph import FluxCUDAGraphDecode
@@ -75,7 +75,7 @@ def _operator_benchmarks(args: argparse.Namespace) -> None:
         error = max(float((actual[i] - expected[i]).abs().max()) for i in (0, 1))
         torch.testing.assert_close(actual[0], expected[0], rtol=1e-6, atol=2e-7)
         torch.testing.assert_close(actual[1], expected[1], rtol=1e-6, atol=2e-7)
-        medians = _event_latencies(
+        medians = alternating_event_medians(
             {
                 "reference": lambda: apply_rotary_pos_emb(*inputs),
                 "Flux": lambda: rope_native(*inputs),
@@ -96,8 +96,8 @@ def _model_benchmarks(args: argparse.Namespace) -> None:
     print("\nIntegrated model CUDA-event median (baseline Flux vs Flux+RoPE)")
     print(f"{'workload':>10} {'size':>7} {'baseline ms':>12} {'RoPE ms':>10} {'speedup':>9} {'logit err':>11}")
     for length in args.prefill_lengths:
-        input_ids = _input_ids(length, baseline.config.vocab_size)
-        result = _benchmark_full_or_prefill(
+        input_ids = deterministic_input_ids(length, baseline.config.vocab_size)
+        result = benchmark_full_or_prefill(
             baseline, integrated, input_ids, True, args.warmup, args.repetitions
         )
         print(
@@ -105,9 +105,11 @@ def _model_benchmarks(args: argparse.Namespace) -> None:
             f"{result.flux_ms:>10.3f} {result.speedup:>8.3f}x {result.max_absolute_error:>11.3g}"
         )
     for context in args.decode_positions:
-        context_ids = _input_ids(context, baseline.config.vocab_size)
-        next_token = _input_ids(context + 1, baseline.config.vocab_size)[:, -1:]
-        result = _benchmark_decode(
+        context_ids = deterministic_input_ids(context, baseline.config.vocab_size)
+        next_token = deterministic_input_ids(
+            context + 1, baseline.config.vocab_size
+        )[:, -1:]
+        result = benchmark_decode(
             baseline,
             integrated,
             context_ids,
@@ -121,7 +123,7 @@ def _model_benchmarks(args: argparse.Namespace) -> None:
         )
 
     graph_context = args.decode_positions[len(args.decode_positions) // 2]
-    prompt = _input_ids(graph_context, baseline.config.vocab_size)
+    prompt = deterministic_input_ids(graph_context, baseline.config.vocab_size)
     capacity = 1 + args.warmup + args.repetitions
     baseline_graph = FluxCUDAGraphDecode.capture(
         baseline, prompt, max_decode_steps=capacity, warmup_steps=3
@@ -168,7 +170,7 @@ def main() -> int:
     args = _parse_args()
     if not torch.cuda.is_available() or not native_rope_is_available():
         raise RuntimeError("CUDA and the rebuilt Flux RoPE operator are required")
-    _configure_runtime()
+    configure_runtime()
     print(
         f"GPU={torch.cuda.get_device_name()} dtype=float32 TF32=off "
         f"warmup={args.warmup} repetitions={args.repetitions}"

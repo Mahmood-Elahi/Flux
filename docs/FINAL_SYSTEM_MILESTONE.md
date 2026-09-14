@@ -2,6 +2,13 @@
 
 Date: 2026-09-13
 
+> Historical milestone note: this document records the completed Python-owned
+> Flux CUDA-Graph system at Milestone 24. Milestones 26-27 subsequently added a
+> lifetime-managed native one-layer runtime and then a complete native
+> token-to-logits 30-layer runtime. See `NATIVE_FULL_DECODE_RUNTIME_MILESTONE.md`.
+> The separate 50% CUDA source-share release requirement remains unmet, so the
+> later native-runtime phase does not declare the overall project complete.
+
 ## 1. System overview
 
 Flux is complete as one integrated FP32 CUDA inference path for the pinned

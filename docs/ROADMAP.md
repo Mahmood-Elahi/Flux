@@ -33,8 +33,42 @@ independent finish lines.
     CUDA-Graph replay, stable-address, allocation, greedy-generation, and
     long-context behavior, and benchmark the complete reference, Flux eager,
     and Flux graph systems from 128 through 8192 tokens.
+25. **Completed:** Audit and consolidate the Python benchmark/support surface
+    around the canonical final-system benchmark, retained decode profiler, and
+    focused operator benchmarks; preserve historical evidence and define the
+    native fixed-shape decode architecture.
+26. **Completed:** Implement the native fixed-shape decode control plane and a
+    one-layer executor using retained kernels and exact cuBLAS/cuBLASLt paths,
+    with lifetime-managed stable buffers, device position/cache length, K/V,
+    workspace, capture stream, CUDA Graph executable, asynchronous current-stream
+    replay, reset, diagnostics, and validation from 128 through 8192 tokens.
+27. **Completed:** Scale the validated executor across all 30 layers with
+    compact per-layer descriptors and shared lifetime-planned workspace; add
+    native token embedding, final RMSNorm, retained cuBLAS LM head, one-step
+    device state advancement, and complete token-to-logits CUDA Graph replay;
+    validate logits, every layer's compact K/V, greedy tokens, streams,
+    allocation behavior, launch structure, and performance against Python Flux
+    and the pinned Hugging Face oracle from length 128 through 8192.
+28. **Completed:** Implement native full-model FP32 prompt prefill from CUDA
+    token IDs through all 30 layers and final logits, with compact direct K/V
+    writes into the attached native decode runtime, grouped GQA without
+    `repeat_kv`, in-place causal softmax, persistent lifetime-planned workspace,
+    current-stream/event ordering, allocation-free reuse, and validation and
+    performance coverage from length 128 through 8192.
+29. **Next:** Preserve the integrated native prompt-to-decode runtime while
+    advancing the remaining 50% CUDA source-share release requirement through
+    useful, integrated CUDA work only; do not pad, duplicate layer code,
+    resurrect rejected operators, or weaken the established correctness and
+    performance gates.
 
-The roadmap is complete. Each milestone remains part of this single integrated
-codebase; rejected experiments were removed, the ordinary pinned
-Hugging Face/PyTorch path remains the correctness oracle, and the final retained
-architecture is recorded in `docs/FINAL_SYSTEM_MILESTONE.md`.
+Milestone 28 source totals are Python 635,115 B, CUDA 228,861 B, C++ 144,435 B,
+and headers 15,701 B. CUDA is 22.3473% of these sources and remains 566,390 B
+short of equal CUDA/non-CUDA bytes under the required exact metric. This
+milestone adds 35,930 CUDA bytes and 34,119 non-CUDA bytes, netting 1,811 bytes
+of exact progress without padding or code duplication.
+
+The operator-optimization roadmap through milestone 24 is complete. The final
+native-runtime phase continues the same integrated codebase; rejected experiments
+remain removed, the ordinary pinned Hugging Face/PyTorch path remains the
+correctness oracle, and the retained operator architecture is recorded in
+`docs/FINAL_SYSTEM_MILESTONE.md`.

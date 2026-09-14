@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
 import subprocess
 import sys
@@ -33,6 +32,11 @@ from flux.model.smollm2_flux import (
     FINAL_FLUX_OPERATOR_CATEGORIES,
     enable_flux_ops,
     flux_operator_counts,
+)
+from benchmarks.smollm2_benchmark_utils import (
+    configure_runtime,
+    deterministic_input_ids,
+    parse_positive_int_list,
 )
 
 
@@ -99,22 +103,14 @@ class RuntimeAudit:
     cpu_allocation_events: int
 
 
-def _parse_int_list(value: str) -> tuple[int, ...]:
-    try:
-        result = tuple(int(item.strip()) for item in value.split(",") if item.strip())
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("expected comma-separated integers") from error
-    if not result or any(item < 1 for item in result):
-        raise argparse.ArgumentTypeError("values must be positive integers")
-    return result
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lengths", type=_parse_int_list, default=DEFAULT_LENGTHS)
+    parser.add_argument(
+        "--lengths", type=parse_positive_int_list, default=DEFAULT_LENGTHS
+    )
     parser.add_argument(
         "--generation-prompts",
-        type=_parse_int_list,
+        type=parse_positive_int_list,
         default=DEFAULT_GENERATION_PROMPTS,
     )
     parser.add_argument("--output-tokens", type=int, default=32)
@@ -148,18 +144,6 @@ def _parse_args() -> argparse.Namespace:
     if not args.skip_audit and args.audit_capacity <= args.audit_replays + 3:
         parser.error("audit capacity must exceed audit replays plus three warmups")
     return args
-
-
-def _configure_runtime() -> None:
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
 
 
 def _command_line(command: list[str]) -> str:
@@ -208,8 +192,7 @@ def _environment(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _input_ids(length: int, vocab_size: int) -> torch.Tensor:
-    values = (torch.arange(length, dtype=torch.long) * 17 + 11) % vocab_size
-    return values.unsqueeze(0).cuda()
+    return deterministic_input_ids(length, vocab_size)
 
 
 def _max_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -741,7 +724,7 @@ def main() -> int:
     args = _parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    _configure_runtime()
+    configure_runtime(seed=SEED)
     print("Loading reference and final Flux model instances...", flush=True)
     reference = load_model("cuda")
     flux = enable_flux_ops(

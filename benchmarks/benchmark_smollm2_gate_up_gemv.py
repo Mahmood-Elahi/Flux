@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import gc
 import multiprocessing
-import os
 import statistics
 from collections.abc import Callable
 from typing import Any
@@ -29,6 +28,10 @@ from flux.model.smollm2_flux import (
     enable_flux_ops,
 )
 from flux.ops import packed_gate_up_swiglu_native_out, packed_swiglu_native_out
+from benchmarks.smollm2_benchmark_utils import (
+    configure_runtime,
+    deterministic_input_ids as _ids,
+)
 
 
 FULL_OPERATORS = FLUX_OPERATOR_CATEGORIES | {
@@ -58,18 +61,7 @@ def _args() -> argparse.Namespace:
 
 
 def _configure() -> None:
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
-    torch.use_deterministic_algorithms(True)
-    torch.utils.deterministic.fill_uninitialized_memory = True
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
-
-
-def _ids(length: int, vocab_size: int) -> torch.Tensor:
-    return (((torch.arange(length) * 17 + 11) % vocab_size).unsqueeze(0)).cuda()
+    configure_runtime(deterministic_fill=True)
 
 
 def _event_median_us(

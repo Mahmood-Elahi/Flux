@@ -11,7 +11,6 @@ import argparse
 import copy
 import gc
 import multiprocessing
-import os
 import statistics
 import sys
 from collections import Counter
@@ -38,6 +37,10 @@ from flux.model.smollm2_flux import (
 from flux.ops import (
     gqa_decode_attention_native,
     native_gqa_decode_attention_is_available,
+)
+from benchmarks.smollm2_benchmark_utils import (
+    configure_runtime as _configure,
+    deterministic_input_ids as _ids,
 )
 
 
@@ -107,22 +110,6 @@ def _args() -> argparse.Namespace:
             or args.stabilization_iterations < 0):
         parser.error("warmup may be zero; repetition counts must be positive")
     return args
-
-
-def _configure() -> None:
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
-
-
-def _ids(length: int, vocab: int) -> torch.Tensor:
-    return (((torch.arange(length) * 17 + 11) % vocab).unsqueeze(0)).cuda()
 
 
 def _current_attention(

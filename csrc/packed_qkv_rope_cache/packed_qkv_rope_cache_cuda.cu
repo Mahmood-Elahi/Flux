@@ -54,7 +54,8 @@ __global__ void packed_qkv_rope_cache_cuda_fp32_kernel(
     const float* sin,
     float* key_cache,
     float* value_cache,
-    std::int64_t* cache_length,
+    const std::int64_t* cache_position,
+    std::int64_t* updated_cache_length,
     float* query_output,
     const std::size_t cache_capacity,
     const PackedQKVStrides packed_strides,
@@ -64,7 +65,7 @@ __global__ void packed_qkv_rope_cache_cuda_fp32_kernel(
     const PackedQKVCacheStrides value_cache_strides) {
     __shared__ std::int64_t position;
     if (threadIdx.x == 0) {
-        position = cache_length[0];
+        position = cache_position[0];
     }
     __syncthreads();
 
@@ -114,8 +115,8 @@ __global__ void packed_qkv_rope_cache_cuda_fp32_kernel(
         }
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        cache_length[0] = position + 1;
+    if (threadIdx.x == 0 && updated_cache_length != nullptr) {
+        updated_cache_length[0] = position + 1;
     }
 }
 
@@ -143,7 +144,35 @@ cudaError_t packed_qkv_rope_cache_cuda_fp32(
         return cudaErrorInvalidValue;
     }
     packed_qkv_rope_cache_cuda_fp32_kernel<<<1, kBlockSize, 0, stream>>>(
-        packed_qkv, cos, sin, key_cache, value_cache, cache_length,
+        packed_qkv, cos, sin, key_cache, value_cache, cache_length, cache_length,
+        query_output, cache_capacity, packed_strides, cos_strides, sin_strides,
+        key_cache_strides, value_cache_strides);
+    return cudaGetLastError();
+}
+
+cudaError_t packed_qkv_rope_cache_at_position_cuda_fp32(
+    const float* packed_qkv,
+    const float* cos,
+    const float* sin,
+    float* key_cache,
+    float* value_cache,
+    const std::int64_t* cache_position,
+    float* query_output,
+    const std::size_t cache_capacity,
+    const PackedQKVStrides packed_strides,
+    const PackedQKVEmbeddingStrides cos_strides,
+    const PackedQKVEmbeddingStrides sin_strides,
+    const PackedQKVCacheStrides key_cache_strides,
+    const PackedQKVCacheStrides value_cache_strides,
+    cudaStream_t stream) {
+    if (packed_qkv == nullptr || cos == nullptr || sin == nullptr ||
+        key_cache == nullptr || value_cache == nullptr ||
+        cache_position == nullptr || query_output == nullptr ||
+        cache_capacity == 0) {
+        return cudaErrorInvalidValue;
+    }
+    packed_qkv_rope_cache_cuda_fp32_kernel<<<1, kBlockSize, 0, stream>>>(
+        packed_qkv, cos, sin, key_cache, value_cache, cache_position, nullptr,
         query_output, cache_capacity, packed_strides, cos_strides, sin_strides,
         key_cache_strides, value_cache_strides);
     return cudaGetLastError();

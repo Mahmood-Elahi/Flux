@@ -1,6 +1,6 @@
 # Flux
 
-Flux is a completed, integrated FP32 CUDA inference path for
+Flux is an integrated FP32 CUDA inference path for
 **SmolLM2-135M**. It combines explicit PyTorch model adapters with custom
 C++/CUDA operators, packed checkpoint-compatible projections, native
 one-token grouped-query attention, and fixed-shape CUDA-Graph decode. The
@@ -57,6 +57,39 @@ stable addresses, and replay launch/allocation behavior. See
 [the final system milestone](docs/FINAL_SYSTEM_MILESTONE.md) for the complete
 configuration, methodology, tables, bottleneck interpretation, limitations,
 and optimization history.
+
+The maintained benchmark/support inventory and source-footprint accounting are
+recorded in [the benchmark audit](docs/BENCHMARK_SUPPORT_AUDIT.md).
+
+The native runtime now owns the complete prompt-to-decode path. Native FP32
+prefill runs all 30 layers, writes the compact cache directly into the attached
+token-to-logits CUDA Graph runtime, and returns stable final-token logits:
+
+```python
+from flux.runtime import NativeSmolLM2Prefill
+
+runtime = NativeSmolLM2Prefill.capture(
+    model,
+    prompt_ids,
+    max_decode_steps=31,
+)
+token = runtime.logits.argmax(dim=-1)
+logits = runtime.replay(token)
+```
+
+The native object owns all 30 compact K/V caches, prompt/decode workspaces,
+device position/cache length, stable logits, stream/event resources, and the
+decode graph. Prefill never constructs a Python cache, expands GQA K/V, or
+copies cache storage at handoff. See [the native prefill milestone](docs/NATIVE_PREFILL_RUNTIME_MILESTONE.md),
+[the full native decode milestone](docs/NATIVE_FULL_DECODE_RUNTIME_MILESTONE.md),
+and [runtime design](docs/NATIVE_DECODE_RUNTIME_DESIGN.md). Reproduce the
+prefill correctness, direct continuation, launch, memory, and three-path timing
+matrix with:
+
+```powershell
+build\python3119\python.exe benchmarks\benchmark_native_smollm2_prefill.py `
+  --json-output build\native_prefill_results.json
+```
 
 ## Development setup
 
@@ -198,12 +231,10 @@ enable_flux_ops(
 ```
 
 Packed models continue to load and export the standard `gate_proj.weight` and
-`up_proj.weight` state-dict keys. Compare isolated projection/MLP latency,
-integrated prefill, cached decode, numerical error, and parameter storage with:
-
-```bash
-python -m benchmarks.benchmark_smollm2_mlp
-```
+`up_proj.weight` state-dict keys. Their layout, state-dict, prefill, cached
+decode, and generation contracts are maintained in `tests/test_smollm2_flux.py`;
+the final integrated performance path is measured by
+`benchmarks/benchmark_final_system.py`.
 
 The independent `"gqa_decode_attention"` category replaces the one-token
 cached-decode sequence—K/V repetition, QK, scaling/mask/softmax, and P@V—with
@@ -253,12 +284,10 @@ enable_flux_ops(
 )
 ```
 
-Validate and benchmark the fused boundary, including isolated, layer, eager,
-and CUDA-Graph measurements plus cache, generation, launch, and memory checks:
-
-```bash
-python benchmarks/benchmark_smollm2_packed_qkv_rope_cache.py
-```
+The fused boundary's operator, cache-update, stream, FakeTensor, and graph
+contracts are maintained in `tests/test_native_packed_qkv_rope_cache.py` and
+`tests/test_smollm2_cuda_graph.py`. Its production contribution is exercised by
+the final-system benchmark and decode profiler.
 
 For the fully fused FP32 `B=1`, one-token StaticCache graph path at capacities
 513 through 8192, graph capture also preallocates a small state-owned scratch
@@ -268,12 +297,10 @@ buffers are shared only where producer/consumer lifetimes do not overlap,
 remain owned by the captured runtime object, and are not used by eager or
 unsupported paths. PyTorch deterministic algorithms and uninitialized-memory
 safety filling remain enabled; removing the captured `empty` allocations
-removes their redundant replay fills. Profile the fill attribution, launch
-breakdown, correctness, latency, and graph-pool behavior with:
-
-```bash
-python benchmarks/benchmark_smollm2_stable_buffers.py
-```
+removes their redundant replay fills. Stable-address, stale-data, stream, and
+fallback behavior are maintained in `tests/test_stable_decode_outputs.py`; the
+canonical benchmark's runtime audit checks stable addresses, replay allocation
+growth, and launch ownership.
 
 The separately controlled `"cublaslt_projection"` category replaces only the
 FP32 one-token packed-QKV and attention-output projections inside the supported
@@ -298,13 +325,11 @@ enable_flux_ops(
 )
 ```
 
-Reproduce the shape inventory, PyTorch API comparison, bounded cuBLASLt search,
-category ablation, decoder-layer timing, full CUDA-Graph sweep, eager fallback,
-correctness checks, and independent-process memory accounting with:
-
-```bash
-python benchmarks/benchmark_smollm2_projections.py --production --independent-memory --eager-production
-```
+The retained explicit cuBLASLt configuration, current-stream behavior, graph
+capture, numerical result, and FakeTensor contract are maintained in
+`tests/test_native_cublaslt_linear.py`. The full CUDA-Graph sweep, production
+launch inventory, and memory behavior are maintained by the final-system
+benchmark and decode profiler.
 
 See [the projection milestone report](docs/PROJECTION_MILESTONE.md) for the
 retention evidence and rejected candidates.
@@ -349,19 +374,13 @@ See [the GQA reduction milestone report](docs/GQA_REDUCTION_MILESTONE.md) for
 the baseline structure, traffic/resource analysis, alternating full-graph A/B
 results, rejected experiment, correctness, and recommendation.
 
-Validate and benchmark the retained production packed-QKV path, including
-projection and attention-setup latency, prefill, eager and CUDA-Graph decode,
-view layouts, numerical error, and memory lifetime, with:
+Packed-QKV layout, checkpoint compatibility, storage, prefill, decode, and
+generation behavior are maintained in `tests/test_smollm2_flux.py`; production
+performance is included in the canonical final-system benchmark.
+
+Benchmark RoPE in isolation and in integrated prefill/cached-decode paths with:
 
 ```bash
-python benchmarks/benchmark_smollm2_qkv.py
-```
-
-Validate the pinned model and benchmark RoPE in isolation and in integrated
-prefill/cached-decode paths with:
-
-```bash
-python scripts/validate_rope_model.py
 python benchmarks/benchmark_rope.py
 ```
 

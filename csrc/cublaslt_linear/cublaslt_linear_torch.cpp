@@ -1,3 +1,5 @@
+#include "cublaslt_linear_cuda.h"
+
 #include <ATen/ATen.h>
 #include <ATen/MemoryOverlap.h>
 #include <ATen/core/grad_mode.h>
@@ -472,6 +474,43 @@ at::Tensor cublaslt_linear_config_out_cuda(
 }
 
 }  // namespace
+
+void cublaslt_linear_config_cuda_fp32(
+    const float* input,
+    const float* weight,
+    float* output,
+    const std::int64_t input_width,
+    const std::int64_t output_width,
+    void* workspace,
+    const std::size_t workspace_bytes,
+    const int device,
+    const CublasLtAlgorithmConfig config,
+    cudaStream_t stream) {
+    TORCH_CHECK(input != nullptr && weight != nullptr && output != nullptr,
+        "flux::cublaslt_linear: raw launch pointers must be non-null");
+    TORCH_CHECK(input_width > 0 && output_width > 0,
+        "flux::cublaslt_linear: raw launch dimensions must be positive");
+    TORCH_CHECK(stream != nullptr,
+        "flux::cublaslt_linear: raw launch stream must be non-null");
+    TORCH_CHECK(workspace != nullptr || workspace_bytes == 0,
+        "flux::cublaslt_linear: non-empty workspace requires storage");
+
+    auto plan = plan_for(device, output_width, input_width, workspace_bytes);
+    const cublasLtMatmulAlgo_t algorithm = plan->configured_algorithm(
+        config.algorithm_id, config.tile_id, config.split_k,
+        config.reduction_scheme, config.cta_swizzle, config.custom_option,
+        config.stages_id);
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    check_cublas(
+        cublasLtMatmul(
+            cublaslt_handle(), plan->operation(), &alpha,
+            input, plan->input(), weight, plan->weight(), &beta,
+            output, plan->output(), output, plan->output(), &algorithm,
+            workspace, workspace_bytes, stream),
+        "cublasLtMatmul raw launch with explicit configuration");
+}
+
 }  // namespace flux
 
 TORCH_LIBRARY_FRAGMENT(flux, library) {

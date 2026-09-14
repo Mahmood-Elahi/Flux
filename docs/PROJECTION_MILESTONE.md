@@ -235,15 +235,29 @@ the full decode graph rather than merely the isolated kernel.
 
 ## Reproduction
 
+The bounded-search and category-ablation commands below record the original
+milestone methodology. Their one-off harness was retired during final benchmark
+consolidation after the selected configuration was frozen. The exact harness is
+available at commit `b374d0423bdff5fe083eb4ded6890c358d265757`.
+
+For the maintained production path, run
+`tests/test_native_cublaslt_linear.py`, `tests/test_smollm2_cuda_graph.py`,
+`benchmarks/benchmark_smollm2_decode_profile.py`, and
+`benchmarks/benchmark_final_system.py`. These own the retained algorithm's
+numerical/current-stream/graph contract and final integrated measurements.
+
 ```powershell
 $env:FLUX_BUILD_NATIVE='1'
 build\python3119\python.exe setup.py build_ext --inplace
-build\python3119\python.exe benchmarks\benchmark_smollm2_projections.py `
+New-Item -ItemType Directory -Force build\historical | Out-Null
+git show b374d0423bdff5fe083eb4ded6890c358d265757:benchmarks/benchmark_smollm2_projections.py |
+  Out-File -Encoding utf8 build\historical\benchmark_smollm2_projections.py
+build\python3119\python.exe build\historical\benchmark_smollm2_projections.py `
   --warmup 20 --repetitions 60 --max-algorithms 8 --profile-replays 3 `
   --layer-capacity 0
-build\python3119\python.exe benchmarks\benchmark_smollm2_projections.py `
+build\python3119\python.exe build\historical\benchmark_smollm2_projections.py `
   --warmup 20 --repetitions 60 --integrated-only --layer-capacity 0
-build\python3119\python.exe benchmarks\benchmark_smollm2_projections.py `
+build\python3119\python.exe build\historical\benchmark_smollm2_projections.py `
   --warmup 5 --repetitions 20 --production-only `
   --production-capacities 512,1024,2048,4096,8192 `
   --layer-capacity 4096 --independent-memory --eager-production
@@ -254,5 +268,5 @@ The short Nsight Systems trace is generated with:
 ```powershell
 nsys profile --trace=cuda,cublas,nvtx --force-overwrite=true `
   --output=build\projection_nsys build\python3119\python.exe `
-  benchmarks\benchmark_smollm2_projections.py --nsys-trace-only
+  build\historical\benchmark_smollm2_projections.py --nsys-trace-only
 ```

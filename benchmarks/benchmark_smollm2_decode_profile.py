@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import os
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -59,6 +58,12 @@ from flux.ops import (
     residual_rmsnorm_native,
     rope_native,
     softmax_native,
+)
+from benchmarks.smollm2_benchmark_utils import (
+    configure_runtime,
+    deterministic_input_ids,
+    event_median as _event_median,
+    parse_positive_int_list,
 )
 
 
@@ -125,26 +130,20 @@ class IntermediateRow:
     consumer: str
 
 
-def _parse_int_list(value: str) -> tuple[int, ...]:
-    try:
-        result = tuple(int(item.strip()) for item in value.split(",") if item.strip())
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("expected comma-separated integers") from error
-    if not result or any(item < 1 for item in result):
-        raise argparse.ArgumentTypeError("values must be positive")
-    return result
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--decode-contexts", type=_parse_int_list, default=DECODE_CONTEXTS)
+    parser.add_argument(
+        "--decode-contexts", type=parse_positive_int_list, default=DECODE_CONTEXTS
+    )
     parser.add_argument(
         "--graph-capacities",
-        type=_parse_int_list,
+        type=parse_positive_int_list,
         default=GRAPH_CAPACITIES,
         help="exact fixed cache capacities for graph timing and repeated attribution",
     )
-    parser.add_argument("--prefill-lengths", type=_parse_int_list, default=PREFILL_LENGTHS)
+    parser.add_argument(
+        "--prefill-lengths", type=parse_positive_int_list, default=PREFILL_LENGTHS
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repetitions", type=int, default=30)
     parser.add_argument("--graph-replays", type=int, default=30)
@@ -152,7 +151,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stabilization-iterations", type=int, default=50)
     parser.add_argument(
         "--profile-contexts",
-        type=_parse_int_list,
+        type=parse_positive_int_list,
         default=DECODE_CONTEXTS,
         help="decode contexts receiving one eager and one graph profiler pass",
     )
@@ -169,50 +168,8 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-def _configure_runtime() -> None:
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
-
-
 def _input_ids(length: int, vocab_size: int) -> torch.Tensor:
-    values = (torch.arange(length, dtype=torch.long) * 17 + 11) % vocab_size
-    return values.unsqueeze(0).to("cuda")
-
-
-def _event_median(
-    operation: Callable[[], object],
-    warmup: int,
-    repetitions: int,
-    prepare: Callable[[], Callable[[], object]] | None = None,
-) -> float:
-    output: object = None
-    for _ in range(warmup):
-        call = prepare() if prepare is not None else operation
-        output = call()
-    torch.cuda.synchronize()
-    samples = []
-    final = None
-    for _ in range(repetitions):
-        call = prepare() if prepare is not None else operation
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        output = call()
-        end.record()
-        samples.append((start, end))
-        final = end
-    assert final is not None
-    final.synchronize()
-    result = statistics.median(start.elapsed_time(end) for start, end in samples)
-    del output
-    return result
+    return deterministic_input_ids(length, vocab_size)
 
 
 def _clone_dynamic_cache(cache: Any, config: Any) -> Any:
@@ -1164,7 +1121,7 @@ def main() -> int:
         raise RuntimeError("CUDA is required")
     if not _required_ops_available():
         raise RuntimeError("all retained Flux native operators must be built")
-    _configure_runtime()
+    configure_runtime(seed=SEED)
     model = enable_flux_ops(load_model("cuda"), operators=ALL_OPERATORS)
     _print_environment(model, args)
     maximum = int(model.config.max_position_embeddings)

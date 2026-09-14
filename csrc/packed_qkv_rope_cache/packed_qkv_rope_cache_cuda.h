@@ -42,4 +42,23 @@ cudaError_t packed_qkv_rope_cache_cuda_fp32(
     PackedQKVCacheStrides value_cache_strides,
     cudaStream_t stream);
 
+// Native multi-layer decode keeps one shared cache position for every layer.
+// This variant reads that position without advancing it; the full runtime
+// advances its device state once after all layers and logits complete.
+cudaError_t packed_qkv_rope_cache_at_position_cuda_fp32(
+    const float* packed_qkv,
+    const float* cos,
+    const float* sin,
+    float* key_cache,
+    float* value_cache,
+    const std::int64_t* cache_position,
+    float* query_output,
+    std::size_t cache_capacity,
+    PackedQKVStrides packed_strides,
+    PackedQKVEmbeddingStrides cos_strides,
+    PackedQKVEmbeddingStrides sin_strides,
+    PackedQKVCacheStrides key_cache_strides,
+    PackedQKVCacheStrides value_cache_strides,
+    cudaStream_t stream);
+
 }  // namespace flux

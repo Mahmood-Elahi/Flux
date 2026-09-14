@@ -23,10 +23,18 @@ enabled. Timings use CUDA events with warmups and medians. Device-category times
 come from 20 replay profiler batches and therefore differ slightly from
 unprofiled replay medians.
 
-The retained baseline was reproduced with:
+The retained baseline was originally reproduced with the command below. The
+milestone-only A/B harness was retired during the final benchmark consolidation;
+its exact source remains available at commit
+`b374d0423bdff5fe083eb4ded6890c358d265757`. Current production behavior is
+validated by `tests/test_stable_decode_outputs.py` and the runtime-audit mode of
+`benchmarks/benchmark_final_system.py`.
 
 ```powershell
-build/python3119/python.exe benchmarks/benchmark_smollm2_stable_buffers.py `
+New-Item -ItemType Directory -Force build/historical | Out-Null
+git show b374d0423bdff5fe083eb4ded6890c358d265757:benchmarks/benchmark_smollm2_stable_buffers.py |
+  Out-File -Encoding utf8 build/historical/benchmark_smollm2_stable_buffers.py
+build/python3119/python.exe build/historical/benchmark_smollm2_stable_buffers.py `
   --capacities 2048,4096 --warmup 3 --repetitions 10 `
   --correctness-tokens 2 --profile-capacity 4096 --skip-independent-pools
 ```

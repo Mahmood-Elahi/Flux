@@ -39,6 +39,8 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
     packed_qkv_rope_cache_dir = ROOT / "csrc" / "packed_qkv_rope_cache"
     cublaslt_linear_dir = ROOT / "csrc" / "cublaslt_linear"
     packed_gate_up_gemv_dir = ROOT / "csrc" / "packed_gate_up_gemv"
+    native_decode_runtime_dir = ROOT / "csrc" / "native_decode_runtime"
+    native_prefill_runtime_dir = ROOT / "csrc" / "native_prefill_runtime"
     extension = CUDAExtension(
         name="flux._C",
         sources=[
@@ -66,6 +68,10 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(cublaslt_linear_dir / "cublaslt_linear_torch.cpp"),
             str(packed_gate_up_gemv_dir / "packed_gate_up_gemv_torch.cpp"),
             str(packed_gate_up_gemv_dir / "packed_gate_up_gemv_cuda.cu"),
+            str(native_decode_runtime_dir / "native_decode_runtime_torch.cpp"),
+            str(native_decode_runtime_dir / "native_decode_runtime_cuda.cu"),
+            str(native_prefill_runtime_dir / "native_prefill_runtime_torch.cpp"),
+            str(native_prefill_runtime_dir / "native_prefill_runtime_cuda.cu"),
         ],
         include_dirs=[
             str(rmsnorm_dir),
@@ -78,6 +84,8 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(packed_qkv_rope_cache_dir),
             str(cublaslt_linear_dir),
             str(packed_gate_up_gemv_dir),
+            str(native_decode_runtime_dir),
+            str(native_prefill_runtime_dir),
         ],
         libraries=["cublas", "cublasLt"],
         extra_compile_args={
@@ -86,6 +94,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
                 "-arch=sm_120",
                 "-Xcompiler=/W4",
                 "-Xcompiler=/EHsc",
+                "-Xcompiler=/Zc:preprocessor",
             ],
         },
     )
