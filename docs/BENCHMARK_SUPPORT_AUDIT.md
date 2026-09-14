@@ -1,5 +1,9 @@
 # Benchmark and Python support audit
 
+> Historical milestone-25 inventory. The current native-validation ownership,
+> including later retirements, is recorded in
+> `docs/NATIVE_VALIDATION_MILESTONE.md`.
+
 This audit records the final-system consolidation performed after commit
 `b374d0423bdff5fe083eb4ded6890c358d265757`. The governing rule was functional:
 files were retired only when their result was already recorded and maintained

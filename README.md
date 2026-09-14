@@ -126,12 +126,11 @@ C++ wrappers make contiguous copies before calling the standalone row-major
 implementations. No dtype conversion is performed.
 
 The RMSNorm stack is correctness-complete, and its CUDA kernel uses warp
-shuffles plus a small shared-memory reduction across warp partials. With the
-native extension built, benchmark it against PyTorch's native RMSNorm from the
-repository root:
+shuffles plus a small shared-memory reduction across warp partials. Build and
+run the direct native CUDA microbenchmark from the repository root with:
 
-```bash
-python benchmarks/benchmark_rmsnorm.py
+```bat
+scripts\native.cmd benchmark -Filter rmsnorm
 ```
 
 An aligned `float4` memory-access path was evaluated as the final standalone
@@ -366,8 +365,8 @@ rescaling exponentials without changing launches or operator semantics. A
 coalesced stage-1 candidate was removed after its isolated 4096 win regressed
 the integrated graph. Reproduce the retained kernel/stage benchmark with:
 
-```bash
-python benchmarks/benchmark_gqa_long_context.py
+```bat
+scripts\native.cmd benchmark -Filter gqa
 ```
 
 See [the GQA reduction milestone report](docs/GQA_REDUCTION_MILESTONE.md) for
@@ -386,12 +385,12 @@ python benchmarks/benchmark_rope.py
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the planned progression toward the integrated system.
 
-The native RMSNorm test can be built directly from an x64 MSVC Developer Command Prompt:
+The coherent native correctness suite discovers the repository's verified
+MSVC, CUDA, and PyTorch toolchain and builds CPU, CUDA-operator, and native
+prefill/decode runtime tests:
 
 ```bat
-if not exist build\rmsnorm mkdir build\rmsnorm
-cl /nologo /std:c++17 /EHsc /W4 /permissive- /Od /I csrc\rmsnorm csrc\rmsnorm\rmsnorm.cpp csrc\rmsnorm\test_rmsnorm.cpp /Fo:build\rmsnorm\ /Fe:build\rmsnorm\test_rmsnorm.exe
-build\rmsnorm\test_rmsnorm.exe
+scripts\native.cmd test
 ```
 
 The implementation accumulates each sum of squares sequentially in `float`.
@@ -399,13 +398,13 @@ PyTorch may reduce in a different order, so cross-language checks use FP32
 tolerances rather than requiring bit-for-bit equality.
 
 The standalone CUDA kernel uses one 256-thread block per row, scalar FP32 memory
-access, a two-level FP32 warp reduction, and a caller-provided CUDA stream. For
-an RTX 5070 Ti (compute
-capability 12.0), build and validate it from the same developer prompt with:
+access, a two-level FP32 warp reduction, and a caller-provided CUDA stream. The
+suite targets the configured CUDA architecture (SmolLM2 development uses an RTX
+5070 Ti at compute capability 12.0), calls production launchers directly, and
+does not use binary-file or Python executable wrappers. Native benchmarks are
+separately opt-in:
 
 ```bat
-nvcc -std=c++17 -arch=sm_120 -Xcompiler=/W4 -Xcompiler=/EHsc -I csrc\rmsnorm csrc\rmsnorm\rmsnorm_cuda.cu csrc\rmsnorm\test_rmsnorm_cuda.cu -o build\rmsnorm\test_rmsnorm_cuda.exe
-nvcc -std=c++17 -arch=sm_120 -Xcompiler=/W4 -Xcompiler=/EHsc -I csrc\rmsnorm csrc\rmsnorm\rmsnorm_cuda.cu csrc\rmsnorm\rmsnorm_cuda_cli.cu -o build\rmsnorm\rmsnorm_cuda_cli.exe
-build\rmsnorm\test_rmsnorm_cuda.exe
-python scripts\check_rmsnorm_cuda.py build\rmsnorm\rmsnorm_cuda_cli.exe
+scripts\native.cmd build-benchmarks
+scripts\native.cmd benchmark -Warmup 10 -Samples 51
 ```

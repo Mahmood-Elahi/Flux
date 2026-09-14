@@ -80,6 +80,7 @@ class Audit:
     allocator_events: int
     synchronization_events: int
     stable_addresses: bool
+    top_cuda_events_ms: tuple[tuple[str, float], ...]
 
 
 def _args() -> argparse.Namespace:
@@ -317,10 +318,13 @@ def _audit(runtime: NativeSmolLM2Prefill, repetitions: int) -> Audit:
     ]
     owners = {"native": 0, "library": 0, "framework": 0}
     owner_times = {"native": 0.0, "library": 0.0, "framework": 0.0}
+    event_times: dict[str, float] = {}
     for event in cuda_events:
         owner = _owner(event.name)
         owners[owner] += 1
-        owner_times[owner] += float(event.self_device_time_total) / 1000.0
+        milliseconds = float(event.self_device_time_total) / 1000.0
+        owner_times[owner] += milliseconds
+        event_times[event.name] = event_times.get(event.name, 0.0) + milliseconds
     cpu_names = [
         event.name.lower()
         for event in profiler.events()
@@ -342,6 +346,9 @@ def _audit(runtime: NativeSmolLM2Prefill, repetitions: int) -> Audit:
         ),
         synchronization_events=sum("synchronize" in name for name in cpu_names),
         stable_addresses=addresses == runtime.stable_addresses(),
+        top_cuda_events_ms=tuple(
+            sorted(event_times.items(), key=lambda item: item[1], reverse=True)[:12]
+        ),
     )
 
 

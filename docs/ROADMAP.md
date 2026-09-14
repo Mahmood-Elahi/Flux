@@ -55,17 +55,22 @@ independent finish lines.
     `repeat_kv`, in-place causal softmax, persistent lifetime-planned workspace,
     current-stream/event ordering, allocation-free reuse, and validation and
     performance coverage from length 128 through 8192.
-29. **Next:** Preserve the integrated native prompt-to-decode runtime while
-    advancing the remaining 50% CUDA source-share release requirement through
-    useful, integrated CUDA work only; do not pad, duplicate layer code,
-    resurrect rejected operators, or weaken the established correctness and
-    performance gates.
+29. **Completed:** Establish a coherent native CTest and CUDA-event benchmark
+    hierarchy around production kernels and the native prefill/decode runtime;
+    add direct correctness, stream, graph, state, storage, allocation, and
+    long-context validation; retire superseded Python executable wrappers,
+    operator-only benchmarks, CLIs, and the historical one-layer benchmark
+    while retaining all PyTorch/Hugging Face integration coverage.
+30. **Next:** Replace native prefill's full quadratic score materialization
+    with tiled/streaming FP32 grouped-GQA attention using online softmax,
+    compact three-head K/V, and no `repeat_kv`; validate memory, correctness,
+    and performance through length 8192 without changing decode semantics.
 
-Milestone 28 source totals are Python 635,115 B, CUDA 228,861 B, C++ 144,435 B,
-and headers 15,701 B. CUDA is 22.3473% of these sources and remains 566,390 B
-short of equal CUDA/non-CUDA bytes under the required exact metric. This
-milestone adds 35,930 CUDA bytes and 34,119 non-CUDA bytes, netting 1,811 bytes
-of exact progress without padding or code duplication.
+Milestone 29 source totals are Python 550,093 B, CUDA 272,017 B, C++ 132,894 B,
+and headers 15,701 B. CUDA is 28.022623% of these sources and remains 426,671 B
+short of equal CUDA/non-CUDA bytes under the required exact metric. The native
+validation milestone made 139,719 bytes of exact progress without padding,
+duplication, or Linguist overrides.
 
 The operator-optimization roadmap through milestone 24 is complete. The final
 native-runtime phase continues the same integrated codebase; rejected experiments
