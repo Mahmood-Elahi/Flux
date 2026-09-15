@@ -242,9 +242,9 @@ gate/up GEMV + SwiGLU:
 ```powershell
 $env:FLUX_BUILD_NATIVE='1'
 build\python3119\python.exe setup.py build_ext --inplace
-build\python3119\python.exe benchmarks\benchmark_smollm2_decode_profile.py `
-  --decode-contexts 1024,2048,4096 --profile-contexts 4096 `
-  --warmup 10 --repetitions 30 --graph-replays 30
+build\python3119\python.exe benchmarks\benchmark_flux.py --mode profile `
+  --decode-contexts 1024,2048,4096 --skip-prefill `
+  --warmup 10 --samples 30 --repetitions 30 --top-k 12
 ```
 
 Capacity 8192 is measured by the fixed-capacity gate/up benchmark harness,

@@ -241,9 +241,9 @@ consolidation after the selected configuration was frozen. The exact harness is
 available at commit `b374d0423bdff5fe083eb4ded6890c358d265757`.
 
 For the maintained production path, run
-`tests/test_native_cublaslt_linear.py`, `tests/test_smollm2_cuda_graph.py`,
-`benchmarks/benchmark_smollm2_decode_profile.py`, and
-`benchmarks/benchmark_final_system.py`. These own the retained algorithm's
+`tests/test_ops.py`, `tests/test_system.py`,
+`benchmarks/benchmark_flux.py --mode profile`, and
+`benchmarks/benchmark_flux.py --mode system`. These own the retained algorithm's
 numerical/current-stream/graph contract and final integrated measurements.
 
 ```powershell

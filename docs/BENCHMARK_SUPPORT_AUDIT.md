@@ -15,7 +15,7 @@ benchmark timing region, or published number was changed.
 The benchmark suite is now centered on one production benchmark, one retained
 decode profiler, and focused operator benchmarks. Shared deterministic runtime,
 input, alternating CUDA-event timing, cache cloning, and model-comparison logic
-lives in `benchmarks/smollm2_benchmark_utils.py`.
+lives in `benchmarks/benchmark_utils.py`.
 
 | Area | Before | After | Byte change |
 | --- | ---: | ---: | ---: |
@@ -33,9 +33,9 @@ includes package/build Python outside these three directories.
 
 | File | Ownership and reason retained |
 | --- | --- |
-| `benchmark_final_system.py` | Canonical reference/Flux eager/Flux graph benchmark; owns published production prefill, decode, generation, correctness, launch, allocation, and environment results. |
+| `benchmark_flux.py --mode system` | Canonical reference/Flux eager/Flux graph benchmark; owns published production prefill, decode, generation, correctness, launch, allocation, and environment results. |
 | `benchmark_native_smollm2_layer_runtime.py` | Active native-runtime milestone harness; compares one native-owned decoder-layer graph with the retained Python-owned layer graph, including correctness, CUDA-event latency, host enqueue cost, launch inventory, replay allocation, and synchronization audits. It is intentionally not an end-to-end model benchmark. |
-| `benchmark_smollm2_decode_profile.py` | Final decode profiling infrastructure; uniquely owns full-model kernel/category attribution and bottleneck evidence. |
+| `benchmark_flux.py --mode profile` | Final decode profiling infrastructure; uniquely owns full-model kernel/category attribution and bottleneck evidence. |
 | `benchmark_attention_score_softmax.py` | Focused eager/graph A/B for the retained fused scale+mask+softmax operator. |
 | `benchmark_softmax.py` | General standalone softmax shape sweep and PyTorch comparison. |
 | `benchmark_rmsnorm.py` | General standalone RMSNorm shape sweep and PyTorch comparison. |
@@ -44,7 +44,7 @@ includes package/build Python outside these three directories.
 | `benchmark_smollm2_gqa_decode_attention.py` | Unique isolated, layer, eager, graph, numerical, kernel-inventory, and memory A/B for retained native one-token GQA. |
 | `benchmark_gqa_long_context.py` | Small authoritative long-context GQA stage benchmark used by the retained reduction milestone. |
 | `benchmark_smollm2_gate_up_gemv.py` | Exact retained fused gate/up GEMV+SwiGLU operator and integrated graph A/B, including launch and memory checks. |
-| `smollm2_benchmark_utils.py` | Shared setup only; no independently runnable benchmark. |
+| `benchmark_utils.py` | Shared setup only; no independently runnable benchmark. |
 
 ### Retired
 
@@ -64,8 +64,8 @@ includes package/build Python outside these three directories.
 Detailed historical tables and rejected experiments remain in `docs/` and the
 pre-consolidation source remains available in Git history. Current production
 claims do not require checking out an old harness: they are reproduced by
-`benchmark_final_system.py`, while current bottleneck claims use
-`benchmark_smollm2_decode_profile.py`.
+`benchmark_flux.py --mode system`, while current bottleneck claims use
+`benchmark_flux.py --mode profile`.
 
 ## Script inventory
 
@@ -120,9 +120,9 @@ must not replace the Python oracle or dispatcher/opcheck coverage.
 The following current capabilities remain directly reproducible:
 
 - final prefill, eager decode, graph decode, generation, state-dict, KV/cache,
-  stable-address, allocation, and launch claims: `benchmark_final_system.py`;
+  stable-address, allocation, and launch claims: `benchmark_flux.py --mode system`;
 - retained full-model bottleneck and launch-owner analysis:
-  `benchmark_smollm2_decode_profile.py`;
+  `benchmark_flux.py --mode profile`;
 - retained GQA long-context stage and PyTorch-baseline behavior:
   `benchmark_gqa_long_context.py` and
   `benchmark_smollm2_gqa_decode_attention.py`;
@@ -170,7 +170,7 @@ environment:
 ```powershell
 build\python3119\python.exe -m compileall -q benchmarks scripts tests flux
 build\python3119\python.exe -m pytest -q
-build\python3119\python.exe benchmarks\benchmark_final_system.py `
+build\python3119\python.exe benchmarks\benchmark_flux.py --mode system `
   --lengths 128 --skip-generation --skip-audit `
   --stabilization-iterations 0 --warmup 1 --samples 1 --rounds 1 `
   --correctness-tokens 1

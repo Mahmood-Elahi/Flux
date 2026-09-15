@@ -27,8 +27,8 @@ The retained baseline was originally reproduced with the command below. The
 milestone-only A/B harness was retired during the final benchmark consolidation;
 its exact source remains available at commit
 `b374d0423bdff5fe083eb4ded6890c358d265757`. Current production behavior is
-validated by `tests/test_stable_decode_outputs.py` and the runtime-audit mode of
-`benchmarks/benchmark_final_system.py`.
+validated by `tests/test_system.py` and the runtime-audit mode of
+`benchmarks/benchmark_flux.py --mode system`.
 
 ```powershell
 New-Item -ItemType Directory -Force build/historical | Out-Null

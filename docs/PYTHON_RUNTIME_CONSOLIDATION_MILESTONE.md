@@ -1,7 +1,7 @@
 # Native runtime and Python consolidation milestone
 
 > Historical milestone 31 report. Milestone 32 subsequently consolidated the
-> separate native-prefill benchmark into `benchmark_final_system.py`; see
+> separate native-prefill benchmark into `benchmark_flux.py --mode system`; see
 > `PYTHON_INTEGRATION_LAYER_MILESTONE.md` for the current inventory and counts.
 
 ## Outcome
@@ -87,8 +87,8 @@ benchmarks. No active source or README command imports or names a deleted path.
 | Standalone Python GQA development benchmark | `flux_cuda_microbenchmarks -Filter gqa`; `flux_test_decode_ops`; final benchmark and native profiler | Direct production launcher correctness/timing and integrated runtime attribution replace historical model A/B orchestration. |
 | Standalone Python gate/up development benchmark | `flux_cuda_microbenchmarks -Filter gate_up`; `flux_test_decode_ops`; final benchmark and native profiler | Exact-shape math, timing, and production integration remain covered without the superseded Python graph comparison. |
 | Standalone Python RoPE development benchmark | `flux_cuda_microbenchmarks -Filter rope`; `flux_test_transformer_ops`; retained Transformers/opcheck tests | Native math/timing and the independent Transformers contract remain covered. |
-| Separate full native decode benchmark | Canonical `benchmark_final_system.py` native decode column and reduced native runtime profiler | The canonical benchmark now contains HF, Flux eager, native correctness/timing/generation/audit in one system matrix. |
-| Old profiler eager/component microbenchmarks and Python-graph indexing | Reduced `benchmark_smollm2_decode_profile.py`; selectable native microbenchmarks | The retained profiler attributes complete native prefill/decode kernels and owners; isolated timing uses correctness-gated native launchers. |
+| Separate full native decode benchmark | Canonical `benchmark_flux.py --mode system` native decode column and reduced native runtime profiler | The canonical benchmark now contains HF, Flux eager, native correctness/timing/generation/audit in one system matrix. |
+| Old profiler eager/component microbenchmarks and Python-graph indexing | Reduced `benchmark_flux.py --mode profile`; selectable native microbenchmarks | The retained profiler attributes complete native prefill/decode kernels and owners; isolated timing uses correctness-gated native launchers. |
 | Shared cache-clone and historical eager benchmark helpers | Retained benchmark-local system logic | No remaining caller used the deleted helpers; deterministic configuration, input generation, and argument parsing remain shared. |
 | Attention-score CUDA shape/causal/stream sweeps | `flux_test_transformer_ops::test_attention_score_softmax`; retained broadcast/dispatcher/FakeTensor/opcheck tests | CTest directly checks production CUDA math, preservation, and stream; Python keeps framework semantics. |
 | cuBLASLt stream/capture development test | `flux_test_native_runtimes`; retained nonzero plan comparisons and FakeTensor/schema tests | Production selected plans execute on the non-default stream inside the full runtime graph; numerical selected-plan checks remain Python. |
@@ -112,12 +112,12 @@ cache comparison, greedy generation, and end-to-end system benchmarking.
 
 ## Canonical benchmark hierarchy
 
-1. `benchmarks/benchmark_final_system.py` is the canonical checkpoint-backed
+1. `benchmarks/benchmark_flux.py --mode system` is the canonical checkpoint-backed
    HF / Flux eager / native prefill-decode correctness and performance matrix.
 2. `benchmarks/benchmark_native_smollm2_prefill.py` retains its unique detailed
    every-layer prompt/cache/handoff validation, long-context cache-drift report,
    workspace report, and prefill-specific audit.
-3. `benchmarks/benchmark_smollm2_decode_profile.py` retains only full native
+3. `benchmarks/benchmark_flux.py --mode profile` retains only full native
    prefill/decode CUDA owner and top-kernel attribution.
 4. `flux_cuda_microbenchmarks` owns selectable direct CUDA launcher timing.
 

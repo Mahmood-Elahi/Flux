@@ -7,13 +7,13 @@ Python benchmark layer at the 342,517-byte baseline. It does not change model
 mathematics, CUDA, C++, tolerances, or the production Python package.
 
 The separate native-prefill benchmark is retired after its remaining system
-responsibilities are absorbed by `benchmark_final_system.py`. The canonical
+responsibilities are absorbed by `benchmark_flux.py --mode system`. The canonical
 benchmark now reports every-layer native prefill K/V errors, cache position and
 length, stable addresses, cache bytes, prefill and decode workspace bytes, and
 stable-buffer bytes. Prefill-to-decode continuation, Hugging Face and Flux
 logits, greedy identity, state-dict identity, and three-path timing were already
 canonical benchmark responsibilities. Native prefill/decode launch and kernel
-attribution remains in `benchmark_smollm2_decode_profile.py`.
+attribution remains in `benchmark_flux.py --mode profile`.
 
 Three category-4-only repetitions are removed from Python: a second softmax
 CUDA numerical shape, a second residual-RMSNorm epsilon sweep, and two extra
@@ -99,12 +99,12 @@ allocation, address, device-state, handoff, reuse, and lifecycle behavior.
 
 The maintained Python benchmark layer is now:
 
-1. `benchmark_final_system.py`: canonical checkpoint-backed HF/Flux/native
+1. `benchmark_flux.py --mode system`: canonical checkpoint-backed HF/Flux/native
    logits, state dict, prefill, all-layer K/V and cache state, workspace/storage,
    prefill-to-decode continuation, generation, timing, and runtime audit.
-2. `benchmark_smollm2_decode_profile.py`: distinct full-runtime native prefill
+2. `benchmark_flux.py --mode profile`: distinct full-runtime native prefill
    and decode owner/launch/top-kernel attribution.
-3. `smollm2_benchmark_utils.py`: shared deterministic runtime configuration,
+3. `benchmark_utils.py`: shared deterministic runtime configuration,
    input construction, and argument parsing.
 
 `benchmark_native_smollm2_prefill.py` is removed. Its duplicate model loading,

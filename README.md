@@ -44,7 +44,7 @@ Rebuild, validate, and reproduce the final matrix with:
 $env:FLUX_BUILD_NATIVE='1'
 build\python3119\python.exe setup.py build_ext --inplace --parallel 8
 build\python3119\python.exe -m pytest -q
-build\python3119\python.exe benchmarks\benchmark_final_system.py `
+build\python3119\python.exe benchmarks\benchmark_flux.py --mode system `
   --json-output build\final_system_results.json
 ```
 
@@ -91,12 +91,13 @@ and [runtime design](docs/NATIVE_DECODE_RUNTIME_DESIGN.md). Reproduce the
   with the canonical final-system benchmark:
 
 ```powershell
-build\python3119\python.exe benchmarks\benchmark_final_system.py `
+build\python3119\python.exe benchmarks\benchmark_flux.py --mode prefill `
   --json-output build\final_system_results.json
 ```
 
-Use `benchmark_smollm2_decode_profile.py` when prefill/decode launch ownership
-and top-kernel attribution are required.
+Use `benchmarks\benchmark_flux.py --mode profile` when prefill/decode launch
+ownership and top-kernel attribution are required. The same entry point exposes
+`system`, `prefill`, `decode`, `generation`, and `profile` modes.
 
 ## Development setup
 
@@ -238,9 +239,9 @@ enable_flux_ops(
 
 Packed models continue to load and export the standard `gate_proj.weight` and
 `up_proj.weight` state-dict keys. Their layout, state-dict, prefill, cached
-decode, and generation contracts are maintained in `tests/test_smollm2_flux.py`;
+decode, and generation contracts are maintained in `tests/test_system.py`;
 the final integrated performance path is measured by
-`benchmarks/benchmark_final_system.py`.
+`benchmarks/benchmark_flux.py --mode system`.
 
 The independent `"gqa_decode_attention"` category replaces the one-token
 cached-decode sequence—K/V repetition, QK, scaling/mask/softmax, and P@V—with
@@ -378,7 +379,7 @@ the baseline structure, traffic/resource analysis, alternating full-graph A/B
 results, rejected experiment, correctness, and recommendation.
 
 Packed-QKV layout, checkpoint compatibility, storage, prefill, decode, and
-generation behavior are maintained in `tests/test_smollm2_flux.py`; production
+generation behavior are maintained in `tests/test_system.py`; production
 performance is included in the canonical final-system benchmark.
 
 Benchmark RoPE directly with:

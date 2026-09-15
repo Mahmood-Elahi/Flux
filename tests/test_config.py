@@ -98,3 +98,8 @@ def test_load_model_uses_fp32_eager_and_eval(monkeypatch) -> None:
     assert loaded is model
     assert not loaded.training
     assert loaded.weight.device == torch.device("cpu")
+
+def test_import_flux() -> None:
+    import flux
+
+    assert flux is not None

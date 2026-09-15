@@ -17,8 +17,8 @@ infrastructure whose result is already recorded.
 
 | File | Class | Decision and ownership |
 | --- | ---: | --- |
-| `benchmark_final_system.py` | 1 | Retain as the canonical Hugging Face/Flux eager/Flux graph full-system benchmark. |
-| `benchmark_smollm2_decode_profile.py` | 1 | Retain unique full-model kernel/category attribution. |
+| `benchmark_flux.py --mode system` | 1 | Retain as the canonical Hugging Face/Flux eager/Flux graph full-system benchmark. |
+| `benchmark_flux.py --mode profile` | 1 | Retain unique full-model kernel/category attribution. |
 | `benchmark_smollm2_gqa_decode_attention.py` | 3 | Retain model, graph, cache-memory, and Python-versus-native A/B coverage; native timing moves to the CUDA benchmark. |
 | `benchmark_smollm2_gate_up_gemv.py` | 3 | Retain exact full-layer/full-graph A/B coverage; direct kernel timing moves native. |
 | `benchmark_rope.py` | 3 | Retain Transformers and integrated prefill/decode comparisons; direct kernel timing moves native. |
@@ -30,7 +30,7 @@ infrastructure whose result is already recorded.
 | `benchmark_softmax.py` | 2 | Retire after native width coverage and the native 8192-wide benchmark exist. |
 | `benchmark_attention_score_softmax.py` | 2 | Retire after native broadcast/mask correctness and direct fused-kernel timing exist. |
 | `benchmark_gqa_long_context.py` | 2 | Retire after native short/8192 correctness and 8192 grouped-reduction timing exist; historical reduction evidence remains in `GQA_LONG_CONTEXT_MILESTONE.md`. |
-| `smollm2_benchmark_utils.py` | 1 | Retain shared full-model setup, deterministic inputs, cache cloning, and alternating event timing. |
+| `benchmark_utils.py` | 1 | Retain shared full-model setup, deterministic inputs, cache cloning, and alternating event timing. |
 | `.gitkeep` | 4 | Remove because the directory is populated. |
 
 The native microbenchmark does not replace full-model benchmarks. It calls the

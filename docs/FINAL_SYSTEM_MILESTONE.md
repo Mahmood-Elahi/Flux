@@ -160,7 +160,7 @@ No tolerance was changed.
 The canonical run was:
 
 ```powershell
-build\python3119\python.exe benchmarks\benchmark_final_system.py `
+build\python3119\python.exe benchmarks\benchmark_flux.py --mode system `
   --stabilization-iterations 100 --warmup 5 --samples 10 --rounds 3 `
   --correctness-tokens 8 --generation-repetitions 3 `
   --json-output build\final_system_results.json

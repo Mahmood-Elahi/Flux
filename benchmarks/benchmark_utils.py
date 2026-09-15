@@ -1,4 +1,4 @@
-"""Deterministic setup and input helpers for SmolLM2 system benchmarks."""
+"""Deterministic setup and input helpers for the canonical Flux benchmark."""
 
 from __future__ import annotations
 

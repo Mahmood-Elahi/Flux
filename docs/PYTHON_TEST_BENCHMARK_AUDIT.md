@@ -1,5 +1,9 @@
 # Python test and benchmark ownership audit
 
+> Historical pre-consolidation audit. The implemented four-suite/two-file
+> benchmark result and complete old-to-new mapping are recorded in
+> `PYTHON_SUITE_CONSOLIDATION_MILESTONE.md`.
+
 ## Scope and conclusion
 
 This is an audit of every tracked Python file under `benchmarks/` and `tests/`

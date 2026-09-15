@@ -1,8 +1,8 @@
-"""Final integrated SmolLM2 benchmark: reference, Flux eager, and native Flux.
+"""Canonical SmolLM2 system benchmark and full-runtime profiler.
 
 Run from the repository root after rebuilding the native extension:
 
-    build/python3119/python.exe benchmarks/benchmark_final_system.py
+    build/python3119/python.exe benchmarks/benchmark_flux.py --mode system
 
 The benchmark uses the pinned FP32 checkpoint and the canonical retained Flux
 category set.  CUDA-event samples are collected in rotating same-process order;
@@ -20,6 +20,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -35,7 +36,7 @@ from flux.model.smollm2_flux import (
     flux_operator_counts,
 )
 from flux.runtime import NativeSmolLM2Prefill
-from benchmarks.smollm2_benchmark_utils import (
+from benchmarks.benchmark_utils import (
     configure_runtime,
     deterministic_input_ids,
     parse_positive_int_list,
@@ -119,6 +120,12 @@ class RuntimeAudit:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--mode",
+        choices=("system", "prefill", "decode", "generation", "profile"),
+        default="system",
+        help="benchmark responsibility to run (default: system)",
+    )
+    parser.add_argument(
         "--lengths", type=parse_positive_int_list, default=DEFAULT_LENGTHS
     )
     parser.add_argument(
@@ -128,8 +135,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-tokens", type=int, default=32)
     parser.add_argument("--stabilization-iterations", type=int, default=100)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--warmup", type=int)
+    parser.add_argument("--samples", type=int)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--correctness-tokens", type=int, default=8)
     parser.add_argument("--generation-repetitions", type=int, default=3)
@@ -137,8 +144,28 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--audit-replays", type=int, default=10)
     parser.add_argument("--skip-generation", action="store_true")
     parser.add_argument("--skip-audit", action="store_true")
+    parser.add_argument(
+        "--decode-contexts",
+        type=parse_positive_int_list,
+        default=(128, 1024, 4096, 8192),
+        help="effective decode lengths used by profile mode",
+    )
+    parser.add_argument(
+        "--prefill-lengths",
+        type=parse_positive_int_list,
+        default=(128, 1024, 4096, 8192),
+        help="prompt lengths used by profile mode",
+    )
+    parser.add_argument("--repetitions", type=int, default=5)
+    parser.add_argument("--top-k", type=int, default=12)
+    parser.add_argument("--skip-prefill", action="store_true")
+    parser.add_argument("--skip-decode", action="store_true")
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
+    if args.warmup is None:
+        args.warmup = 3 if args.mode == "profile" else 5
+    if args.samples is None:
+        args.samples = 5 if args.mode == "profile" else 20
     positive = (
         "output_tokens",
         "samples",
@@ -152,9 +179,21 @@ def _parse_args() -> argparse.Namespace:
         parser.error("sample, round, token, and audit counts must be positive")
     if args.warmup < 0 or args.stabilization_iterations < 0:
         parser.error("warmup and stabilization counts may be zero, not negative")
-    if not args.skip_generation and args.output_tokens < 2:
+    if args.mode == "profile" and min(args.repetitions, args.top_k) < 1:
+        parser.error("repetitions and top-k must be positive")
+    if args.mode == "profile" and args.skip_prefill and args.skip_decode:
+        parser.error("cannot skip both profile workloads")
+    if (
+        args.mode in {"system", "generation"}
+        and not args.skip_generation
+        and args.output_tokens < 2
+    ):
         parser.error("--output-tokens must be at least two when generation is enabled")
-    if not args.skip_audit and args.audit_capacity <= args.audit_replays + 3:
+    if (
+        args.mode in {"system", "decode"}
+        and not args.skip_audit
+        and args.audit_capacity <= args.audit_replays + 3
+    ):
         parser.error("audit capacity must exceed audit replays plus three warmups")
     return args
 
@@ -173,6 +212,7 @@ def _command_line(command: list[str]) -> str:
 def _environment(args: argparse.Namespace) -> dict[str, Any]:
     capability = torch.cuda.get_device_capability()
     return {
+        "mode": args.mode,
         "model": MODEL_ID,
         "revision": MODEL_REVISION,
         "python": sys.version.split()[0],
@@ -797,10 +837,146 @@ def _print_results(
             print(f"  {name}: {value}")
 
 
+
+# --- Full-system profile mode ---
+
+@dataclass(frozen=True)
+class ProfileRow:
+    workload: str
+    size: int
+    repetitions: int
+    median_ms: float
+    profiled_ms: float
+    launches: int
+    allocation_growth_bytes: int
+    stable_addresses: bool
+    owner_counts: dict[str, int]
+    owner_ms: dict[str, float]
+    top_kernels_ms: tuple[tuple[str, int, float], ...]
+
+def _owner(name: str) -> str:
+    lowered = name.lower()
+    if 'memcpy' in lowered or 'memset' in lowered:
+        return 'CUDA state/copy'
+    if 'gqa_decode' in lowered or 'streaming_prefill' in lowered:
+        return 'Flux attention'
+    if '_zn4flux' in lowered or 'flux' in lowered:
+        return 'Flux other'
+    if 'cublas' in lowered or 'gemm' in lowered or 'gemv' in lowered:
+        return 'cuBLAS/cuBLASLt'
+    return 'framework CUDA'
+
+def _short_name(name: str) -> str:
+    for marker, short in (('streaming_prefill', 'streaming prefill GQA'), ('gqa_decode_attention_grouped_chunk', 'decode GQA grouped chunk'), ('gqa_decode_attention_reduce', 'decode GQA reduce'), ('packed_gate_up_swiglu', 'fused gate/up + SwiGLU'), ('packed_qkv_rope_cache', 'packed QKV/RoPE/cache'), ('residual_rmsnorm', 'residual-RMSNorm'), ('rmsnorm', 'RMSNorm'), ('prepare_full_decode', 'decode state prepare'), ('advance_full_decode', 'decode state advance'), ('gemv', 'GEMV'), ('gemm', 'GEMM'), ('memcpy', 'CUDA memcpy'), ('memset', 'CUDA memset')):
+        if marker in name.lower():
+            return short
+    return name if len(name) <= 100 else name[:97] + '...'
+
+def _profile_runtime(workload: str, size: int, runtime: NativeSmolLM2Prefill, operation: Callable[[], object], warmup: int, samples: int, repetitions: int, top_k: int) -> ProfileRow:
+    for _ in range(warmup):
+        operation()
+    torch.cuda.synchronize()
+    medians = [_event_sample(operation)[0] for _ in range(samples)]
+    addresses = runtime.stable_addresses()
+    allocated = torch.cuda.memory_allocated()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as profiler:
+        start.record()
+        for _ in range(repetitions):
+            operation()
+        end.record()
+    end.synchronize()
+    growth = torch.cuda.memory_allocated() - allocated
+    owner_counts: Counter[str] = Counter()
+    owner_times: dict[str, float] = defaultdict(float)
+    kernel_counts: Counter[str] = Counter()
+    kernel_times: dict[str, float] = defaultdict(float)
+    for event in profiler.events():
+        if event.device_type != DeviceType.CUDA:
+            continue
+        milliseconds = float(event.self_device_time_total) / 1000.0 / repetitions
+        owner = _owner(event.name)
+        short = _short_name(event.name)
+        owner_counts[owner] += 1
+        owner_times[owner] += milliseconds
+        kernel_counts[short] += 1
+        kernel_times[short] += milliseconds
+    owners = sorted(set(owner_counts) | set(owner_times))
+    top = sorted(kernel_times, key=kernel_times.get, reverse=True)[:top_k]
+    return ProfileRow(workload=workload, size=size, repetitions=repetitions, median_ms=statistics.median(medians), profiled_ms=start.elapsed_time(end) / repetitions, launches=round(sum(owner_counts.values()) / repetitions), allocation_growth_bytes=growth, stable_addresses=addresses == runtime.stable_addresses(), owner_counts={name: round(owner_counts[name] / repetitions) for name in owners}, owner_ms={name: owner_times[name] for name in owners}, top_kernels_ms=tuple(((name, round(kernel_counts[name] / repetitions), kernel_times[name]) for name in top)))
+
+def _decode_profile(model: torch.nn.Module, context: int, args: argparse.Namespace) -> ProfileRow:
+    total = args.warmup + args.samples + args.repetitions
+    runtime = NativeSmolLM2Prefill.capture(model, _input_ids(context - total, model.config.vocab_size), max_decode_steps=total)
+    return _profile_runtime('native decode', context, runtime, runtime.replay, args.warmup, args.samples, args.repetitions, args.top_k)
+
+def _prefill_profile(model: torch.nn.Module, length: int, args: argparse.Namespace) -> ProfileRow:
+    ids = _input_ids(length, model.config.vocab_size)
+    runtime = NativeSmolLM2Prefill.capture(model, ids)
+    return _profile_runtime('native prefill', length, runtime, lambda: runtime.prefill(ids), args.warmup, args.samples, args.repetitions, args.top_k)
+
+def _print(rows: list[ProfileRow]) -> None:
+    for row in rows:
+        print(f'\n{row.workload}, size={row.size}: median={row.median_ms:.4f} ms, profiled={row.profiled_ms:.4f} ms, launches={row.launches}, allocation_growth={row.allocation_growth_bytes}, stable_addresses={row.stable_addresses}')
+        print('  Owners')
+        for owner, milliseconds in sorted(row.owner_ms.items(), key=lambda item: item[1], reverse=True):
+            print(f'    {owner:<20} {row.owner_counts[owner]:>4} launches {milliseconds:>10.4f} ms')
+        print('  Top kernels')
+        for name, launches, milliseconds in row.top_kernels_ms:
+            print(f'    {name:<60} {launches:>4} {milliseconds:>10.4f} ms')
+
+
+def _run_profile(args: argparse.Namespace) -> int:
+    configure_runtime(seed=SEED)
+    model = enable_flux_ops(
+        load_model("cuda"), operators=FINAL_FLUX_OPERATOR_CATEGORIES
+    )
+    maximum = int(model.config.max_position_embeddings)
+    if any(length > maximum for length in args.prefill_lengths):
+        raise ValueError(f"prefill length exceeds model maximum {maximum}")
+    decode_steps = args.warmup + args.samples + args.repetitions
+    if any(
+        context > maximum or context <= decode_steps
+        for context in args.decode_contexts
+    ):
+        raise ValueError(
+            "decode contexts must exceed all profiling steps and fit the model maximum"
+        )
+    print(
+        f"Model: {MODEL_ID} @ {MODEL_REVISION}\n"
+        f"GPU: {torch.cuda.get_device_name()}\n"
+        f"PyTorch/CUDA: {torch.__version__} / {torch.version.cuda}\n"
+        "Backend: native prefill and attached native decode"
+    )
+    rows: list[ProfileRow] = []
+    if not args.skip_decode:
+        for context in args.decode_contexts:
+            rows.append(_decode_profile(model, context, args))
+    if not args.skip_prefill:
+        for length in args.prefill_lengths:
+            rows.append(_prefill_profile(model, length, args))
+    _print(rows)
+    if args.json_output is not None:
+        payload = {
+            "mode": "profile",
+            "model": MODEL_ID,
+            "revision": MODEL_REVISION,
+            "rows": [asdict(row) for row in rows],
+        }
+        args.json_output.write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"\nWrote {args.json_output}")
+    return 0
+
+
 def main() -> int:
     args = _parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if args.mode == "profile":
+        return _run_profile(args)
     configure_runtime(seed=SEED)
     print("Loading reference and final Flux model instances...", flush=True)
     reference = load_model("cuda")
@@ -808,9 +984,11 @@ def main() -> int:
         load_model("cuda"), operators=FINAL_FLUX_OPERATOR_CATEGORIES
     )
     maximum = int(reference.config.max_position_embeddings)
-    if any(length > maximum for length in args.lengths):
+    if args.mode in {"system", "prefill", "decode"} and any(
+        length > maximum for length in args.lengths
+    ):
         raise ValueError(f"lengths exceed model maximum {maximum}")
-    if any(
+    if args.mode in {"system", "generation"} and any(
         prompt + args.output_tokens - 1 > maximum
         for prompt in args.generation_prompts
     ):
@@ -831,26 +1009,42 @@ def main() -> int:
     correctness = []
     prefill_results = []
     decode_results = []
-    for length in args.lengths:
-        print(f"Validating effective length {length}...", flush=True)
-        correctness.append(
-            _validate_decode(reference, flux, length, args.correctness_tokens)
-        )
-        print(f"Benchmarking prefill length {length}...", flush=True)
-        prefill_results.append(
-            _benchmark_prefill(
-                reference, flux, length, args.warmup, args.samples, args.rounds
+    if args.mode in {"system", "prefill", "decode"}:
+        for length in args.lengths:
+            print(f"Validating effective length {length}...", flush=True)
+            correctness.append(
+                _validate_decode(reference, flux, length, args.correctness_tokens)
             )
-        )
-        print(f"Benchmarking decode through effective length {length}...", flush=True)
-        decode_results.append(
-            _benchmark_decode(
-                reference, flux, length, args.warmup, args.samples, args.rounds
-            )
-        )
+            if args.mode in {"system", "prefill"}:
+                print(f"Benchmarking prefill length {length}...", flush=True)
+                prefill_results.append(
+                    _benchmark_prefill(
+                        reference,
+                        flux,
+                        length,
+                        args.warmup,
+                        args.samples,
+                        args.rounds,
+                    )
+                )
+            if args.mode in {"system", "decode"}:
+                print(
+                    f"Benchmarking decode through effective length {length}...",
+                    flush=True,
+                )
+                decode_results.append(
+                    _benchmark_decode(
+                        reference,
+                        flux,
+                        length,
+                        args.warmup,
+                        args.samples,
+                        args.rounds,
+                    )
+                )
 
     generation_results = []
-    if not args.skip_generation:
+    if args.mode in {"system", "generation"} and not args.skip_generation:
         for prompt_length in args.generation_prompts:
             print(
                 f"Benchmarking {args.output_tokens}-token generation at prompt "
@@ -867,7 +1061,7 @@ def main() -> int:
                 )
             )
     audit = None
-    if not args.skip_audit:
+    if args.mode in {"system", "decode"} and not args.skip_audit:
         print(f"Auditing native runtime at capacity {args.audit_capacity}...", flush=True)
         audit = _runtime_audit(flux, args.audit_capacity, args.audit_replays)
 
@@ -882,6 +1076,7 @@ def main() -> int:
     )
     if args.json_output is not None:
         payload = {
+            "mode": args.mode,
             "environment": environment,
             "flux_modules": flux_operator_counts(flux),
             "correctness": [asdict(item) for item in correctness],
