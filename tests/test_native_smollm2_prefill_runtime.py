@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import gc
-
 import pytest
 import torch
 
@@ -12,7 +10,7 @@ from flux.runtime import (
     native_smollm2_greedy_generate,
     native_smollm2_prefill_is_available,
 )
-from tests.test_native_smollm2_runtime import _model
+from tests.test_native_smollm2_runtime import _model, _reference_and_flux_models
 
 
 RTOL = 2e-4
@@ -73,21 +71,13 @@ def test_native_prefill_matches_logits_every_layer_cache_and_decode() -> None:
 
 
 @_CUDA_ONLY
-def test_native_prefill_reuse_current_stream_memory_and_addresses() -> None:
+def test_native_prefill_reuse_public_api() -> None:
     model = _model()
     first_ids = _ids(9)
     second_ids = (first_ids + 7) % 128
     native = NativeSmolLM2Prefill.capture(model, first_ids, max_decode_steps=1)
-    addresses = native.stable_addresses()
-    stream = torch.cuda.Stream()
-    consumed = torch.empty_like(native.logits)
-    torch.cuda.synchronize()
-    allocated = torch.cuda.memory_allocated()
-    with torch.cuda.stream(stream), torch.inference_mode():
-        consumed.copy_(native.prefill(second_ids))
-    stream.synchronize()
-    assert torch.cuda.memory_allocated() == allocated
-    assert native.stable_addresses() == addresses
+    with torch.inference_mode():
+        consumed = native.prefill(second_ids).clone()
     with torch.inference_mode():
         expected = model(input_ids=second_ids, use_cache=True, logits_to_keep=1)
     torch.testing.assert_close(consumed, expected.logits, rtol=RTOL, atol=ATOL)
@@ -106,12 +96,6 @@ def test_native_prefill_reuse_current_stream_memory_and_addresses() -> None:
         )
 
     assert native.memory.cache_bytes == 2 * 30 * 1 * 3 * 10 * 64 * 4
-    del native
-    gc.collect()
-    recreated = NativeSmolLM2Prefill.capture(model, first_ids, max_decode_steps=0)
-    assert recreated.cache_position == 9
-    with pytest.raises(RuntimeError, match="exhausted"):
-        recreated.replay()
 
 
 @_CUDA_ONLY
@@ -130,14 +114,18 @@ def test_native_prefill_rejects_invalid_inputs_and_capacity() -> None:
 
 
 @_CUDA_ONLY
-def test_native_prefill_single_token_greedy_generation() -> None:
-    model = _model()
+def test_native_prefill_multitoken_greedy_generation_matches_hf() -> None:
+    reference, model = _reference_and_flux_models()
     ids = _ids(7)
     with torch.inference_mode():
-        expected = model(input_ids=ids, use_cache=False, logits_to_keep=1)
-        generated = native_smollm2_greedy_generate(
-            model, ids, max_new_tokens=1
+        expected = reference.generate(
+            input_ids=ids,
+            do_sample=False,
+            num_beams=1,
+            max_new_tokens=8,
+            use_cache=True,
+            pad_token_id=0,
         )
-    assert generated.shape == (1, 8)
-    assert generated[:, :-1].equal(ids)
-    assert generated[:, -1:].equal(expected.logits.argmax(dim=-1))
+        generated = native_smollm2_greedy_generate(model, ids, max_new_tokens=8)
+    assert generated.shape == (1, 15)
+    assert generated.equal(expected)

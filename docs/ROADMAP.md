@@ -67,16 +67,25 @@ independent finish lines.
     short-context fallback, remove the 2.25 GiB length-8192 score matrix, and
     validate memory, correctness, and performance through length 8192 without
     changing decode semantics.
-31. **Next:** Reassess the remaining integrated architecture and source balance
-    from the retained streaming-prefill profile without adding unnecessary
-    attention complexity or replacing performant library GEMMs for accounting.
+31. **Completed:** Make native prefill and full native decode the canonical
+    optimized backend; replace the Python CUDA-Graph oracle with independent
+    Hugging Face and Flux-eager validation; retire the historical Python graph,
+    one-layer adapter, and superseded benchmark harnesses; and consolidate
+    duplicated CUDA-specific Python tests into the native CTest hierarchy.
+32. **Completed:** Reduce Python to its integration responsibilities by
+    classifying all remaining tests, removing the last duplicated low-level
+    CUDA numerical cases, and folding detailed native-prefill validation and
+    workspace reporting into the canonical final-system benchmark.
+33. **Next:** Reassess the integrated architecture only from measured native
+    prefill/decode profiles; do not add a subsystem or replace performant
+    library GEMMs for source-language accounting.
 
-Milestone 30 source totals are Python 551,695 B, CUDA 306,421 B, C++ 132,894 B,
-and headers 16,553 B. CUDA is 30.412093% of these sources and remains 394,721 B
-short of equal CUDA/non-CUDA bytes under the required exact metric. This
-milestone makes 31,950 bytes of net progress (`34,404` CUDA bytes added minus
-`2,454` non-CUDA bytes added) without padding, duplication, or Linguist
-overrides.
+Milestone 32 source totals are Python 325,056 B, CUDA 306,421 B, C++ 132,894 B,
+and headers 16,553 B. CUDA is 39.238261% of these sources and remains 168,082 B
+short of equal CUDA/non-CUDA bytes under the required exact metric. This pass
+removes another 17,461 Python bytes by consolidating the last separate prefill
+benchmark without padding, duplication, a Linguist override, or loss of the
+independent Python integration oracle.
 
 The operator-optimization roadmap through milestone 24 is complete. The final
 native-runtime phase continues the same integrated codebase; rejected experiments

@@ -1,4 +1,4 @@
-"""Final integrated SmolLM2 benchmark: reference, Flux eager, and Flux graph.
+"""Final integrated SmolLM2 benchmark: reference, Flux eager, and native Flux.
 
 Run from the repository root after rebuilding the native extension:
 
@@ -7,7 +7,8 @@ Run from the repository root after rebuilding the native extension:
 The benchmark uses the pinned FP32 checkpoint and the canonical retained Flux
 category set.  CUDA-event samples are collected in rotating same-process order;
 model loading, deterministic input construction, correctness checks, cache
-setup for steady-state decode, and graph capture are outside decode timings.
+setup for steady-state decode, and native runtime construction are outside
+decode timings.
 JSON output is optional so the final report can retain exact measurements.
 """
 
@@ -18,6 +19,7 @@ import json
 import statistics
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -27,12 +29,12 @@ from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile
 
 from flux.model.smollm2 import MODEL_ID, MODEL_REVISION, load_model
-from flux.model.smollm2_cuda_graph import FluxCUDAGraphDecode
 from flux.model.smollm2_flux import (
     FINAL_FLUX_OPERATOR_CATEGORIES,
     enable_flux_ops,
     flux_operator_counts,
 )
+from flux.runtime import NativeSmolLM2Prefill
 from benchmarks.smollm2_benchmark_utils import (
     configure_runtime,
     deterministic_input_ids,
@@ -53,7 +55,18 @@ class PrefillResult:
     length: int
     reference_ms: float
     flux_ms: float
+    native_ms: float
     max_logits_error: float
+    max_native_logits_error: float
+    max_native_key_error: float
+    max_native_value_error: float
+    cache_position: int
+    cache_length: int
+    stable_addresses: bool
+    cache_bytes: int
+    prefill_workspace_bytes: int
+    decode_workspace_bytes: int
+    stable_buffer_bytes: int
 
 
 @dataclass(frozen=True)
@@ -74,7 +87,7 @@ class DecodeResult:
     window_stop: int
     reference_ms: float
     flux_eager_ms: float
-    flux_graph_ms: float
+    native_ms: float
 
 
 @dataclass(frozen=True)
@@ -242,32 +255,83 @@ def _benchmark_prefill(
 ) -> PrefillResult:
     maximum = _prefill_correctness(reference, flux, length)
     input_ids = _input_ids(length, reference.config.vocab_size)
-    values: dict[str, list[float]] = {"reference": [], "Flux eager": []}
-    paths = (("reference", reference), ("Flux eager", flux))
+    with torch.inference_mode():
+        native = NativeSmolLM2Prefill.capture(flux, input_ids)
+        flux_output = flux(input_ids=input_ids, use_cache=True, logits_to_keep=1)
+    native_error = _max_error(native.logits, flux_output.logits)
+    max_key_error = 0.0
+    max_value_error = 0.0
+    for layer_index, layer in enumerate(flux_output.past_key_values.layers):
+        max_key_error = max(
+            max_key_error,
+            _max_error(native.key_cache[layer_index, ..., :length, :], layer.keys),
+        )
+        max_value_error = max(
+            max_value_error,
+            _max_error(native.value_cache[layer_index, ..., :length, :], layer.values),
+        )
+    if native.cache_position != length or native.cache_length != length:
+        raise AssertionError("native prefill cache position or length is incorrect")
+    addresses = native.stable_addresses()
+    memory = native.memory
+    del flux_output
+    values: dict[str, list[float]] = {
+        "reference": [],
+        "Flux eager": [],
+        "native": [],
+    }
+    paths = ("reference", "Flux eager", "native")
     output = None
     with torch.inference_mode():
         for round_index in range(rounds):
-            order = paths if round_index % 2 == 0 else tuple(reversed(paths))
-            for _, model in order:
+            order = paths[round_index % 3 :] + paths[: round_index % 3]
+            for name in order:
                 for _ in range(warmup):
-                    output = model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
-            torch.cuda.synchronize()
-            for sample_index in range(samples):
-                order = paths if sample_index % 2 == round_index % 2 else tuple(reversed(paths))
-                for name, model in order:
-                    elapsed, output = _event_sample(
-                        lambda model=model: model(
+                    if name == "native":
+                        output = native.prefill(input_ids)
+                    else:
+                        model = reference if name == "reference" else flux
+                        output = model(
                             input_ids=input_ids, use_cache=True, logits_to_keep=1
                         )
-                    )
+            torch.cuda.synchronize()
+            for sample_index in range(samples):
+                offset = (sample_index + round_index) % 3
+                order = paths[offset:] + paths[:offset]
+                for name in order:
+                    if name == "native":
+                        elapsed, output = _event_sample(
+                            lambda: native.prefill(input_ids)
+                        )
+                    else:
+                        model = reference if name == "reference" else flux
+                        elapsed, output = _event_sample(
+                            lambda model=model: model(
+                                input_ids=input_ids,
+                                use_cache=True,
+                                logits_to_keep=1,
+                            )
+                        )
                     values[name].append(elapsed)
-    del input_ids, output
-    return PrefillResult(
+    result = PrefillResult(
         length,
         statistics.median(values["reference"]),
         statistics.median(values["Flux eager"]),
+        statistics.median(values["native"]),
         maximum,
+        native_error,
+        max_key_error,
+        max_value_error,
+        native.cache_position,
+        native.cache_length,
+        addresses == native.stable_addresses(),
+        memory.cache_bytes,
+        memory.prefill_workspace_bytes,
+        memory.decode_workspace_bytes,
+        memory.stable_buffer_bytes,
     )
+    del input_ids, output, native
+    return result
 
 
 def _validate_decode(
@@ -282,23 +346,25 @@ def _validate_decode(
     with torch.inference_mode():
         reference_output = reference(input_ids=prompt, use_cache=True, logits_to_keep=1)
         flux_output = flux(input_ids=prompt, use_cache=True, logits_to_keep=1)
-        graph = FluxCUDAGraphDecode.capture(flux, prompt, max_decode_steps=steps)
+        native = NativeSmolLM2Prefill.capture(
+            flux, prompt, max_decode_steps=steps
+        )
         reference_cache = reference_output.past_key_values
         flux_cache = flux_output.past_key_values
         reference_token = reference_output.logits.argmax(dim=-1)
         flux_token = flux_output.logits.argmax(dim=-1)
-        graph_token = graph.prefill_logits.argmax(dim=-1)
+        native_token = native.logits.argmax(dim=-1)
         reference_tokens = [reference_token]
         flux_tokens = [flux_token]
-        graph_tokens = [graph_token]
+        native_tokens = [native_token]
         max_logits = max(
             _max_error(flux_output.logits, reference_output.logits),
-            _max_error(graph.prefill_logits, flux_output.logits),
+            _max_error(native.logits, flux_output.logits),
         )
         max_key = 0.0
         max_value = 0.0
-        positions = graph.cache_position == prompt_length
-        addresses = graph.stable_addresses()
+        positions = native.cache_position == native.cache_length == prompt_length
+        addresses = native.stable_addresses()
         for step in range(steps):
             reference_output = reference(
                 input_ids=reference_token,
@@ -312,43 +378,42 @@ def _validate_decode(
                 use_cache=True,
                 logits_to_keep=1,
             )
-            graph_logits = graph.replay(graph_token)
+            native_logits = native.replay(native_token)
             max_logits = max(
                 max_logits,
                 _max_error(flux_output.logits, reference_output.logits),
-                _max_error(graph_logits, flux_output.logits),
+                _max_error(native_logits, flux_output.logits),
             )
             expected_length = prompt_length + step + 1
             positions &= (
-                graph.cache_position == expected_length
+                native.cache_position == expected_length
+                and native.cache_length == expected_length
                 and _cache_length(reference_cache) == expected_length
                 and _cache_length(flux_cache) == expected_length
-                and _cache_length(graph.cache) == expected_length
             )
-            for reference_layer, flux_layer, graph_layer in zip(
-                reference_cache.layers,
-                flux_cache.layers,
-                graph.cache.layers,
-                strict=True,
+            for layer_index, (reference_layer, flux_layer) in enumerate(
+                zip(reference_cache.layers, flux_cache.layers, strict=True)
             ):
-                graph_keys = graph_layer.keys[..., :expected_length, :]
-                graph_values = graph_layer.values[..., :expected_length, :]
+                native_keys = native.key_cache[
+                    layer_index, ..., :expected_length, :
+                ]
+                native_values = native.value_cache[
+                    layer_index, ..., :expected_length, :
+                ]
                 key_error = float((flux_layer.keys - reference_layer.keys).abs().max().item())
                 value_error = float(
                     (flux_layer.values - reference_layer.values).abs().max().item()
                 )
-                graph_key_error = float((graph_keys - flux_layer.keys).abs().max().item())
-                graph_value_error = float(
-                    (graph_values - flux_layer.values).abs().max().item()
-                )
-                max_key = max(max_key, key_error, graph_key_error)
-                max_value = max(max_value, value_error, graph_value_error)
+                native_key_error = _max_error(native_keys, flux_layer.keys)
+                native_value_error = _max_error(native_values, flux_layer.values)
+                max_key = max(max_key, key_error, native_key_error)
+                max_value = max(max_value, value_error, native_value_error)
                 expected_shape = reference_layer.keys.shape
                 if (
                     flux_layer.keys.shape != expected_shape
                     or flux_layer.values.shape != reference_layer.values.shape
-                    or graph_keys.shape != expected_shape
-                    or graph_values.shape != reference_layer.values.shape
+                    or native_keys.shape != expected_shape
+                    or native_values.shape != reference_layer.values.shape
                 ):
                     raise AssertionError("KV-cache tensor shapes differ")
                 if not all(
@@ -356,24 +421,24 @@ def _validate_decode(
                     for tensor in (
                         flux_layer.keys,
                         flux_layer.values,
-                        graph_keys,
-                        graph_values,
+                        native_keys,
+                        native_values,
                     )
                 ):
                     raise AssertionError("KV cache contains non-finite values")
             reference_token = reference_output.logits.argmax(dim=-1)
             flux_token = flux_output.logits.argmax(dim=-1)
-            graph_token = graph_logits.argmax(dim=-1)
+            native_token = native_logits.argmax(dim=-1)
             reference_tokens.append(reference_token)
             flux_tokens.append(flux_token)
-            graph_tokens.append(graph_token)
-        stable = addresses == graph.stable_addresses()
+            native_tokens.append(native_token)
+        stable = addresses == native.stable_addresses()
         greedy = torch.equal(
             torch.cat(reference_tokens, dim=-1), torch.cat(flux_tokens, dim=-1)
         ) and torch.equal(
-            torch.cat(flux_tokens, dim=-1), torch.cat(graph_tokens, dim=-1)
+            torch.cat(flux_tokens, dim=-1), torch.cat(native_tokens, dim=-1)
         )
-    del prompt, graph, reference_cache, flux_cache
+    del prompt, native, reference_cache, flux_cache
     return CorrectnessResult(
         effective_length, max_logits, max_key, max_value, positions, stable, greedy
     )
@@ -413,23 +478,23 @@ def _decode_eager_samples(
     return values
 
 
-def _decode_graph_samples(
+def _decode_native_samples(
     model: torch.nn.Module,
     prompt: torch.Tensor,
     warmup: int,
     samples: int,
 ) -> list[float]:
-    graph = FluxCUDAGraphDecode.capture(
+    native = NativeSmolLM2Prefill.capture(
         model, prompt, max_decode_steps=warmup + samples
     )
     for _ in range(warmup):
-        graph.graph.replay()
+        native.replay()
     torch.cuda.synchronize()
     values = []
     for _ in range(samples):
-        elapsed, _ = _event_sample(graph.graph.replay)
+        elapsed, _ = _event_sample(native.replay)
         values.append(elapsed)
-    del graph
+    del native
     return values
 
 
@@ -451,9 +516,9 @@ def _benchmark_decode(
     values: dict[str, list[float]] = {
         "reference": [],
         "Flux eager": [],
-        "Flux graph": [],
+        "native": [],
     }
-    paths = ("reference", "Flux eager", "Flux graph")
+    paths = ("reference", "Flux eager", "native")
     for round_index in range(rounds):
         order = paths[round_index % 3 :] + paths[: round_index % 3]
         for name in order:
@@ -463,7 +528,7 @@ def _benchmark_decode(
             elif name == "Flux eager":
                 batch = _decode_eager_samples(flux, prompt, warmup, samples)
             else:
-                batch = _decode_graph_samples(flux, prompt, warmup, samples)
+                batch = _decode_native_samples(flux, prompt, warmup, samples)
             values[name].extend(batch)
             del prompt
     return DecodeResult(
@@ -472,7 +537,7 @@ def _benchmark_decode(
         effective_length,
         statistics.median(values["reference"]),
         statistics.median(values["Flux eager"]),
-        statistics.median(values["Flux graph"]),
+        statistics.median(values["native"]),
     )
 
 
@@ -505,26 +570,26 @@ def _generation_eager_once(
     return prefill_ms, decode_start.elapsed_time(decode_end)
 
 
-def _generation_graph_once(
+def _generation_native_once(
     model: torch.nn.Module, prompt: torch.Tensor, output_tokens: int
 ) -> tuple[float, float, float]:
-    graph = FluxCUDAGraphDecode.capture(
+    setup_start = time.perf_counter()
+    native = NativeSmolLM2Prefill.capture(
         model, prompt, max_decode_steps=output_tokens - 1
     )
-    token = graph.prefill_logits.argmax(dim=-1)
+    torch.cuda.synchronize()
+    setup_ms = (time.perf_counter() - setup_start) * 1000.0
+    prefill_ms, logits = _event_sample(lambda: native.prefill(prompt))
+    token = logits.argmax(dim=-1)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(output_tokens - 1):
-        token = graph.replay(token).argmax(dim=-1)
+        token = native.replay(token).argmax(dim=-1)
     end.record()
     end.synchronize()
-    result = (
-        graph.setup_timing.prefill_ms,
-        graph.setup_timing.total_ms,
-        start.elapsed_time(end),
-    )
-    del graph
+    result = (prefill_ms, setup_ms, start.elapsed_time(end))
+    del native
     return result
 
 
@@ -538,7 +603,7 @@ def _benchmark_generation(
     samples: dict[str, list[tuple[float, float, float]]] = {
         "reference": [],
         "Flux eager": [],
-        "Flux graph": [],
+        "native": [],
     }
     paths = tuple(samples)
     for repetition in range(repetitions):
@@ -555,7 +620,7 @@ def _benchmark_generation(
                 samples[name].append((prefill, prefill, decode))
             else:
                 samples[name].append(
-                    _generation_graph_once(flux, prompt, output_tokens)
+                    _generation_native_once(flux, prompt, output_tokens)
                 )
             del prompt
     results = []
@@ -591,17 +656,17 @@ def _runtime_audit(
     flux: torch.nn.Module, capacity: int, replays: int
 ) -> RuntimeAudit:
     prompt = _input_ids(capacity - replays - 3, flux.config.vocab_size)
-    graph = FluxCUDAGraphDecode.capture(
+    native = NativeSmolLM2Prefill.capture(
         flux, prompt, max_decode_steps=replays + 3
     )
     for _ in range(3):
-        graph.graph.replay()
+        native.replay()
     torch.cuda.synchronize()
-    addresses = graph.stable_addresses()
+    addresses = native.stable_addresses()
     allocated_before = torch.cuda.memory_allocated()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as profiler:
         for _ in range(replays):
-            graph.graph.replay()
+            native.replay()
         torch.cuda.synchronize()
     allocated_after = torch.cuda.memory_allocated()
     cuda_events = [
@@ -623,11 +688,11 @@ def _runtime_audit(
         round(owners["cuBLAS"] / replays),
         round(owners["framework"] / replays),
         allocated_after - allocated_before,
-        addresses == graph.stable_addresses(),
+        addresses == native.stable_addresses(),
         sum("synchronize" in name for name in cpu_names),
         sum("cudamalloc" in name or "cudafree" in name for name in cpu_names),
     )
-    del graph, prompt
+    del native, prompt
     return result
 
 
@@ -676,33 +741,45 @@ def _print_results(
         )
     print("\nPrefill (last-token logits, use_cache=True)")
     print(
-        f"{'tokens':>8} {'reference ms':>13} {'Flux ms':>11} {'ref tok/s':>12} "
-        f"{'Flux tok/s':>12} {'speedup':>9} {'max error':>11}"
+        f"{'tokens':>8} {'reference':>11} {'Flux eager':>11} {'native':>11} "
+        f"{'native tok/s':>12} {'HF/native':>10} {'Flux/native':>12} "
+        f"{'HF/Flux err':>12} {'native err':>11}"
     )
     for item in prefill:
         print(
-            f"{item.length:>8} {item.reference_ms:>13.3f} {item.flux_ms:>11.3f} "
-            f"{1000 * item.length / item.reference_ms:>12.1f} "
-            f"{1000 * item.length / item.flux_ms:>12.1f} "
-            f"{item.reference_ms / item.flux_ms:>8.3f}x "
-            f"{item.max_logits_error:>11.6g}"
+            f"{item.length:>8} {item.reference_ms:>11.3f} {item.flux_ms:>11.3f} "
+            f"{item.native_ms:>11.3f} {1000 * item.length / item.native_ms:>12.1f} "
+            f"{item.reference_ms / item.native_ms:>9.3f}x "
+            f"{item.flux_ms / item.native_ms:>11.3f}x "
+            f"{item.max_logits_error:>12.6g} {item.max_native_logits_error:>11.6g}"
+        )
+    print("\nNative prefill cache and persistent storage")
+    for item in prefill:
+        print(
+            f"  {item.length}: K={item.max_native_key_error:.6g}, "
+            f"V={item.max_native_value_error:.6g}, "
+            f"position/length={item.cache_position}/{item.cache_length}, "
+            f"addresses={item.stable_addresses}, cache={item.cache_bytes} B, "
+            f"prefill_workspace={item.prefill_workspace_bytes} B, "
+            f"decode_workspace={item.decode_workspace_bytes} B, "
+            f"stable_buffers={item.stable_buffer_bytes} B"
         )
     print("\nSteady-state decode (effective attention length; median window shown)")
     print(
         f"{'length':>8} {'window':>13} {'reference':>11} {'Flux eager':>11} "
-        f"{'Flux graph':>11} {'graph/ref':>10} {'graph/eager':>12}"
+        f"{'native':>11} {'native/ref':>10} {'native/eager':>12}"
     )
     for item in decode:
         print(
             f"{item.effective_length:>8} "
             f"{item.window_start:>5}-{item.window_stop:<5} "
             f"{item.reference_ms:>11.4f} {item.flux_eager_ms:>11.4f} "
-            f"{item.flux_graph_ms:>11.4f} "
-            f"{item.reference_ms / item.flux_graph_ms:>9.3f}x "
-            f"{item.flux_eager_ms / item.flux_graph_ms:>11.3f}x"
+            f"{item.native_ms:>11.4f} "
+            f"{item.reference_ms / item.native_ms:>9.3f}x "
+            f"{item.flux_eager_ms / item.native_ms:>11.3f}x"
         )
     if generation:
-        print("\nGeneration (CUDA-event execution; graph observed total includes setup)")
+        print("\nGeneration (CUDA-event execution; native observed total includes setup)")
         print(
             f"{'prompt':>7} {'path':>11} {'prefill':>10} {'TTFT':>10} "
             f"{'decode':>10} {'total exec':>11} {'total seen':>11} {'gen tok/s':>10}"
@@ -791,7 +868,7 @@ def main() -> int:
             )
     audit = None
     if not args.skip_audit:
-        print(f"Auditing graph runtime at capacity {args.audit_capacity}...", flush=True)
+        print(f"Auditing native runtime at capacity {args.audit_capacity}...", flush=True)
         audit = _runtime_audit(flux, args.audit_capacity, args.audit_replays)
 
     environment = _environment(args)

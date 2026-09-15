@@ -12,7 +12,7 @@ from flux.ops import (
 
 
 _AVAILABLE = torch.cuda.is_available() and native_cublaslt_linear_is_available()
-_SHAPES = ((960, 576), (576, 576), (3072, 576), (576, 1536), (49152, 576))
+_SHAPES = ((960, 576), (49152, 576))
 _WORKSPACE_BYTES = 4 * 1024 * 1024
 
 
@@ -57,77 +57,6 @@ def test_cublaslt_linear_matches_pytorch_and_repeats(
     assert returned.data_ptr() == output.data_ptr()
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(output, first, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not _AVAILABLE, reason="CUDA cuBLASLt extension is required")
-def test_cublaslt_linear_uses_current_stream_and_captures() -> None:
-    generator = torch.Generator(device="cuda").manual_seed(880)
-    input = torch.randn((1, 1, 576), generator=generator, device="cuda")
-    weight = torch.randn((960, 576), generator=generator, device="cuda")
-    output = torch.empty((1, 1, 960), device="cuda")
-    workspace = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
-    algorithm = cublaslt_algorithms(
-        input, weight, max_workspace_bytes=_WORKSPACE_BYTES
-    )[0]
-
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream), torch.inference_mode():
-        input.fill_(0.25)
-        cublaslt_linear_out(
-            input,
-            weight,
-            output,
-            workspace,
-            algorithm_index=algorithm.index,
-            max_workspace_bytes=_WORKSPACE_BYTES,
-        )
-    torch.cuda.current_stream().wait_stream(stream)
-    expected = torch.nn.functional.linear(input, weight)
-    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-
-    # Plan/heuristic initialization happens before capture. Replay performs no
-    # allocation and keeps caller-owned output/workspace addresses stable.
-    cublaslt_linear_out(
-        input,
-        weight,
-        output,
-        workspace,
-        algorithm_index=algorithm.index,
-        max_workspace_bytes=_WORKSPACE_BYTES,
-    )
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph), torch.inference_mode():
-        captured = cublaslt_linear_out(
-            input,
-            weight,
-            output,
-            workspace,
-            algorithm_index=algorithm.index,
-            max_workspace_bytes=_WORKSPACE_BYTES,
-        )
-    addresses = (output.data_ptr(), workspace.data_ptr(), captured.data_ptr())
-    for value in (0.5, -0.125, 0.75):
-        input.fill_(value)
-        graph.replay()
-        torch.testing.assert_close(
-            output, torch.nn.functional.linear(input, weight), rtol=1e-5, atol=1e-5
-        )
-        assert addresses == (output.data_ptr(), workspace.data_ptr(), captured.data_ptr())
-
-    exact = cublaslt_algorithms(
-        input, weight, max_workspace_bytes=_WORKSPACE_BYTES, max_algorithms=16
-    )[5]
-    exact_workspace = torch.empty(0, dtype=torch.uint8, device="cuda")
-    exact_stream = torch.cuda.Stream()
-    with torch.cuda.stream(exact_stream), torch.inference_mode():
-        input.fill_(-0.375)
-        cublaslt_linear_config_out(
-            input, weight, output, exact_workspace, exact
-        )
-    torch.cuda.current_stream().wait_stream(exact_stream)
-    torch.testing.assert_close(
-        output, torch.nn.functional.linear(input, weight), rtol=2e-5, atol=2e-5
-    )
 
 
 @pytest.mark.skipif(not _AVAILABLE, reason="CUDA cuBLASLt extension is required")

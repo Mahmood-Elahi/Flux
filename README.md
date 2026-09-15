@@ -2,8 +2,8 @@
 
 Flux is an integrated FP32 CUDA inference path for
 **SmolLM2-135M**. It combines explicit PyTorch model adapters with custom
-C++/CUDA operators, packed checkpoint-compatible projections, native
-one-token grouped-query attention, and fixed-shape CUDA-Graph decode. The
+C++/CUDA operators, packed checkpoint-compatible projections, native prompt
+prefill, and fixed-shape native CUDA-Graph decode. The
 ordinary pinned Hugging Face/PyTorch model remains unchanged as the numerical
 and performance reference; Flux is enabled only on the model instance passed
 to `enable_flux_ops` and never monkey-patches Transformers globally.
@@ -27,19 +27,16 @@ It retains FP32 RMSNorm, fused residual-RMSNorm, RoPE, fused attention score
 processing/softmax, packed QKV and MLP storage, packed SwiGLU, native one-token
 GQA, fused packed-QKV/RoPE/StaticCache update, tuned zero-workspace cuBLASLt
 QKV/output projections, and fused gate/up GEMV+SwiGLU. Fixed-shape graph decode
-uses stable caller-owned buffers, device-resident cache position/mask state, and
+uses stable native-owned buffers, device-resident cache position/mask state, and
 unexpanded 3-head K/V storage; it never materializes `repeat_kv` in the
 optimized 513--8192-capacity path.
 
-On the target RTX 5070 Ti, the final 30-sample run measured 1.435, 1.464,
-1.707, and 2.053 ms/token at effective attention lengths 1024, 2048, 4096,
-and 8192. These are 16.82x, 16.12x, 13.62x, and 10.92x faster than the ordinary
-Hugging Face/PyTorch reference path. A 4096-capacity replay contains 315 GPU
-launches (181 Flux, 92 cuBLAS/cuBLASLt, 42 remaining framework), grows PyTorch
-allocated memory by zero bytes, and preserves all graph tensor addresses.
-Reference, Flux eager, and Flux graph greedy tokens matched through every
-tested continuation; the largest observed end-to-end logit difference was
-`8.965e-5` under the established FP32 tolerance.
+On the target RTX 5070 Ti, the native runtime measured 1.3991, 1.4569,
+1.6516, and 1.9163 ms/token at effective attention lengths 1024, 2048, 4096,
+and 8192. A replay contains 304 GPU launches, grows PyTorch-allocated memory by
+zero bytes, preserves all stable addresses, and has no framework GPU launches.
+Pinned Hugging Face, Flux eager, and native greedy tokens matched through every
+tested continuation under the established FP32 tolerance.
 
 Rebuild, validate, and reproduce the final matrix with:
 
@@ -59,7 +56,7 @@ configuration, methodology, tables, bottleneck interpretation, limitations,
 and optimization history.
 
 The maintained benchmark/support inventory and source-footprint accounting are
-recorded in [the benchmark audit](docs/BENCHMARK_SUPPORT_AUDIT.md).
+recorded in [the Python test/benchmark audit](docs/PYTHON_TEST_BENCHMARK_AUDIT.md).
 
 The native runtime now owns the complete prompt-to-decode path. Native FP32
 prefill runs all 30 layers, writes the compact cache directly into the attached
@@ -89,13 +86,17 @@ lengths 129--1024 caps retained score storage at 36 MiB. See
 [the native prefill milestone](docs/NATIVE_PREFILL_RUNTIME_MILESTONE.md),
 [the full native decode milestone](docs/NATIVE_FULL_DECODE_RUNTIME_MILESTONE.md),
 and [runtime design](docs/NATIVE_DECODE_RUNTIME_DESIGN.md). Reproduce the
-prefill correctness, direct continuation, launch, memory, and three-path timing
-matrix with:
+  prefill correctness, direct continuation, memory, and three-path timing
+  matrix, including every-layer native cache validation and workspace reporting,
+  with the canonical final-system benchmark:
 
 ```powershell
-build\python3119\python.exe benchmarks\benchmark_native_smollm2_prefill.py `
-  --json-output build\native_prefill_results.json
+build\python3119\python.exe benchmarks\benchmark_final_system.py `
+  --json-output build\final_system_results.json
 ```
+
+Use `benchmark_smollm2_decode_profile.py` when prefill/decode launch ownership
+and top-kernel attribution are required.
 
 ## Development setup
 
@@ -262,11 +263,10 @@ enable_flux_ops(
 )
 ```
 
-Validate and benchmark isolated attention, a decoder layer, eager decode,
-CUDA-Graph replay, numerical behavior, kernel inventory, and memory with:
+Validate and benchmark the production attention kernel directly with:
 
-```bash
-python benchmarks/benchmark_smollm2_gqa_decode_attention.py
+```bat
+scripts\native.cmd benchmark -Filter gqa
 ```
 
 The separately controlled `"packed_qkv_rope_cache"` category fuses the work
@@ -289,23 +289,21 @@ enable_flux_ops(
 )
 ```
 
-The fused boundary's operator, cache-update, stream, FakeTensor, and graph
-contracts are maintained in `tests/test_native_packed_qkv_rope_cache.py` and
-`tests/test_smollm2_cuda_graph.py`. Its production contribution is exercised by
-the final-system benchmark and decode profiler.
+The fused boundary's dispatcher, cache-update, FakeTensor, and opcheck contracts
+are maintained in `tests/test_native_packed_qkv_rope_cache.py`; native CTest
+owns its direct stream and graph behavior. Its production contribution is
+exercised by the final-system benchmark and native runtime profiler.
 
 For the fully fused FP32 `B=1`, one-token StaticCache graph path at capacities
 513 through 8192, graph capture also preallocates a small state-owned scratch
 set. Narrow internal out variants reuse it for RMSNorm, residual RMSNorm,
 packed SwiGLU, packed-QKV post-processing, and native GQA attention. The
 buffers are shared only where producer/consumer lifetimes do not overlap,
-remain owned by the captured runtime object, and are not used by eager or
-unsupported paths. PyTorch deterministic algorithms and uninitialized-memory
-safety filling remain enabled; removing the captured `empty` allocations
-removes their redundant replay fills. Stable-address, stale-data, stream, and
-fallback behavior are maintained in `tests/test_stable_decode_outputs.py`; the
-canonical benchmark's runtime audit checks stable addresses, replay allocation
-growth, and launch ownership.
+remain owned by the captured native runtime object, and are not used by eager
+or unsupported paths. PyTorch deterministic algorithms and uninitialized-memory
+safety filling remain enabled. Native CTest owns overwrite, stable-address,
+stream, graph, and allocation behavior; the Python operator tests retain the
+public out-schema, identity, alias, and FakeTensor contracts.
 
 The separately controlled `"cublaslt_projection"` category replaces only the
 FP32 one-token packed-QKV and attention-output projections inside the supported
@@ -347,10 +345,10 @@ activation buffer. Eager, prefill, non-FP32, non-unit batch/query, and other
 geometry use the existing packed `nn.Linear` plus packed-SwiGLU fallback.
 
 Add `"fused_gate_up_swiglu"` to the fully optimized category set shown above.
-Reproduce the retained benchmark with:
+Measure the retained production kernel with:
 
-```bash
-python benchmarks/benchmark_smollm2_gate_up_gemv.py
+```bat
+scripts\native.cmd benchmark -Filter gate_up
 ```
 
 See [the gate/up GEMV milestone report](docs/GATE_UP_GEMV_MILESTONE.md) for the
@@ -383,10 +381,10 @@ Packed-QKV layout, checkpoint compatibility, storage, prefill, decode, and
 generation behavior are maintained in `tests/test_smollm2_flux.py`; production
 performance is included in the canonical final-system benchmark.
 
-Benchmark RoPE in isolation and in integrated prefill/cached-decode paths with:
+Benchmark RoPE directly with:
 
-```bash
-python benchmarks/benchmark_rope.py
+```bat
+scripts\native.cmd benchmark -Filter rope
 ```
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the planned progression toward the integrated system.
