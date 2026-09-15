@@ -10,7 +10,11 @@ from collections.abc import Callable
 import torch
 
 from flux.model.smollm2 import MODEL_ID, MODEL_REVISION, load_model, load_tokenizer
-from flux.model.smollm2_flux import enable_flux_ops, flux_operator_counts
+from flux.model.smollm2_flux import (
+    FINAL_FLUX_OPERATOR_CATEGORIES,
+    enable_flux_ops,
+    flux_operator_counts,
+)
 from flux.runtime import native_smollm2_greedy_generate
 
 
@@ -104,7 +108,7 @@ def main() -> None:
             args.iterations,
         )
 
-        enable_flux_ops(model)
+        enable_flux_ops(model, operators=FINAL_FLUX_OPERATOR_CATEGORIES)
         flux_output = model(
             **inputs,
             use_cache=False,

@@ -55,8 +55,11 @@ DEFAULT_GENERATION_PROMPTS = (128, 1024, 4096)
 class PrefillResult:
     length: int
     reference_ms: float
+    reference_mad_ms: float
     flux_ms: float
+    flux_mad_ms: float
     native_ms: float
+    native_mad_ms: float
     max_logits_error: float
     max_native_logits_error: float
     max_native_key_error: float
@@ -177,15 +180,21 @@ def _parse_args() -> argparse.Namespace:
         "output_tokens",
         "samples",
         "rounds",
-        "correctness_tokens",
         "generation_repetitions",
         "audit_capacity",
         "audit_replays",
     )
     if any(getattr(args, name) < 1 for name in positive):
         parser.error("sample, round, token, and audit counts must be positive")
-    if args.warmup < 0 or args.stabilization_iterations < 0:
-        parser.error("warmup and stabilization counts may be zero, not negative")
+    if (
+        args.warmup < 0
+        or args.stabilization_iterations < 0
+        or args.correctness_tokens < 0
+    ):
+        parser.error(
+            "warmup, stabilization, and correctness-token counts may be zero, "
+            "not negative"
+        )
     if args.mode == "profile" and min(args.repetitions, args.top_k) < 1:
         parser.error("repetitions and top-k must be positive")
     if args.mode == "profile" and args.skip_prefill and args.skip_decode:
@@ -295,6 +304,11 @@ def _event_sample(operation: Callable[[], Any]) -> tuple[float, Any]:
     return start.elapsed_time(end), output
 
 
+def _median_absolute_deviation(values: list[float]) -> float:
+    median = statistics.median(values)
+    return statistics.median(abs(value - median) for value in values)
+
+
 def _benchmark_prefill(
     reference: torch.nn.Module,
     flux: torch.nn.Module,
@@ -369,8 +383,11 @@ def _benchmark_prefill(
     result = PrefillResult(
         length,
         statistics.median(values["reference"]),
+        _median_absolute_deviation(values["reference"]),
         statistics.median(values["Flux eager"]),
+        _median_absolute_deviation(values["Flux eager"]),
         statistics.median(values["native"]),
+        _median_absolute_deviation(values["native"]),
         maximum,
         native_error,
         max_key_error,
@@ -864,14 +881,18 @@ def _print_results(
         )
     print("\nPrefill (last-token logits, use_cache=True)")
     print(
-        f"{'tokens':>8} {'reference':>11} {'Flux eager':>11} {'native':>11} "
+        f"{'tokens':>8} {'reference':>11} {'ref MAD':>9} "
+        f"{'Flux eager':>11} {'Flux MAD':>9} {'native':>11} {'nat MAD':>9} "
         f"{'native tok/s':>12} {'HF/native':>10} {'Flux/native':>12} "
         f"{'HF/Flux err':>12} {'native err':>11}"
     )
     for item in prefill:
         print(
-            f"{item.length:>8} {item.reference_ms:>11.3f} {item.flux_ms:>11.3f} "
-            f"{item.native_ms:>11.3f} {1000 * item.length / item.native_ms:>12.1f} "
+            f"{item.length:>8} {item.reference_ms:>11.3f} "
+            f"{item.reference_mad_ms:>9.3f} {item.flux_ms:>11.3f} "
+            f"{item.flux_mad_ms:>9.3f} {item.native_ms:>11.3f} "
+            f"{item.native_mad_ms:>9.3f} "
+            f"{1000 * item.length / item.native_ms:>12.1f} "
             f"{item.reference_ms / item.native_ms:>9.3f}x "
             f"{item.flux_ms / item.native_ms:>11.3f}x "
             f"{item.max_logits_error:>12.6g} {item.max_native_logits_error:>11.6g}"
