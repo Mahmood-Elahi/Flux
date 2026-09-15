@@ -36,6 +36,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
     rope_dir = ROOT / "csrc" / "rope"
     packed_swiglu_dir = ROOT / "csrc" / "packed_swiglu"
     gqa_decode_attention_dir = ROOT / "csrc" / "gqa_decode_attention"
+    greedy_generation_dir = ROOT / "csrc" / "greedy_generation"
     packed_qkv_rope_cache_dir = ROOT / "csrc" / "packed_qkv_rope_cache"
     cublaslt_linear_dir = ROOT / "csrc" / "cublaslt_linear"
     packed_gate_up_gemv_dir = ROOT / "csrc" / "packed_gate_up_gemv"
@@ -64,6 +65,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(packed_swiglu_dir / "packed_swiglu_cuda.cu"),
             str(gqa_decode_attention_dir / "gqa_decode_attention_torch.cpp"),
             str(gqa_decode_attention_dir / "gqa_decode_attention_cuda.cu"),
+            str(greedy_generation_dir / "greedy_generation_cuda.cu"),
             str(streaming_prefill_gqa_dir / "streaming_prefill_gqa_cuda.cu"),
             str(packed_qkv_rope_cache_dir / "packed_qkv_rope_cache_torch.cpp"),
             str(packed_qkv_rope_cache_dir / "packed_qkv_rope_cache_cuda.cu"),
@@ -83,6 +85,7 @@ def _native_extension_config() -> tuple[list[object], dict[str, object]]:
             str(rope_dir),
             str(packed_swiglu_dir),
             str(gqa_decode_attention_dir),
+            str(greedy_generation_dir),
             str(streaming_prefill_gqa_dir),
             str(packed_qkv_rope_cache_dir),
             str(cublaslt_linear_dir),

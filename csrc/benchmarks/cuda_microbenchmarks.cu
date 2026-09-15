@@ -2,6 +2,7 @@
 
 #include "attention_score_softmax_cuda.h"
 #include "gqa_decode_attention_cuda.h"
+#include "greedy_generation_cuda.h"
 #include "packed_gate_up_gemv_cuda.h"
 #include "packed_qkv_rope_cache_cuda.h"
 #include "packed_swiglu_cuda.h"
@@ -82,6 +83,44 @@ void benchmark_rmsnorm(const Options& options, Stream& stream) {
     expect_close(copy_to_host(d_output, stream.get()), expected,
                  1.0e-5F, 2.0e-6F, "benchmark RMSNorm correctness");
     time_case(options, "rmsnorm_14x576", stream.get(), operation);
+}
+
+void benchmark_greedy_generation(const Options& options, Stream& stream) {
+    constexpr std::int64_t vocabulary = 49152;
+    std::vector<float> logits = deterministic_values(vocabulary, 100.0F);
+    logits[43117] = 1000.0F;
+    DeviceBuffer<float> device_logits(vocabulary);
+    DeviceBuffer<std::int64_t> token(1);
+    DeviceBuffer<std::int64_t> generated(1024);
+    DeviceBuffer<std::int64_t> step(1);
+    DeviceBuffer<std::int64_t> position(1);
+    DeviceBuffer<std::int64_t> attention_length(1);
+    copy_to_device(device_logits, logits, stream.get());
+    copy_to_device(step, std::vector<std::int64_t>{0}, stream.get());
+    copy_to_device(position, std::vector<std::int64_t>{127}, stream.get());
+    copy_to_device(
+        attention_length, std::vector<std::int64_t>{128}, stream.get());
+
+    const auto argmax = [&] {
+        check_cuda(flux::greedy_argmax_cuda_fp32(
+            device_logits.get(), token.get(), vocabulary, stream.get()),
+            "benchmark greedy argmax launch");
+    };
+    argmax();
+    expect(copy_to_host(token, stream.get())[0] == 43117,
+        "benchmark greedy argmax correctness failed");
+    time_case(options, "greedy_argmax_49152", stream.get(), argmax);
+
+    const auto fused = [&] {
+        check_cuda(flux::greedy_argmax_update_cuda_fp32(
+            device_logits.get(), token.get(), generated.get(), step.get(), 1024,
+            position.get(), attention_length.get(), vocabulary, stream.get()),
+            "benchmark fused greedy update launch");
+    };
+    fused();
+    expect(copy_to_host(generated, stream.get())[0] == 43117,
+        "benchmark fused greedy update correctness failed");
+    time_case(options, "greedy_argmax_state_update_49152", stream.get(), fused);
 }
 
 void benchmark_residual_rmsnorm(const Options& options, Stream& stream) {
@@ -376,12 +415,16 @@ void benchmark_streaming_prefill_gqa(
     constexpr float scale = 0.125F;
     constexpr std::array<std::size_t, 10> lengths{
         128, 192, 256, 384, 448, 512, 1024, 2048, 4096, 8192};
-    constexpr std::array<flux::StreamingPrefillGQAVariant, 3> variants{
+    constexpr std::array<flux::StreamingPrefillGQAVariant, 5> variants{
         flux::StreamingPrefillGQAVariant::kQueryTile8,
         flux::StreamingPrefillGQAVariant::kQueryTile32,
-        flux::StreamingPrefillGQAVariant::kQueryTile128};
-    constexpr std::array<const char*, 3> names{
-        "query_tile_8", "query_tile_32", "query_tile_128"};
+        flux::StreamingPrefillGQAVariant::kQueryTile128,
+        flux::StreamingPrefillGQAVariant::kSplit2QueryTile128,
+        flux::StreamingPrefillGQAVariant::kSplit4QueryTile128};
+    constexpr std::array<const char*, 5> names{
+        "query_tile_8", "query_tile_32", "query_tile_128",
+        "split2_query_tile_128", "split4_query_tile_128",
+    };
     for (const std::size_t sequence : lengths) {
         std::vector<float> query(query_heads * sequence * dimension, 0.0F);
         std::vector<float> key = deterministic_values(
@@ -394,6 +437,12 @@ void benchmark_streaming_prefill_gqa(
         DeviceBuffer<float> d_key(key.size());
         DeviceBuffer<float> d_value(value.size());
         DeviceBuffer<float> d_output(query.size());
+        const std::size_t workspace_floats =
+            flux::streaming_prefill_gqa_workspace_bytes(
+                sequence,
+                flux::StreamingPrefillGQAVariant::kSplit4QueryTile128) /
+            sizeof(float);
+        DeviceBuffer<float> d_workspace(workspace_floats);
         copy_to_device(d_query, query, stream.get());
         copy_to_device(d_key, key, stream.get());
         copy_to_device(d_value, value, stream.get());
@@ -404,7 +453,8 @@ void benchmark_streaming_prefill_gqa(
             const auto operation = [&] {
                 check_cuda(flux::streaming_prefill_gqa_cuda_fp32(
                     d_query.get(), d_key.get(), d_value.get(), d_output.get(),
-                    scale, sequence, sequence, variants[index], stream.get()),
+                    d_workspace.get(), scale, sequence, sequence,
+                    variants[index], stream.get()),
                     "benchmark streaming prefill GQA launch");
             };
             operation();
@@ -483,6 +533,7 @@ int main(int argc, char** argv) {
                   << ", samples=" << options.samples << "\n";
         Stream stream;
         benchmark_rmsnorm(options, stream);
+        benchmark_greedy_generation(options, stream);
         benchmark_residual_rmsnorm(options, stream);
         benchmark_softmax(options, stream);
         benchmark_attention_softmax(options, stream);

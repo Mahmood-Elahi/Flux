@@ -284,11 +284,16 @@ void run_case(
     DeviceBuffer<float> d_key(key.size());
     DeviceBuffer<float> d_value(value.size());
     DeviceBuffer<float> d_output(expected.size());
+    const std::size_t workspace_floats =
+        flux::streaming_prefill_gqa_workspace_bytes(sequence, variant) /
+        sizeof(float);
+    DeviceBuffer<float> d_workspace(std::max<std::size_t>(workspace_floats, 1));
     copy_to_device(d_query, query, stream.get());
     copy_to_device(d_key, key, stream.get());
     copy_to_device(d_value, value, stream.get());
     check_cuda(flux::streaming_prefill_gqa_cuda_fp32(
-        d_query.get(), d_key.get(), d_value.get(), d_output.get(), kScale,
+        d_query.get(), d_key.get(), d_value.get(), d_output.get(),
+        workspace_floats == 0 ? nullptr : d_workspace.get(), kScale,
         sequence, capacity, variant, stream.get()),
         "streaming prefill GQA launch");
     const std::vector<float> actual = copy_to_host(d_output, stream.get());
@@ -311,6 +316,11 @@ void test_small_and_boundary_lengths(Stream& stream) {
              flux::StreamingPrefillGQAVariant::kQueryTile128}) {
         run_case(65, 79, variant, true, stream);
     }
+    for (const auto variant : {
+             flux::StreamingPrefillGQAVariant::kSplit2QueryTile128,
+             flux::StreamingPrefillGQAVariant::kSplit4QueryTile128}) {
+        run_case(65, 79, variant, true, stream);
+    }
 }
 
 void test_production_lengths(Stream& stream) {
@@ -324,7 +334,8 @@ void test_production_lengths(Stream& stream) {
 }
 
 void test_repeated_deterministic_and_allocation_free(Stream& stream) {
-    constexpr std::size_t sequence = 129;
+    constexpr std::size_t sequence = 2048;
+    const auto variant = flux::select_streaming_prefill_gqa_variant(sequence);
     std::vector<float> query = deterministic_values(
         kQueryHeads * sequence * kHeadDimension, 0.25F, 0.0F, 901);
     std::vector<float> key = deterministic_values(
@@ -336,22 +347,25 @@ void test_repeated_deterministic_and_allocation_free(Stream& stream) {
     DeviceBuffer<float> d_value(value.size());
     DeviceBuffer<float> d_output_a(query.size());
     DeviceBuffer<float> d_output_b(query.size());
+    DeviceBuffer<float> d_workspace(
+        flux::streaming_prefill_gqa_workspace_bytes(sequence, variant) /
+        sizeof(float));
     copy_to_device(d_query, query, stream.get());
     copy_to_device(d_key, key, stream.get());
     copy_to_device(d_value, value, stream.get());
     check_cuda(flux::streaming_prefill_gqa_cuda_fp32(
-        d_query.get(), d_key.get(), d_value.get(), d_output_a.get(), kScale,
-        sequence, sequence, flux::select_streaming_prefill_gqa_variant(sequence),
-        stream.get()), "first repeated streaming launch");
+        d_query.get(), d_key.get(), d_value.get(), d_output_a.get(),
+        d_workspace.get(), kScale, sequence, sequence, variant, stream.get()),
+        "first repeated streaming launch");
     stream.synchronize();
     std::size_t free_before = 0;
     std::size_t total_before = 0;
     check_cuda(cudaMemGetInfo(&free_before, &total_before),
                "cudaMemGetInfo before repeated invocation");
     check_cuda(flux::streaming_prefill_gqa_cuda_fp32(
-        d_query.get(), d_key.get(), d_value.get(), d_output_b.get(), kScale,
-        sequence, sequence, flux::select_streaming_prefill_gqa_variant(sequence),
-        stream.get()), "second repeated streaming launch");
+        d_query.get(), d_key.get(), d_value.get(), d_output_b.get(),
+        d_workspace.get(), kScale, sequence, sequence, variant, stream.get()),
+        "second repeated streaming launch");
     stream.synchronize();
     std::size_t free_after = 0;
     std::size_t total_after = 0;
@@ -390,6 +404,12 @@ void test_retained_path_comparison(Stream& stream) {
         DeviceBuffer<float> d_streaming(query.size());
         DeviceBuffer<float> d_retained(query.size());
         DeviceBuffer<float> d_scores(kQueryHeads * sequence * sequence);
+        const auto variant = flux::select_streaming_prefill_gqa_variant(sequence);
+        const std::size_t workspace_floats =
+            flux::streaming_prefill_gqa_workspace_bytes(sequence, variant) /
+            sizeof(float);
+        DeviceBuffer<float> d_workspace(
+            std::max<std::size_t>(workspace_floats, 1));
         copy_to_device(d_query, query, stream.get());
         copy_to_device(d_key, key, stream.get());
         copy_to_device(d_value, value, stream.get());
@@ -398,8 +418,8 @@ void test_retained_path_comparison(Stream& stream) {
             d_retained.get(), sequence, stream.get());
         check_cuda(flux::streaming_prefill_gqa_cuda_fp32(
             d_query.get(), d_key.get(), d_value.get(), d_streaming.get(),
-            kScale, sequence, sequence,
-            flux::select_streaming_prefill_gqa_variant(sequence), stream.get()),
+            workspace_floats == 0 ? nullptr : d_workspace.get(), kScale,
+            sequence, sequence, variant, stream.get()),
             "retained-path comparison streaming launch");
         const std::vector<float> expected =
             copy_to_host(d_retained, stream.get());
@@ -416,8 +436,8 @@ void test_retained_path_comparison(Stream& stream) {
         const float streaming_ms = median_cuda_ms(stream.get(), [&] {
             check_cuda(flux::streaming_prefill_gqa_cuda_fp32(
                 d_query.get(), d_key.get(), d_value.get(), d_streaming.get(),
-                kScale, sequence, sequence,
-                flux::select_streaming_prefill_gqa_variant(sequence),
+                workspace_floats == 0 ? nullptr : d_workspace.get(), kScale,
+                sequence, sequence, variant,
                 stream.get()), "timed streaming launch");
         });
         std::cout << "  retained comparison length " << sequence
@@ -432,30 +452,31 @@ void test_retained_path_comparison(Stream& stream) {
 void test_invalid_arguments(Stream& stream) {
     DeviceBuffer<float> buffer(kQueryHeads * kHeadDimension);
     expect(flux::streaming_prefill_gqa_cuda_fp32(
-               nullptr, buffer.get(), buffer.get(), buffer.get(), kScale,
+               nullptr, buffer.get(), buffer.get(), buffer.get(), nullptr, kScale,
                1, 1, flux::StreamingPrefillGQAVariant::kQueryTile8,
                stream.get()) == cudaErrorInvalidValue,
            "null query was accepted");
     expect(flux::streaming_prefill_gqa_cuda_fp32(
-               buffer.get(), buffer.get(), buffer.get(), buffer.get(), kScale,
+               buffer.get(), buffer.get(), buffer.get(), buffer.get(), nullptr, kScale,
                0, 1, flux::StreamingPrefillGQAVariant::kQueryTile8,
                stream.get()) == cudaErrorInvalidValue,
            "zero sequence length was accepted");
     expect(flux::streaming_prefill_gqa_cuda_fp32(
-               buffer.get(), buffer.get(), buffer.get(), buffer.get(), kScale,
+               buffer.get(), buffer.get(), buffer.get(), buffer.get(), nullptr, kScale,
                2, 1, flux::StreamingPrefillGQAVariant::kQueryTile8,
                stream.get()) == cudaErrorInvalidValue,
            "sequence longer than capacity was accepted");
     expect(flux::streaming_prefill_gqa_cuda_fp32(
-               buffer.get(), buffer.get(), buffer.get(), buffer.get(),
+               buffer.get(), buffer.get(), buffer.get(), buffer.get(), nullptr,
                std::numeric_limits<float>::infinity(), 1, 1,
                flux::StreamingPrefillGQAVariant::kQueryTile8,
                stream.get()) == cudaErrorInvalidValue,
            "non-finite scale was accepted");
-    expect(flux::streaming_prefill_gqa_workspace_bytes(8192) == 0,
+    expect(flux::streaming_prefill_gqa_workspace_bytes(
+               8192, flux::StreamingPrefillGQAVariant::kQueryTile128) == 0,
            "streaming attention unexpectedly requires workspace");
     expect(flux::streaming_prefill_gqa_cuda_fp32(
-               buffer.get(), buffer.get(), buffer.get(), buffer.get(), kScale,
+               buffer.get(), buffer.get(), buffer.get(), buffer.get(), nullptr, kScale,
                1, 1, static_cast<flux::StreamingPrefillGQAVariant>(99),
                stream.get()) == cudaErrorInvalidValue,
            "unknown streaming attention variant was accepted");
@@ -466,8 +487,28 @@ void test_invalid_arguments(Stream& stream) {
            flux::select_streaming_prefill_gqa_variant(384) ==
                flux::StreamingPrefillGQAVariant::kQueryTile32 &&
            flux::select_streaming_prefill_gqa_variant(385) ==
-               flux::StreamingPrefillGQAVariant::kQueryTile128,
+               flux::StreamingPrefillGQAVariant::kSplit4QueryTile128 &&
+           flux::select_streaming_prefill_gqa_variant(1024) ==
+               flux::StreamingPrefillGQAVariant::kSplit4QueryTile128 &&
+           flux::select_streaming_prefill_gqa_variant(1025) ==
+               flux::StreamingPrefillGQAVariant::kSplit2QueryTile128 &&
+           flux::select_streaming_prefill_gqa_variant(2048) ==
+               flux::StreamingPrefillGQAVariant::kSplit2QueryTile128 &&
+           flux::select_streaming_prefill_gqa_variant(4096) ==
+               flux::StreamingPrefillGQAVariant::kSplit2QueryTile128 &&
+           flux::select_streaming_prefill_gqa_variant(4097) ==
+               flux::StreamingPrefillGQAVariant::kSplit4QueryTile128,
            "streaming attention dispatcher thresholds changed");
+    expect(flux::streaming_prefill_gqa_workspace_bytes(
+               2048, flux::StreamingPrefillGQAVariant::kSplit2QueryTile128) ==
+               9732096 &&
+           flux::streaming_prefill_gqa_workspace_bytes(
+               4096, flux::StreamingPrefillGQAVariant::kSplit2QueryTile128) ==
+               19464192 &&
+           flux::streaming_prefill_gqa_workspace_bytes(
+               8192, flux::StreamingPrefillGQAVariant::kSplit4QueryTile128) ==
+               77856768,
+           "split streaming attention workspace accounting changed");
 }
 
 }  // namespace

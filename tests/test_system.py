@@ -465,6 +465,33 @@ def test_native_multitoken_greedy_generation_matches_hf_exactly() -> None:
             use_cache=True,
             pad_token_id=0,
         )
-        actual = native_smollm2_greedy_generate(flux, input_ids, max_new_tokens=8)
+        python_runtime = NativeSmolLM2Prefill.capture(
+            flux, input_ids, max_decode_steps=7
+        )
+        token = python_runtime.logits.argmax(dim=-1)
+        python_tokens = [input_ids, token]
+        for _ in range(7):
+            token = python_runtime.replay(token).argmax(dim=-1)
+            python_tokens.append(token)
+        python_orchestrated = torch.cat(python_tokens, dim=-1)
+
+        native = NativeSmolLM2Prefill.capture(flux, input_ids, max_decode_steps=7)
+        addresses = native.stable_addresses()
+        generated = native.generate_greedy(8)
+        actual = torch.cat((input_ids, generated), dim=-1)
     assert actual.shape == (1, 15)
+    assert python_orchestrated.equal(expected)
     assert actual.equal(expected)
+    assert generated[:, :1].equal(native.prefill_logits.argmax(dim=-1))
+    assert native.cache_position == input_ids.shape[1] + 7
+    assert native.cache_length == input_ids.shape[1] + 7
+    assert native.generation_step == 8
+    assert native.stable_addresses() == addresses
+    with pytest.raises(RuntimeError, match="prefill or reset"):
+        native.generate_greedy(1)
+
+    with torch.inference_mode():
+        native.prefill(input_ids)
+        repeated = native.generate_greedy(8).clone()
+    assert repeated.equal(expected[:, input_ids.shape[1] :])
+    assert native.stable_addresses() == addresses

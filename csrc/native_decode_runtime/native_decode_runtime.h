@@ -78,6 +78,7 @@ public:
     ~NativeSmolLM2Decode() override;
 
     at::Tensor replay(const c10::optional<at::Tensor>& token);
+    at::Tensor generate_greedy(std::int64_t decode_steps);
     void reset(
         const at::Tensor& token,
         const std::vector<at::Tensor>& key_caches,
@@ -85,6 +86,9 @@ public:
         std::int64_t position);
 
     at::Tensor logits() const;
+    at::Tensor current_token() const;
+    at::Tensor generated_tokens() const;
+    at::Tensor device_generation_step() const;
     at::Tensor key_cache() const;
     at::Tensor value_cache() const;
     at::Tensor device_position() const;
@@ -95,6 +99,7 @@ public:
     std::int64_t cache_length();
     std::int64_t capacity() const;
     std::int64_t replay_count() const;
+    std::int64_t generation_step();
     std::int64_t workspace_bytes() const;
     std::int64_t stable_buffer_bytes() const;
     std::int64_t vocabulary_size() const;

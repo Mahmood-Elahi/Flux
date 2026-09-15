@@ -101,6 +101,7 @@ class GenerationResult:
     decode_ms: float
     total_execution_ms: float
     total_observed_ms: float
+    average_decode_token_ms: float
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--audit-replays", type=int, default=10)
     parser.add_argument("--skip-generation", action="store_true")
     parser.add_argument("--skip-audit", action="store_true")
+    parser.add_argument(
+        "--report-cache-drift",
+        action="store_true",
+        help=("report known reordered long-context cache deltas without applying "
+              "the cache assertion; logit and greedy checks remain enforced"),
+    )
     parser.add_argument(
         "--decode-contexts",
         type=parse_positive_int_list,
@@ -248,9 +255,12 @@ def _input_ids(length: int, vocab_size: int) -> torch.Tensor:
     return deterministic_input_ids(length, vocab_size)
 
 
-def _max_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+def _max_error(
+    actual: torch.Tensor, expected: torch.Tensor, *, assert_close: bool = True
+) -> float:
     result = float((actual - expected).abs().max().item())
-    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+    if assert_close:
+        torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
     return result
 
 
@@ -292,6 +302,7 @@ def _benchmark_prefill(
     warmup: int,
     samples: int,
     rounds: int,
+    report_cache_drift: bool = False,
 ) -> PrefillResult:
     maximum = _prefill_correctness(reference, flux, length)
     input_ids = _input_ids(length, reference.config.vocab_size)
@@ -304,11 +315,13 @@ def _benchmark_prefill(
     for layer_index, layer in enumerate(flux_output.past_key_values.layers):
         max_key_error = max(
             max_key_error,
-            _max_error(native.key_cache[layer_index, ..., :length, :], layer.keys),
+            _max_error(native.key_cache[layer_index, ..., :length, :], layer.keys,
+                       assert_close=not report_cache_drift),
         )
         max_value_error = max(
             max_value_error,
-            _max_error(native.value_cache[layer_index, ..., :length, :], layer.values),
+            _max_error(native.value_cache[layer_index, ..., :length, :], layer.values,
+                       assert_close=not report_cache_drift),
         )
     if native.cache_position != length or native.cache_length != length:
         raise AssertionError("native prefill cache position or length is incorrect")
@@ -379,6 +392,7 @@ def _validate_decode(
     flux: torch.nn.Module,
     effective_length: int,
     tokens: int,
+    report_cache_drift: bool = False,
 ) -> CorrectnessResult:
     steps = min(tokens, effective_length - 1)
     prompt_length = effective_length - steps
@@ -444,8 +458,14 @@ def _validate_decode(
                 value_error = float(
                     (flux_layer.values - reference_layer.values).abs().max().item()
                 )
-                native_key_error = _max_error(native_keys, flux_layer.keys)
-                native_value_error = _max_error(native_values, flux_layer.values)
+                native_key_error = _max_error(
+                    native_keys, flux_layer.keys,
+                    assert_close=not report_cache_drift,
+                )
+                native_value_error = _max_error(
+                    native_values, flux_layer.values,
+                    assert_close=not report_cache_drift,
+                )
                 max_key = max(max_key, key_error, native_key_error)
                 max_value = max(max_value, value_error, native_value_error)
                 expected_shape = reference_layer.keys.shape
@@ -633,6 +653,64 @@ def _generation_native_once(
     return result
 
 
+def _generation_device_native_once(
+    model: torch.nn.Module, prompt: torch.Tensor, output_tokens: int
+) -> tuple[float, float, float]:
+    setup_start = time.perf_counter()
+    native = NativeSmolLM2Prefill.capture(
+        model, prompt, max_decode_steps=output_tokens - 1
+    )
+    torch.cuda.synchronize()
+    setup_ms = (time.perf_counter() - setup_start) * 1000.0
+    prefill_ms, _ = _event_sample(lambda: native.prefill(prompt))
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    native.generate_greedy(output_tokens)
+    end.record()
+    end.synchronize()
+    result = (prefill_ms, setup_ms, start.elapsed_time(end))
+    del native
+    return result
+
+
+def _validate_generation_paths(
+    reference: torch.nn.Module,
+    flux: torch.nn.Module,
+    prompt: torch.Tensor,
+    output_tokens: int,
+) -> None:
+    with torch.inference_mode():
+        expected = reference.generate(
+            input_ids=prompt,
+            do_sample=False,
+            num_beams=1,
+            max_new_tokens=output_tokens,
+            use_cache=True,
+            pad_token_id=0,
+        )
+        python_runtime = NativeSmolLM2Prefill.capture(
+            flux, prompt, max_decode_steps=output_tokens - 1
+        )
+        token = python_runtime.logits.argmax(dim=-1)
+        python_tokens = [prompt, token]
+        for _ in range(output_tokens - 1):
+            token = python_runtime.replay(token).argmax(dim=-1)
+            python_tokens.append(token)
+        python_result = torch.cat(python_tokens, dim=-1)
+
+        device_runtime = NativeSmolLM2Prefill.capture(
+            flux, prompt, max_decode_steps=output_tokens - 1
+        )
+        device_result = torch.cat(
+            (prompt, device_runtime.generate_greedy(output_tokens)), dim=-1
+        )
+    if not python_result.equal(expected):
+        raise AssertionError("Python-orchestrated native generation differs from HF")
+    if not device_result.equal(expected):
+        raise AssertionError("device-resident native generation differs from HF")
+
+
 def _benchmark_generation(
     reference: torch.nn.Module,
     flux: torch.nn.Module,
@@ -640,27 +718,31 @@ def _benchmark_generation(
     output_tokens: int,
     repetitions: int,
 ) -> list[GenerationResult]:
+    prompt = _input_ids(prompt_length, reference.config.vocab_size)
+    _validate_generation_paths(reference, flux, prompt, output_tokens)
+    del prompt
     samples: dict[str, list[tuple[float, float, float]]] = {
-        "reference": [],
-        "Flux eager": [],
-        "native": [],
+        "Hugging Face": [],
+        "native Python": [],
+        "native device": [],
     }
     paths = tuple(samples)
     for repetition in range(repetitions):
         order = paths[repetition % 3 :] + paths[: repetition % 3]
         for name in order:
             prompt = _input_ids(prompt_length, reference.config.vocab_size)
-            if name == "reference":
+            if name == "Hugging Face":
                 prefill, decode = _generation_eager_once(
                     reference, prompt, output_tokens
                 )
                 samples[name].append((prefill, prefill, decode))
-            elif name == "Flux eager":
-                prefill, decode = _generation_eager_once(flux, prompt, output_tokens)
-                samples[name].append((prefill, prefill, decode))
-            else:
+            elif name == "native Python":
                 samples[name].append(
                     _generation_native_once(flux, prompt, output_tokens)
+                )
+            else:
+                samples[name].append(
+                    _generation_device_native_once(flux, prompt, output_tokens)
                 )
             del prompt
     results = []
@@ -678,6 +760,7 @@ def _benchmark_generation(
                 decode,
                 prefill + decode,
                 ttft + decode,
+                decode / max(output_tokens - 1, 1),
             )
         )
     return results
@@ -822,12 +905,14 @@ def _print_results(
         print("\nGeneration (CUDA-event execution; native observed total includes setup)")
         print(
             f"{'prompt':>7} {'path':>11} {'prefill':>10} {'TTFT':>10} "
-            f"{'decode':>10} {'total exec':>11} {'total seen':>11} {'gen tok/s':>10}"
+            f"{'decode':>10} {'ms/token':>10} {'total exec':>11} "
+            f"{'total seen':>11} {'gen tok/s':>10}"
         )
         for item in generation:
             print(
                 f"{item.prompt_length:>7} {item.path:>11} {item.prefill_ms:>10.3f} "
                 f"{item.ttft_ms:>10.3f} {item.decode_ms:>10.3f} "
+                f"{item.average_decode_token_ms:>10.4f} "
                 f"{item.total_execution_ms:>11.3f} {item.total_observed_ms:>11.3f} "
                 f"{1000 * item.output_tokens / item.total_observed_ms:>10.2f}"
             )
@@ -867,7 +952,7 @@ def _owner(name: str) -> str:
     return 'framework CUDA'
 
 def _short_name(name: str) -> str:
-    for marker, short in (('streaming_prefill', 'streaming prefill GQA'), ('gqa_decode_attention_grouped_chunk', 'decode GQA grouped chunk'), ('gqa_decode_attention_reduce', 'decode GQA reduce'), ('packed_gate_up_swiglu', 'fused gate/up + SwiGLU'), ('packed_qkv_rope_cache', 'packed QKV/RoPE/cache'), ('residual_rmsnorm', 'residual-RMSNorm'), ('rmsnorm', 'RMSNorm'), ('prepare_full_decode', 'decode state prepare'), ('advance_full_decode', 'decode state advance'), ('gemv', 'GEMV'), ('gemm', 'GEMM'), ('memcpy', 'CUDA memcpy'), ('memset', 'CUDA memset')):
+    for marker, short in (('merge_streaming_prefill', 'streaming prefill GQA merge'), ('split_streaming_prefill', 'streaming prefill GQA stage 1'), ('streaming_prefill', 'streaming prefill GQA'), ('gqa_decode_attention_grouped_chunk', 'decode GQA grouped chunk'), ('gqa_decode_attention_reduce', 'decode GQA reduce'), ('greedy_argmax', 'greedy argmax + state update'), ('packed_gate_up_swiglu', 'fused gate/up + SwiGLU'), ('packed_qkv_rope_cache', 'packed QKV/RoPE/cache'), ('residual_rmsnorm', 'residual-RMSNorm'), ('rmsnorm', 'RMSNorm'), ('prepare_full_decode', 'decode state prepare'), ('gemv', 'GEMV'), ('gemm', 'GEMM'), ('memcpy', 'CUDA memcpy'), ('memset', 'CUDA memset')):
         if marker in name.lower():
             return short
     return name if len(name) <= 100 else name[:97] + '...'
@@ -1013,7 +1098,8 @@ def main() -> int:
         for length in args.lengths:
             print(f"Validating effective length {length}...", flush=True)
             correctness.append(
-                _validate_decode(reference, flux, length, args.correctness_tokens)
+                _validate_decode(reference, flux, length, args.correctness_tokens,
+                                 args.report_cache_drift)
             )
             if args.mode in {"system", "prefill"}:
                 print(f"Benchmarking prefill length {length}...", flush=True)
@@ -1025,6 +1111,7 @@ def main() -> int:
                         args.warmup,
                         args.samples,
                         args.rounds,
+                        args.report_cache_drift,
                     )
                 )
             if args.mode in {"system", "decode"}:

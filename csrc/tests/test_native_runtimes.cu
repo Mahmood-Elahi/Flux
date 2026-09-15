@@ -1,5 +1,6 @@
 #include "cuda_test_utils.cuh"
 
+#include "greedy_generation_cuda.h"
 #include "native_decode_runtime.h"
 #include "native_prefill_runtime.h"
 
@@ -86,6 +87,33 @@ std::vector<at::Tensor> cache_sources(std::int64_t length) {
 void assert_all_zero(const at::Tensor& tensor, const char* name) {
     const float maximum = tensor.abs().max().item<float>();
     expect(maximum == 0.0F, std::string(name) + " was not exactly zero");
+}
+
+void test_argmax_matches_aten() {
+    constexpr std::int64_t vocabulary = 49152;
+    const c10::cuda::CUDAStream stream = c10::cuda::getStreamFromPool(false, 0);
+    const c10::cuda::CUDAStreamGuard stream_guard(stream);
+    const at::TensorOptions float_options = at::TensorOptions()
+        .device(at::kCUDA).dtype(at::kFloat).requires_grad(false);
+    const at::TensorOptions long_options = float_options.dtype(at::kLong);
+    std::vector<at::Tensor> cases{
+        at::randn({vocabulary}, float_options),
+        -at::rand({vocabulary}, float_options) * 1.0e20F,
+        at::full({vocabulary}, -100.0F, float_options)};
+    cases.back().index_put_({17}, 99.0F);
+    cases.back().index_put_({29}, 99.0F);
+    at::Tensor token = at::empty({1}, long_options);
+    for (const at::Tensor& logits : cases) {
+        const std::int64_t expected = at::argmax(logits).item<std::int64_t>();
+        for (int repetition = 0; repetition < 5; ++repetition) {
+            check_cuda(flux::greedy_argmax_cuda_fp32(
+                logits.const_data_ptr<float>(),
+                token.mutable_data_ptr<std::int64_t>(), vocabulary,
+                stream.stream()), "launch runtime-test greedy argmax");
+            expect(token.item<std::int64_t>() == expected,
+                "native greedy argmax differs from ATen");
+        }
+    }
 }
 
 void test_full_decode_runtime_on_non_default_stream() {
@@ -201,15 +229,32 @@ void test_prefill_handoff_and_reuse() {
     expect(runtime.addresses() == addresses,
            "prefill reuse changed a stable address");
 
-    const at::Tensor decode_logits = runtime.replay(c10::nullopt);
+    std::size_t generation_free_before = 0;
+    std::size_t generation_total_before = 0;
+    check_cuda(cudaMemGetInfo(&generation_free_before, &generation_total_before),
+               "cudaMemGetInfo before native generation");
+    const at::Tensor generated = runtime.generate_greedy(2);
     check_cuda(cudaStreamSynchronize(stream.stream()),
-               "synchronize prefill/decode handoff");
-    assert_all_zero(decode_logits, "prefill handoff decode logits");
+               "synchronize native greedy generation");
+    std::size_t generation_free_after = 0;
+    std::size_t generation_total_after = 0;
+    check_cuda(cudaMemGetInfo(&generation_free_after, &generation_total_after),
+               "cudaMemGetInfo after native generation");
+    expect(generation_free_before == generation_free_after &&
+               generation_total_before == generation_total_after,
+           "native generation changed device allocation state");
+    expect(generated.sizes() == at::IntArrayRef({1, 2}) &&
+               generated.eq(0).all().item<bool>(),
+           "native generation did not chain deterministic greedy tokens");
+    expect(runtime.generation_step() == 2,
+           "native generation step is incorrect");
     expect(runtime.position() == capacity && runtime.cache_length() == capacity,
            "prefill/decode handoff state did not advance");
+    expect(runtime.addresses() == addresses,
+           "native generation changed a stable address");
     bool exhausted = false;
     try {
-        runtime.replay(c10::nullopt);
+        runtime.generate_greedy(1);
     } catch (const c10::Error&) {
         exhausted = true;
     }
@@ -221,6 +266,7 @@ void test_prefill_handoff_and_reuse() {
 int main() {
     return flux::test::run("Flux native CUDA runtimes", [] {
         at::InferenceMode inference_guard;
+        test_argmax_matches_aten();
         test_full_decode_runtime_on_non_default_stream();
         test_prefill_handoff_and_reuse();
     });

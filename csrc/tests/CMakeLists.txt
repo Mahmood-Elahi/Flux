@@ -26,6 +26,7 @@ flux_add_cuda_test(
 flux_add_cuda_test(flux_test_softmax ../softmax/test_softmax_cuda.cu)
 flux_add_cuda_test(flux_test_transformer_ops test_transformer_ops.cu)
 flux_add_cuda_test(flux_test_decode_ops test_decode_ops.cu)
+flux_add_cuda_test(flux_test_greedy_generation test_greedy_generation.cu)
 flux_add_cuda_test(
     flux_test_streaming_prefill_gqa
     test_streaming_prefill_gqa.cu)

@@ -15,6 +15,8 @@ from flux.ops.native_rmsnorm import _try_load_native_library
 _ADDRESS_NAMES = (
     "input_token",
     "logits",
+    "generated_tokens",
+    "device_generation_step",
     "key_cache",
     "value_cache",
     "device_position",
@@ -176,6 +178,12 @@ class NativeSmolLM2Prefill:
         """Continue directly with one captured native decode step."""
         return self._native.replay(token)
 
+    def generate_greedy(self, max_new_tokens: int) -> torch.Tensor:
+        """Run the complete fixed-length greedy token loop in native code."""
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        return self._native.generate_greedy(max_new_tokens)
+
     @property
     def logits(self) -> torch.Tensor:
         return self._native.logits()
@@ -201,6 +209,18 @@ class NativeSmolLM2Prefill:
         return self._native.device_cache_length()
 
     @property
+    def current_token(self) -> torch.Tensor:
+        return self._native.current_token()
+
+    @property
+    def generated_tokens(self) -> torch.Tensor:
+        return self._native.generated_tokens()
+
+    @property
+    def device_generation_step(self) -> torch.Tensor:
+        return self._native.device_generation_step()
+
+    @property
     def cache_position(self) -> int:
         return int(self._native.position())
 
@@ -219,6 +239,10 @@ class NativeSmolLM2Prefill:
     @property
     def replay_count(self) -> int:
         return int(self._native.replay_count())
+
+    @property
+    def generation_step(self) -> int:
+        return int(self._native.generation_step())
 
     @property
     def memory(self) -> NativePrefillRuntimeMemory:
@@ -593,12 +617,8 @@ def native_smollm2_greedy_generate(
     runtime = NativeSmolLM2Prefill.capture(
         model, input_ids, max_decode_steps=max_new_tokens - 1
     )
-    token = runtime.logits.argmax(dim=-1)
-    generated = [input_ids, token]
-    for _ in range(max_new_tokens - 1):
-        token = runtime.replay(token).argmax(dim=-1)
-        generated.append(token)
-    return torch.cat(generated, dim=-1)
+    generated = runtime.generate_greedy(max_new_tokens)
+    return torch.cat((input_ids, generated), dim=-1)
 
 
 __all__ = [

@@ -1,5 +1,7 @@
 #include "native_prefill_runtime.h"
 
+#include "greedy_generation_cuda.h"
+
 #include "packed_swiglu_cuda.h"
 #include "residual_rmsnorm_cuda.h"
 #include "rmsnorm_cuda.h"
@@ -275,43 +277,6 @@ __global__ void residual_add_fp32_kernel(
     }
 }
 
-__global__ void argmax_logits_fp32_kernel(
-    const float* logits,
-    std::int64_t* token,
-    const std::int64_t vocabulary_size) {
-    __shared__ float values[kThreads];
-    __shared__ std::int64_t indices[kThreads];
-    float best = -FLT_MAX;
-    std::int64_t best_index = 0;
-    for (std::int64_t index = threadIdx.x; index < vocabulary_size;
-         index += blockDim.x) {
-        const float value = logits[index];
-        if (value > best || (value == best && index < best_index)) {
-            best = value;
-            best_index = index;
-        }
-    }
-    values[threadIdx.x] = best;
-    indices[threadIdx.x] = best_index;
-    __syncthreads();
-    for (int width = blockDim.x / 2; width > 0; width /= 2) {
-        if (threadIdx.x < width) {
-            const float other = values[threadIdx.x + width];
-            const std::int64_t other_index = indices[threadIdx.x + width];
-            if (other > values[threadIdx.x] ||
-                (other == values[threadIdx.x] &&
-                 other_index < indices[threadIdx.x])) {
-                values[threadIdx.x] = other;
-                indices[threadIdx.x] = other_index;
-            }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        token[0] = indices[0];
-    }
-}
-
 unsigned int blocks_for(const std::int64_t elements) {
     return static_cast<unsigned int>(
         std::min<std::int64_t>((elements + kThreads - 1) / kThreads, 65535));
@@ -523,11 +488,18 @@ public:
         const std::int64_t s = sequence_length_;
         const std::int64_t score_elements =
             use_bounded_legacy_attention(s) ? kQueryHeads * s * s : 0;
-        const std::array<std::int64_t, 12> sizes{
+        const StreamingPrefillGQAVariant attention_variant =
+            select_streaming_prefill_gqa_variant(s);
+        const std::int64_t streaming_attention_elements =
+            use_bounded_legacy_attention(s) ? 0 :
+            static_cast<std::int64_t>(streaming_prefill_gqa_workspace_bytes(
+                s, attention_variant) / sizeof(float));
+        const std::array<std::int64_t, 13> sizes{
             s * kHiddenSize, s * kHiddenSize, s * kHiddenSize,
             s * kHiddenSize, s * kPackedQKVWidth,
             s * kQueryHeads * kHeadDim,
-            s * kQueryHeads * kHeadDim, score_elements, s * kHiddenSize,
+            s * kQueryHeads * kHeadDim, streaming_attention_elements,
+            score_elements, s * kHiddenSize,
             s * kPackedGateUpWidth, s * kIntermediateSize,
             s * kHiddenSize};
         std::int64_t total = kHiddenSize;
@@ -550,6 +522,7 @@ public:
             .view({kQueryHeads, s, kHeadDim});
         attention_heads_ = take(s * kQueryHeads * kHeadDim)
             .view({kQueryHeads, s, kHeadDim});
+        streaming_attention_workspace_ = take(streaming_attention_elements);
         if (score_elements != 0) {
             attention_scores_ = take(score_elements)
                 .view({kQueryHeads, s, s});
@@ -626,6 +599,8 @@ public:
                 check_cuda(streaming_prefill_gqa_cuda_fp32(
                     query_output_.const_data_ptr<float>(), layer_keys,
                     layer_values, attention_heads_.mutable_data_ptr<float>(),
+                    streaming_attention_workspace_.numel() == 0 ? nullptr :
+                        streaming_attention_workspace_.mutable_data_ptr<float>(),
                     layer.attention_scale, sequence_length_, capacity_,
                     attention_variant, stream),
                     "launching streaming grouped-GQA attention");
@@ -683,10 +658,10 @@ public:
             lm_head_weight_.const_data_ptr<float>(),
             prefill_logits_.mutable_data_ptr<float>(), 1, kHiddenSize,
             vocabulary_size_, "launching LM head");
-        argmax_logits_fp32_kernel<<<1, kThreads, 0, stream>>>(
+        check_cuda(greedy_argmax_cuda_fp32(
             prefill_logits_.const_data_ptr<float>(),
-            initial_token_.mutable_data_ptr<std::int64_t>(), vocabulary_size_);
-        check_cuda(cudaGetLastError(), "launching prefill argmax");
+            initial_token_.mutable_data_ptr<std::int64_t>(), vocabulary_size_,
+            stream), "launching prefill argmax");
     }
 
     at::Device device_;
@@ -713,6 +688,7 @@ public:
     at::Tensor qkv_output_;
     at::Tensor query_output_;
     at::Tensor attention_heads_;
+    at::Tensor streaming_attention_workspace_;
     at::Tensor attention_scores_;
     at::Tensor attention_projection_;
     at::Tensor packed_gate_up_;
@@ -759,7 +735,26 @@ at::Tensor NativeSmolLM2Prefill::replay(
     return impl_->decode_->replay(token);
 }
 
+at::Tensor NativeSmolLM2Prefill::generate_greedy(
+    const std::int64_t max_new_tokens) {
+    TORCH_CHECK(max_new_tokens >= 1,
+        "flux native prefill: max_new_tokens must be positive");
+    TORCH_CHECK(max_new_tokens <= impl_->capacity_ - impl_->sequence_length_ + 1,
+        "flux native prefill: generation exceeds fixed cache capacity");
+    at::Tensor storage = impl_->decode_->generate_greedy(max_new_tokens - 1);
+    return storage.narrow(0, 0, max_new_tokens).view({1, max_new_tokens});
+}
+
 at::Tensor NativeSmolLM2Prefill::logits() const { return impl_->prefill_logits_; }
+at::Tensor NativeSmolLM2Prefill::current_token() const {
+    return impl_->decode_->current_token();
+}
+at::Tensor NativeSmolLM2Prefill::generated_tokens() const {
+    return impl_->decode_->generated_tokens();
+}
+at::Tensor NativeSmolLM2Prefill::device_generation_step() const {
+    return impl_->decode_->device_generation_step();
+}
 at::Tensor NativeSmolLM2Prefill::final_hidden() const { return impl_->final_hidden_; }
 at::Tensor NativeSmolLM2Prefill::key_cache() const { return impl_->decode_->key_cache(); }
 at::Tensor NativeSmolLM2Prefill::value_cache() const { return impl_->decode_->value_cache(); }
@@ -793,6 +788,9 @@ std::int64_t NativeSmolLM2Prefill::prompt_length() const {
 std::int64_t NativeSmolLM2Prefill::capacity() const { return impl_->capacity_; }
 std::int64_t NativeSmolLM2Prefill::replay_count() const {
     return impl_->decode_->replay_count();
+}
+std::int64_t NativeSmolLM2Prefill::generation_step() {
+    return impl_->decode_->generation_step();
 }
 std::int64_t NativeSmolLM2Prefill::workspace_bytes() const {
     return tensor_bytes(impl_->workspace_);

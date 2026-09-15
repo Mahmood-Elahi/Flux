@@ -27,9 +27,9 @@ It retains FP32 RMSNorm, fused residual-RMSNorm, RoPE, fused attention score
 processing/softmax, packed QKV and MLP storage, packed SwiGLU, native one-token
 GQA, fused packed-QKV/RoPE/StaticCache update, tuned zero-workspace cuBLASLt
 QKV/output projections, and fused gate/up GEMV+SwiGLU. Fixed-shape graph decode
-uses stable native-owned buffers, device-resident cache position/mask state, and
-unexpanded 3-head K/V storage; it never materializes `repeat_kv` in the
-optimized 513--8192-capacity path.
+uses stable native-owned buffers, device-resident cache position/mask and greedy
+generation state, and unexpanded 3-head K/V storage; it never materializes
+`repeat_kv` in the optimized 513--8192-capacity path.
 
 On the target RTX 5070 Ti, the native runtime measured 1.3991, 1.4569,
 1.6516, and 1.9163 ms/token at effective attention lengths 1024, 2048, 4096,
@@ -63,6 +63,8 @@ prefill runs all 30 layers, writes the compact cache directly into the attached
 token-to-logits CUDA Graph runtime, and returns stable final-token logits:
 
 ```python
+import torch
+
 from flux.runtime import NativeSmolLM2Prefill
 
 runtime = NativeSmolLM2Prefill.capture(
@@ -70,19 +72,26 @@ runtime = NativeSmolLM2Prefill.capture(
     prompt_ids,
     max_decode_steps=31,
 )
-token = runtime.logits.argmax(dim=-1)
-logits = runtime.replay(token)
+new_tokens = runtime.generate_greedy(32)
+generated_ids = torch.cat((prompt_ids, new_tokens), dim=-1)
 ```
 
 The native object owns all 30 compact K/V caches, prompt/decode workspaces,
-device position/cache length, stable logits, stream/event resources, and the
-decode graph. Prefill never constructs a Python cache, expands GQA K/V, or
-copies cache storage at handoff. Long-context prefill now uses tiled online
-softmax directly over compact three-head K/V, eliminating the former 2.25 GiB
-score matrix at length 8192 and reducing measured native prefill from 548.288
-ms to 283.349 ms on the target RTX 5070 Ti. A benchmark-selected fallback for
+device position/cache length, stable logits, current/generated-token storage,
+generation step, stream/event resources, and the decode graph. After prefill,
+fixed-length greedy generation is one native call: each replay selects the exact
+lowest-index maximum, appends it on device, and feeds it into the next replay
+without a Python per-token loop. EOS early termination is not part of this
+fixed-length contract. Prefill never constructs a Python cache, expands GQA K/V,
+or copies cache storage at handoff. Long-context prefill now uses split-context
+tiled online softmax directly over compact three-head K/V, eliminating the
+former 2.25 GiB score matrix at length 8192 and reducing measured native prefill
+from 281.631 ms to 254.368 ms over the previous streaming baseline on the target
+RTX 5070 Ti. A benchmark-selected fallback for
 lengths 129--1024 caps retained score storage at 36 MiB. See
 [the streaming prefill GQA milestone](docs/STREAMING_PREFILL_GQA_MILESTONE.md),
+[the long-context streaming GQA milestone](docs/LONG_CONTEXT_STREAMING_GQA_MILESTONE.md),
+[the native greedy-generation milestone](docs/NATIVE_GREEDY_GENERATION_MILESTONE.md),
 [the native prefill milestone](docs/NATIVE_PREFILL_RUNTIME_MILESTONE.md),
 [the full native decode milestone](docs/NATIVE_FULL_DECODE_RUNTIME_MILESTONE.md),
 and [runtime design](docs/NATIVE_DECODE_RUNTIME_DESIGN.md). Reproduce the

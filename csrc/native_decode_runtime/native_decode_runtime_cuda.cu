@@ -1,5 +1,7 @@
 #include "native_decode_runtime.h"
 
+#include "greedy_generation_cuda.h"
+
 #include "cublaslt_linear_cuda.h"
 #include "gqa_decode_attention_cuda.h"
 #include "packed_gate_up_gemv_cuda.h"
@@ -157,24 +159,6 @@ cudaError_t prepare_full_decode_fp32(
     prepare_full_decode_fp32_kernel<<<1, 256, 0, stream>>>(
         token, embedding, vocabulary_size, cos_table, sin_table, position,
         hidden, cos_row, sin_row, attention_length, capacity);
-    return cudaGetLastError();
-}
-
-__global__ void advance_full_decode_state_kernel(
-    std::int64_t* position,
-    const std::int64_t* attention_length) {
-    *position = *attention_length;
-}
-
-cudaError_t advance_full_decode_state(
-    std::int64_t* position,
-    const std::int64_t* attention_length,
-    cudaStream_t stream) {
-    if (position == nullptr || attention_length == nullptr || stream == nullptr) {
-        return cudaErrorInvalidValue;
-    }
-    advance_full_decode_state_kernel<<<1, 1, 0, stream>>>(
-        position, attention_length);
     return cudaGetLastError();
 }
 
@@ -946,6 +930,35 @@ public:
         return logits_;
     }
 
+    at::Tensor generate_greedy(const std::int64_t decode_steps) {
+        TORCH_CHECK(decode_steps >= 0,
+            "flux native full decode: generation step count must be non-negative");
+        TORCH_CHECK(decode_steps <=
+                capacity_ - current_start_position_ - replay_count_,
+            "flux native full decode: fixed-capacity generation is exhausted");
+        TORCH_CHECK(!generation_started_,
+            "flux native full decode: prefill or reset is required before reuse");
+        const c10::cuda::CUDAGuard device_guard(device_);
+        const cudaStream_t stream =
+            c10::cuda::getCurrentCUDAStream(device_index_).stream();
+        if (pending_) {
+            check_cuda(cudaStreamWaitEvent(stream, completion_event_, 0),
+                "ordering native greedy generation");
+        }
+        for (std::int64_t step = 0; step < decode_steps; ++step) {
+            check_cuda(cudaGraphLaunch(graph_exec_, stream),
+                "launching chained greedy decode graph");
+        }
+        if (decode_steps > 0) {
+            check_cuda(cudaEventRecord(completion_event_, stream),
+                "recording native greedy generation completion");
+            pending_ = true;
+            replay_count_ += decode_steps;
+        }
+        generation_started_ = true;
+        return generated_tokens_;
+    }
+
     void reset(
         const at::Tensor& token,
         const std::vector<at::Tensor>& key_caches,
@@ -964,6 +977,7 @@ public:
         check_cuda(cudaStreamSynchronize(stream), "resetting full runtime state");
         current_start_position_ = position;
         replay_count_ = 0;
+        generation_started_ = false;
     }
 
     void wait_for_prefill(cudaStream_t stream) {
@@ -993,10 +1007,22 @@ public:
             device_cache_length_.mutable_data_ptr<std::int64_t>(), &position,
             sizeof(position), cudaMemcpyHostToDevice, stream),
             "installing native prefill cache length");
+        check_cuda(cudaMemcpyAsync(
+            generated_tokens_.mutable_data_ptr<std::int64_t>(),
+            input_token_.const_data_ptr<std::int64_t>(), sizeof(std::int64_t),
+            cudaMemcpyDeviceToDevice, stream),
+            "seeding native generated-token buffer");
+        constexpr std::int64_t first_generation_step = 1;
+        check_cuda(cudaMemcpyAsync(
+            device_generation_step_.mutable_data_ptr<std::int64_t>(),
+            &first_generation_step, sizeof(first_generation_step),
+            cudaMemcpyHostToDevice, stream),
+            "seeding native generation step");
         check_cuda(cudaEventRecord(completion_event_, stream),
             "recording native prefill completion");
         current_start_position_ = position;
         replay_count_ = 0;
+        generation_started_ = false;
         pending_ = true;
     }
 
@@ -1059,10 +1085,16 @@ public:
             static_cast<int>(kHiddenSize), &beta,
             logits_.mutable_data_ptr<float>(),
             static_cast<int>(vocabulary_size_)), "launching production LM head");
-        check_cuda(advance_full_decode_state(
+        check_cuda(greedy_argmax_update_cuda_fp32(
+            logits_.const_data_ptr<float>(),
+            input_token_.mutable_data_ptr<std::int64_t>(),
+            generated_tokens_.mutable_data_ptr<std::int64_t>(),
+            device_generation_step_.mutable_data_ptr<std::int64_t>(),
+            generated_tokens_.numel(),
             device_position_.mutable_data_ptr<std::int64_t>(),
-            device_cache_length_.const_data_ptr<std::int64_t>(), stream),
-            "advancing full-runtime device state");
+            device_cache_length_.const_data_ptr<std::int64_t>(),
+            vocabulary_size_, stream),
+            "selecting greedy token and advancing device state");
     }
 
     void validate_weights_and_state(
@@ -1132,6 +1164,8 @@ public:
         input_token_ = at::empty({1, 1}, long_options);
         device_position_ = at::empty({}, long_options);
         device_cache_length_ = at::empty({}, long_options);
+        device_generation_step_ = at::empty({}, long_options);
+        generated_tokens_ = at::empty({capacity_}, long_options);
         logits_ = at::empty({1, 1, vocabulary_size_}, float_options);
         key_cache_ = at::empty(
             {static_cast<std::int64_t>(layers_.size()), 1, kKeyValueHeads,
@@ -1236,6 +1270,10 @@ public:
             device_cache_length_.mutable_data_ptr<std::int64_t>(), &position,
             sizeof(position), cudaMemcpyHostToDevice, stream),
             "initializing full-runtime cache length");
+        check_cuda(cudaMemsetAsync(
+            device_generation_step_.mutable_data_ptr<std::int64_t>(), 0,
+            sizeof(std::int64_t), stream),
+            "initializing full-runtime generation state");
         if (clear_outputs) {
             check_cuda(cudaMemsetAsync(
                 logits_.mutable_data_ptr<float>(), 0,
@@ -1256,6 +1294,7 @@ public:
     std::int64_t replay_count_ = 0;
     bool pending_ = false;
     bool capture_active_ = false;
+    bool generation_started_ = false;
 
     at::Tensor embedding_weight_;
     at::Tensor final_norm_weight_;
@@ -1265,6 +1304,8 @@ public:
     std::vector<NativeLayerDescriptor> layers_;
 
     at::Tensor input_token_;
+    at::Tensor generated_tokens_;
+    at::Tensor device_generation_step_;
     at::Tensor logits_;
     at::Tensor key_cache_;
     at::Tensor value_cache_;
@@ -1413,6 +1454,11 @@ at::Tensor NativeSmolLM2Decode::replay(
     return impl_->replay(token);
 }
 
+at::Tensor NativeSmolLM2Decode::generate_greedy(
+    const std::int64_t decode_steps) {
+    return impl_->generate_greedy(decode_steps);
+}
+
 void NativeSmolLM2Decode::reset(
     const at::Tensor& token,
     const std::vector<at::Tensor>& key_caches,
@@ -1422,6 +1468,15 @@ void NativeSmolLM2Decode::reset(
 }
 
 at::Tensor NativeSmolLM2Decode::logits() const { return impl_->logits_; }
+at::Tensor NativeSmolLM2Decode::current_token() const {
+    return impl_->input_token_;
+}
+at::Tensor NativeSmolLM2Decode::generated_tokens() const {
+    return impl_->generated_tokens_;
+}
+at::Tensor NativeSmolLM2Decode::device_generation_step() const {
+    return impl_->device_generation_step_;
+}
 at::Tensor NativeSmolLM2Decode::key_cache() const { return impl_->key_cache_; }
 at::Tensor NativeSmolLM2Decode::value_cache() const { return impl_->value_cache_; }
 at::Tensor NativeSmolLM2Decode::device_position() const {
@@ -1436,6 +1491,8 @@ std::vector<std::int64_t> NativeSmolLM2Decode::addresses() const {
     return {
         reinterpret_cast<std::int64_t>(impl_->input_token_.data_ptr()),
         reinterpret_cast<std::int64_t>(impl_->logits_.data_ptr()),
+        reinterpret_cast<std::int64_t>(impl_->generated_tokens_.data_ptr()),
+        reinterpret_cast<std::int64_t>(impl_->device_generation_step_.data_ptr()),
         reinterpret_cast<std::int64_t>(impl_->key_cache_.data_ptr()),
         reinterpret_cast<std::int64_t>(impl_->value_cache_.data_ptr()),
         reinterpret_cast<std::int64_t>(impl_->device_position_.data_ptr()),
@@ -1458,11 +1515,17 @@ std::int64_t NativeSmolLM2Decode::capacity() const { return impl_->capacity_; }
 std::int64_t NativeSmolLM2Decode::replay_count() const {
     return impl_->replay_count_;
 }
+std::int64_t NativeSmolLM2Decode::generation_step() {
+    return impl_->read_scalar(
+        impl_->device_generation_step_, "reading device generation step");
+}
 std::int64_t NativeSmolLM2Decode::workspace_bytes() const {
     return tensor_bytes(impl_->workspace_);
 }
 std::int64_t NativeSmolLM2Decode::stable_buffer_bytes() const {
     return tensor_bytes(impl_->input_token_) + tensor_bytes(impl_->logits_) +
+        tensor_bytes(impl_->generated_tokens_) +
+        tensor_bytes(impl_->device_generation_step_) +
         tensor_bytes(impl_->device_position_) +
         tensor_bytes(impl_->device_cache_length_);
 }

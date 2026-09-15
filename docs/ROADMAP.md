@@ -76,16 +76,30 @@ independent finish lines.
     classifying all remaining tests, removing the last duplicated low-level
     CUDA numerical cases, and folding detailed native-prefill validation and
     workspace reporting into the canonical final-system benchmark.
-33. **Next:** Reassess the integrated architecture only from measured native
-    prefill/decode profiles; do not add a subsystem or replace performant
-    library GEMMs for source-language accounting.
+33. **Completed:** Consolidate the remaining Python operator and system tests
+    around distinct integration responsibilities while preserving native CTest,
+    FakeTensor/opcheck, reference, and checkpoint-backed coverage.
+34. **Completed:** Retire the final duplicate Python benchmark harness, retain
+    one canonical five-mode system benchmark and profiler, and establish the
+    measured 261,662 B Python baseline without weakening validation.
+35. **Completed:** Move fixed-length greedy selection and token/state feedback
+    into the native CUDA Graph runtime, add an exact lowest-index FP32 argmax,
+    stable device generation storage, and a C++ graph replay loop, and validate
+    exact HF/Python-native/device-native sequences plus 16/32/64-token timing.
+36. **Completed:** Add benchmark-selected two-way and four-way split-context
+    streaming GQA with stable FP32 online-softmax partial merging and bounded
+    linear workspace; retain the numerically safer two-way 4096 path, improve
+    complete native prefill at 2048/4096/8192, and preserve compact K/V and
+    decode behavior.
+37. **Next:** Reassess the retained split-context stage-1 register footprint and
+    work distribution at 4096/8192; do not optimize the small merge stage or
+    replace performant library GEMMs without new integrated evidence.
 
-Milestone 32 source totals are Python 325,056 B, CUDA 306,421 B, C++ 132,894 B,
-and headers 16,553 B. CUDA is 39.238261% of these sources and remains 168,082 B
-short of equal CUDA/non-CUDA bytes under the required exact metric. This pass
-removes another 17,461 Python bytes by consolidating the last separate prefill
-benchmark without padding, duplication, a Linguist override, or loss of the
-independent Python integration oracle.
+Milestone 35 source totals are Python 266,084 B, CUDA 321,764 B, C++ 133,693 B,
+and headers 17,810 B. CUDA is 43.519790% of these sources and remains 95,823 B
+short of equal CUDA/non-CUDA bytes under the required exact metric. The added
+native source implements the device-resident generation boundary and its direct
+tests/benchmarks without padding, duplication, or language reclassification.
 
 The operator-optimization roadmap through milestone 24 is complete. The final
 native-runtime phase continues the same integrated codebase; rejected experiments

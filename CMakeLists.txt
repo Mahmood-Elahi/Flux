@@ -24,6 +24,7 @@ add_library(flux_cuda_kernels STATIC
     csrc/packed_swiglu/packed_swiglu_cuda.cu
     csrc/packed_qkv_rope_cache/packed_qkv_rope_cache_cuda.cu
     csrc/gqa_decode_attention/gqa_decode_attention_cuda.cu
+    csrc/greedy_generation/greedy_generation_cuda.cu
     csrc/streaming_prefill_gqa/streaming_prefill_gqa_cuda.cu
     csrc/packed_gate_up_gemv/packed_gate_up_gemv_cuda.cu)
 target_include_directories(flux_cuda_kernels PUBLIC
@@ -35,6 +36,7 @@ target_include_directories(flux_cuda_kernels PUBLIC
     csrc/packed_swiglu
     csrc/packed_qkv_rope_cache
     csrc/gqa_decode_attention
+    csrc/greedy_generation
     csrc/streaming_prefill_gqa
     csrc/packed_gate_up_gemv)
 set_target_properties(flux_cuda_kernels PROPERTIES

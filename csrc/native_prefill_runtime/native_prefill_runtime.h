@@ -33,7 +33,11 @@ public:
 
     at::Tensor prefill(const at::Tensor& input_ids);
     at::Tensor replay(const c10::optional<at::Tensor>& token);
+    at::Tensor generate_greedy(std::int64_t max_new_tokens);
     at::Tensor logits() const;
+    at::Tensor current_token() const;
+    at::Tensor generated_tokens() const;
+    at::Tensor device_generation_step() const;
     at::Tensor final_hidden() const;
     at::Tensor key_cache() const;
     at::Tensor value_cache() const;
@@ -45,6 +49,7 @@ public:
     std::int64_t prompt_length() const;
     std::int64_t capacity() const;
     std::int64_t replay_count() const;
+    std::int64_t generation_step();
     std::int64_t workspace_bytes() const;
     std::int64_t cache_bytes() const;
     std::int64_t stable_buffer_bytes() const;
