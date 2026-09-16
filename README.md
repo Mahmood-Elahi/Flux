@@ -1,424 +1,392 @@
 # Flux
 
-Flux is an integrated FP32 CUDA inference path for
-**SmolLM2-135M**. It combines explicit PyTorch model adapters with custom
-C++/CUDA operators, packed checkpoint-compatible projections, native prompt
-prefill, and fixed-shape native CUDA-Graph decode. The
-ordinary pinned Hugging Face/PyTorch model remains unchanged as the numerical
-and performance reference; Flux is enabled only on the model instance passed
-to `enable_flux_ops` and never monkey-patches Transformers globally.
+[![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus\&logoColor=white)](https://isocpp.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-13.2-76B900?logo=nvidia\&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python\&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.14-EE4C2C?logo=pytorch\&logoColor=white)](https://pytorch.org/)
 
-## Final integrated system
+Flux is a PyTorch integrated CUDA inference optimization engine for [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M). It starts from the standard PyTorch implementation and selectively replaces expensive operations with custom CUDA kernels and native C++ paths to reduce memory traffic, kernel launches, tensor allocations, and runtime overhead. Flux uses compact KV caching, native prefill, CUDA Graph decode, and device resident generation while validating every optimization against the original FP32 model.
 
-The canonical production category set is exported as
-`FINAL_FLUX_OPERATOR_CATEGORIES`:
+[Core Features](#core-features) ·
+[Architecture](#architecture) ·
+[Metrics](#metrics) ·
+[Technical Highlights](#technical-highlights) ·
+[Validation](#correctness-and-validation) ·
+[Setup](#setup-and-build) ·
+[Running Flux](#running-flux) ·
+[Future Work](#future-work)
 
-```python
-from flux.model import FINAL_FLUX_OPERATOR_CATEGORIES, enable_flux_ops
+## Core Features
 
-model = enable_flux_ops(
-    model,
-    operators=FINAL_FLUX_OPERATOR_CATEGORIES,
-    fuse_attention_scores=True,
-)
+* Custom fused CUDA kernels for RMSNorm, RoPE, attention processing, cache updates, and SwiGLU to reduce kernel launches, intermediate tensors, and memory traffic.
+* Checkpoint-compatible packed QKV and MLP paths with direct compact KV-cache updates and no expanded K/V materialization during one-token GQA decode.
+* Tiled online-softmax native prefill with bounded long-context workspace, avoiding the large attention-score materialization used by the original path.
+* Fixed-shape CUDA Graph decode with stable device addresses and device-resident generation state, removing per-token Python participation.
+* Native C++ fixed-length replay for low-latency generation, with greedy token selection and feedback performed directly on the GPU.
+* Nsight Systems and Nsight Compute profiling used to analyze register pressure, occupancy, dependency latency, memory behavior, and kernel-launch overhead.
+
+
+## Architecture
+
+```text
+Hugging Face SmolLM2-135M checkpoint
+                  |
+                  v
+        PyTorch / Flux integration
+                  |
+        +---------+----------------------------+
+        |                                      |
+        v                                      v
+custom C++/CUDA operators                 native prefill
+  |-- RMSNorm / residual RMSNorm               |
+  |-- packed QKV + RoPE                         v
+  |-- compact cache update              compact StaticCache
+  |-- one-token GQA attention                   |
+  `-- fused gate/up + SwiGLU                    v
+                                         CUDA Graph decode
+                                                |
+                                                v
+                                    device-resident greedy state
+                                                |
+                                                v
+                                      native C++ replay loop
+                                                |
+                                                v
+                                         generated tokens
 ```
 
-It retains FP32 RMSNorm, fused residual-RMSNorm, RoPE, fused attention score
-processing/softmax, packed QKV and MLP storage, packed SwiGLU, native one-token
-GQA, fused packed-QKV/RoPE/StaticCache update, tuned zero-workspace cuBLASLt
-QKV/output projections, and fused gate/up GEMV+SwiGLU. Fixed-shape graph decode
-uses stable native-owned buffers, device-resident cache position/mask and greedy
-generation state, and unexpanded 3-head K/V storage; it never materializes
-`repeat_kv` in the optimized 513--8192-capacity path.
+`enable_flux_ops` changes only the model instance passed to it; Flux does not globally monkey-patch Transformers. Standard checkpoint keys remain intact while packed runtime layouts remove redundant projections and intermediate tensors.
 
-On the target RTX 5070 Ti, the native runtime measured 1.3991, 1.4569,
-1.6516, and 1.9163 ms/token at effective attention lengths 1024, 2048, 4096,
-and 8192. A replay contains 304 GPU launches, grows PyTorch-allocated memory by
-zero bytes, preserves all stable addresses, and has no framework GPU launches.
-Pinned Hugging Face, Flux eager, and native greedy tokens matched through every
-tested continuation under the established FP32 tolerance.
+For the fully native path, prompt token IDs enter a 30-layer FP32 prefill runtime that writes compact K/V directly into the decode runtime's cache. The handoff does not construct a Python cache, expand grouped K/V, or copy cache storage.
 
-Rebuild, validate, and reproduce the final matrix with:
+Decode then replays a captured token-to-logits CUDA Graph whose buffers, cache position, mask, logits, current token, and generated-token storage remain at stable addresses.
+
+The graph performs exact lowest-index greedy selection and feeds the selected token into the next step. A single C++ call submits the requested fixed number of graph replays, removing Python work from the per-token execution path.
+
+## Metrics
+
+Final measurements used:
+
+* NVIDIA GeForce RTX 5070 Ti (`sm_120`)
+* Python 3.11.9
+* PyTorch 2.14.0+cu132
+* CUDA Toolkit 13.2
+* NVIDIA driver 616.64
+* Transformers 5.16.1
+* Batch size 1
+
+Latencies are CUDA-event median ± median absolute deviation (MAD). Model loading, input construction, correctness checks, runtime capture, and cache setup are outside the timed regions.
+
+| Headline Result                          |                       Result |
+| ---------------------------------------- | ---------------------------: |
+| Prefill geometric mean, 128–8192 tokens  |  **3.078x** vs. Hugging Face |
+| 8192-token prefill                       |  **4.178x** vs. Hugging Face |
+| Decode geometric mean, contexts 128–8192 | **14.216x** vs. Hugging Face |
+| 128-output generation geometric mean     | **13.185x** vs. Hugging Face |
+| Native decode at context 8192            | **1.9772 ± 0.0254 ms/token** |
+
+The decode and generation gains come from combining specialized CUDA kernels, compact KV-cache access, operation fusion, stable device memory, and CUDA Graph replay to reduce framework overhead, intermediate work, and per-token execution cost.
+
+### Prefill
+
+| Tokens |         Hugging Face |        Native Flux | Speedup |
+| -----: | -------------------: | -----------------: | ------: |
+|    128 |   36.414 ± 11.077 ms |   5.516 ± 0.055 ms |  6.601x |
+|    512 |    24.852 ± 0.195 ms |  12.348 ± 0.042 ms |  2.013x |
+|  1,024 |    33.630 ± 0.266 ms |  21.651 ± 0.092 ms |  1.553x |
+|  2,048 |    94.574 ± 0.160 ms |  38.441 ± 0.172 ms |  2.460x |
+|  4,096 |   298.641 ± 0.309 ms |  96.167 ± 0.101 ms |  3.105x |
+|  8,192 | 1,075.734 ± 5.932 ms | 257.457 ± 1.870 ms |  4.178x |
+
+The geometric-mean speedup across this representative grid is **3.078x**.
+
+At 8,192 tokens, the retained streaming GQA prefill path avoids the former **2.25 GiB attention-score materialization** by using compact K/V storage and bounded persistent workspace.
+
+### Decode
+
+Each row is a steady one-token decode window ending at the listed effective context. Native Flux uses CUDA Graph replay while Hugging Face uses eager execution.
+
+| Context |              Hugging Face |              Native Flux | Speedup |
+| ------: | ------------------------: | -----------------------: | ------: |
+|     128 | 25.2768 ± 1.7552 ms/token | 1.4469 ± 0.0156 ms/token | 17.469x |
+|     512 | 23.4304 ± 0.2684 ms/token | 2.4040 ± 0.0618 ms/token |  9.747x |
+|   1,024 | 24.4220 ± 0.4095 ms/token | 1.4364 ± 0.0124 ms/token | 17.003x |
+|   2,048 | 24.0012 ± 0.2364 ms/token | 1.4602 ± 0.0098 ms/token | 16.437x |
+|   4,096 | 23.8780 ± 0.2055 ms/token | 1.6791 ± 0.0121 ms/token | 14.220x |
+|   8,192 | 24.1153 ± 0.2447 ms/token | 1.9772 ± 0.0254 ms/token | 12.197x |
+
+The geometric-mean decode speedup is **14.216x**.
+
+The 512-token discontinuity comes from the conservative exact-capacity one-CTA GQA path.
+
+At capacity 4,096, one captured replay executes **304 GPU launches** — 183 Flux kernels and 121 cuBLAS/cuBLASLt launches — with **zero framework launches, zero replay allocation growth, and stable device addresses**.
+
+### Generation
+
+Complete generation includes native prefill and all fixed-length decode replays but excludes runtime construction and graph capture. Every timed workload was validated against Hugging Face token-for-token before measurement.
+
+| Prompt | Outputs |          Hugging Face |        Native Flux | Speedup |
+| -----: | ------: | --------------------: | -----------------: | ------: |
+|    128 |     128 |  3,033.647 ± 5.266 ms | 216.035 ± 0.565 ms | 14.042x |
+|    512 |     128 | 3,063.687 ± 11.107 ms | 201.990 ± 0.165 ms | 15.168x |
+|  1,024 |     128 |  3,037.912 ± 3.042 ms | 211.669 ± 0.263 ms | 14.352x |
+|  2,048 |     128 | 3,182.821 ± 78.909 ms | 233.351 ± 0.836 ms | 13.640x |
+|  4,096 |     128 | 3,354.230 ± 50.830 ms | 351.010 ± 8.785 ms |  9.556x |
+
+The geometric-mean speedup for 128 generated tokens is **13.185x**.
+
+Native C++ replay removes Python submission from the per-token path, although its end-to-end gain over Python-controlled native graph replay is modest because GPU execution dominates the final runtime.
+
+### GPU Profiling
+
+Nsight Compute profiling of the long-context streaming prefill attention kernel identified **dependency latency and register pressure** as the primary bottlenecks rather than DRAM bandwidth.
+
+| Metric                                             |                       Result |
+| -------------------------------------------------- | ---------------------------: |
+| Registers per thread                               |                      **162** |
+| Register spills                                    |                        **0** |
+| Theoretical occupancy                              |                    **25.0%** |
+| Achieved occupancy at 2,048 / 4,096 / 8,192 tokens | **19.57% / 22.33% / 24.34%** |
+| Issued warps per scheduler-cycle                   |       **0.54 / 0.61 / 0.65** |
+| DRAM bandwidth utilization                         |       **2.31–5.18% of peak** |
+| L1/shared LSU utilization at 8,192 tokens          |                   **63.26%** |
+
+The kernel is primarily dependency-latency limited rather than memory-bandwidth limited. A two-lane prototype reduced register usage from **162 to 95 registers/thread** and raised theoretical occupancy from **25.0% to 41.67%**, but regressed performance by **82.7–87.1%**, so it was rejected.
+
+Flux retains optimizations only when they improve measured end-to-end performance, not just isolated GPU metrics.
+
+
+## Technical Highlights
+
+### Custom CUDA Operators
+
+Flux replaces operations only where the custom contract matches SmolLM2 semantics.
+
+Retained custom paths include normalization, residual fusion, attention-score processing, RoPE, grouped-query attention, cache updates, and fused activation work.
+
+These changes reduce:
+
+* kernel launches
+* dispatcher overhead
+* global-memory traffic
+* intermediate tensor creation
+* redundant data movement
+
+Native launchers preserve PyTorch's current CUDA stream semantics.
+
+### Packed QKV and Cache Integration
+
+Q, K, and V weights are packed while preserving standard checkpoint and state-dict keys.
+
+During one-token decode, a fused post-projection path:
+
+1. applies RoPE to Q and K,
+2. writes rotated K and V directly into compact cache storage,
+3. emits head-major Q,
+4. advances graph-resident cache state.
+
+This eliminates separate projection views, standalone cache updates, and expanded K/V storage.
+
+### Native GQA Decode
+
+SmolLM2-135M uses nine query heads and three KV heads.
+
+Flux's one-token grouped-query attention kernel reads directly from compact three-head K/V cache storage instead of materializing repeated K/V tensors for each query head.
+
+The kernel uses stable online softmax and separately measured strategies for short and long contexts.
+
+### CUDA Graph Decode
+
+The native runtime owns:
+
+* `StaticCache`
+* lifetime-planned workspaces
+* logits/output buffers
+* input token state
+* cache position
+* attention-mask state
+* generation state
+
+Fixed shapes and stable addresses allow the complete token-to-logits path to be captured and replayed without allocations.
+
+Stream and event handling preserve asynchronous execution on the caller's current CUDA stream.
+
+### Device-Resident Greedy Generation
+
+Greedy argmax, exact lowest-index tie resolution, generated-token writes, cache position, and next-token feedback remain on the GPU.
+
+The C++ runtime submits repeated CUDA Graph replays in one fixed-length generation call, eliminating Python participation between generated tokens.
+
+Native generation is currently fixed-length and does not inspect EOS for early termination.
+
+### Native Prefill
+
+Prefill is optimized separately from one-token decode.
+
+Its tiled FP32 grouped-query attention computes online-softmax partials over compact K/V storage, merges long-context partitions, and bounds workspace growth.
+
+The retained native path reaches a validated **4.178x speedup at 8,192 tokens** versus Hugging Face.
+
+## GPU Performance Analysis
+
+Flux retained optimizations only after correctness validation and end-to-end measurement. CUDA events, same-process comparisons, Nsight Systems, Nsight Compute, compiler resource reports, and SASS inspection were used to separate framework overhead, kernel-launch cost, register pressure, memory behavior, and actual device execution.
+
+Native C++ graph replay reduced host submission overhead from roughly **24–25 µs/token to 3–4 µs/token**, yet improved end-to-end runtime by less than **1%** because GPU execution already dominated. This confirmed that further host-side optimization offered little practical value.
+
+Nsight Compute showed that long-context streaming prefill was primarily dependency-latency and register-pressure limited rather than DRAM-bandwidth limited.
+
+A two-lane-per-query experiment reduced register usage from **162 to 95 registers/thread** and increased theoretical occupancy, but regressed performance by **82.7–87.1%** at 2,048–8,192 tokens because added softmax, shuffle, and control overhead outweighed the occupancy gain.
+
+The experiment was removed.
+
+Other experimental paths, including vectorized RMSNorm, alternative GQA mappings, and a custom LM-head path, were also rejected when their integrated performance did not justify the added complexity.
+
+
+## Correctness and Validation
+
+The finalized system passes:
+
+* **146 Python tests**
+* **11/11 native CTests**
+
+Validation covers:
+
+* explicit Python/PyTorch operator references
+* Hugging Face equivalence
+* exact greedy-token equality for every timed generation workload
+* checkpoint and state-dict compatibility
+* logits comparisons
+* every-layer KV-cache comparisons
+* FakeTensor/meta behavior
+* `torch.library.opcheck`
+* non-default CUDA stream correctness
+* caller-stream native execution
+* stable CUDA Graph addresses
+* zero replay-allocation growth
+* exact lowest-index greedy argmax tie semantics
+* fixed-length native generation
+* direct native prefill-to-decode handoff
+
+One deterministic sparse 4,096-token continuation case has two of 49,152 logits outside the unchanged `rtol=2e-4`, `atol=2e-5` comparison policy, with a maximum absolute difference of:
+
+```text
+3.3736228942871094e-05
+```
+
+Full 4,096-token prefill passes, greedy tokens remain equal, and the tolerance was not loosened to hide this edge case.
+
+## Repository Layout
+
+| Path             | Purpose                                                                  |
+| ---------------- | ------------------------------------------------------------------------ |
+| `flux/`          | PyTorch operators, SmolLM2 integration, and native runtime adapter       |
+| `csrc/`          | Production C++/CUDA kernels, runtimes, native tests, and microbenchmarks |
+| `tests/`         | Consolidated Python correctness and integration suite                    |
+| `benchmarks/`    | Canonical system benchmark and shared timing infrastructure              |
+| `scripts/`       | Inference, native build, testing, and validation entry points            |
+| `CMakeLists.txt` | Standalone native test and microbenchmark build                          |
+| `setup.py`       | Opt-in PyTorch native extension build                                    |
+| `pyproject.toml` | Python package metadata and dependencies                                 |
+
+## Setup and Build
+
+The validated native environment is Windows with:
+
+* Python 3.11.9
+* MSVC Build Tools
+* CUDA Toolkit 13.2
+* NVIDIA GPU supporting the configured `sm_120` target
+
+From the repository root:
 
 ```powershell
-$env:FLUX_BUILD_NATIVE='1'
-build\python3119\python.exe setup.py build_ext --inplace --parallel 8
-build\python3119\python.exe -m pytest -q
-build\python3119\python.exe benchmarks\benchmark_flux.py --mode system `
-  --json-output build\final_system_results.json
-```
+py -3.11 -m venv .venv
+.venv\Scripts\Activate.ps1
 
-The benchmark covers 128--8192-token prefill, steady one-token decode,
-32-token generation, exact state-dict compatibility, logits/KV/cache state,
-stable addresses, and replay launch/allocation behavior. See
-[the final system milestone](docs/FINAL_SYSTEM_MILESTONE.md) for the complete
-configuration, methodology, tables, bottleneck interpretation, limitations,
-and optimization history.
-
-The maintained benchmark/support inventory and source-footprint accounting are
-recorded in [the Python test/benchmark audit](docs/PYTHON_TEST_BENCHMARK_AUDIT.md).
-
-The native runtime now owns the complete prompt-to-decode path. Native FP32
-prefill runs all 30 layers, writes the compact cache directly into the attached
-token-to-logits CUDA Graph runtime, and returns stable final-token logits:
-
-```python
-import torch
-
-from flux.runtime import NativeSmolLM2Prefill
-
-runtime = NativeSmolLM2Prefill.capture(
-    model,
-    prompt_ids,
-    max_decode_steps=31,
-)
-new_tokens = runtime.generate_greedy(32)
-generated_ids = torch.cat((prompt_ids, new_tokens), dim=-1)
-```
-
-The native object owns all 30 compact K/V caches, prompt/decode workspaces,
-device position/cache length, stable logits, current/generated-token storage,
-generation step, stream/event resources, and the decode graph. After prefill,
-fixed-length greedy generation is one native call: each replay selects the exact
-lowest-index maximum, appends it on device, and feeds it into the next replay
-without a Python per-token loop. EOS early termination is not part of this
-fixed-length contract. Prefill never constructs a Python cache, expands GQA K/V,
-or copies cache storage at handoff. Long-context prefill now uses split-context
-tiled online softmax directly over compact three-head K/V, eliminating the
-former 2.25 GiB score matrix at length 8192 and reducing measured native prefill
-from 281.631 ms to 254.368 ms over the previous streaming baseline on the target
-RTX 5070 Ti. A benchmark-selected fallback for
-lengths 129--1024 caps retained score storage at 36 MiB. See
-[the streaming prefill GQA milestone](docs/STREAMING_PREFILL_GQA_MILESTONE.md),
-[the long-context streaming GQA milestone](docs/LONG_CONTEXT_STREAMING_GQA_MILESTONE.md),
-[the native greedy-generation milestone](docs/NATIVE_GREEDY_GENERATION_MILESTONE.md),
-[the native prefill milestone](docs/NATIVE_PREFILL_RUNTIME_MILESTONE.md),
-[the full native decode milestone](docs/NATIVE_FULL_DECODE_RUNTIME_MILESTONE.md),
-and [runtime design](docs/NATIVE_DECODE_RUNTIME_DESIGN.md). Reproduce the
-  prefill correctness, direct continuation, memory, and three-path timing
-  matrix, including every-layer native cache validation and workspace reporting,
-  with the canonical final-system benchmark:
-
-```powershell
-build\python3119\python.exe benchmarks\benchmark_flux.py --mode prefill `
-  --json-output build\final_system_results.json
-```
-
-Use `benchmarks\benchmark_flux.py --mode profile` when prefill/decode launch
-ownership and top-kernel attribution are required. The same entry point exposes
-`system`, `prefill`, `decode`, `generation`, and `profile` modes.
-
-## Development setup
-
-Flux requires Python 3.10 or newer. From the repository root, install the project with its test dependencies:
-
-```bash
+python -m pip install --upgrade pip
 python -m pip install -e ".[test]"
-python -m pytest
 ```
 
-### Native PyTorch RMSNorm operator
+Build the PyTorch extension against the active environment:
 
-The optional native library is an explicit development build so PEP 517 build
-isolation does not install another PyTorch. From an x64 MSVC Developer Command
-Prompt, with the project environment activated, run:
-
-```bat
-set DISTUTILS_USE_SDK=1
-set FLUX_BUILD_NATIVE=1
-python setup.py build_ext --inplace
+```powershell
+$env:FLUX_BUILD_NATIVE = '1'
+python setup.py build_ext --inplace --parallel 8
 ```
 
-If `cl.exe` is not visible, first initialize the compiler environment:
+The first inference run downloads the pinned model/tokenizer revision through the Hugging Face cache.
 
-```bat
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+The standalone native build interface discovers MSVC, uses CUDA from `CUDA_PATH`, and resolves PyTorch's CMake package from the active environment.
+
+## Running Flux
+
+Compare Hugging Face, PyTorch-integrated Flux, and native fixed-length generation on the same prompt:
+
+```powershell
+python scripts\flux_inference.py --device cuda --native `
+  --prompt "The future of efficient inference is" `
+  --max-new-tokens 32
 ```
 
-Importing `flux.ops` loads a built `flux._C` registration library. The Python
-entry point `flux.ops.rms_norm_native(input, weight, epsilon)` invokes
-`torch.ops.flux.rmsnorm`. The operator is currently FP32 and inference-only; it
-does not implement autograd. Input and weight may be non-contiguous because the
-C++ wrappers make contiguous copies before calling the standalone row-major
-implementations. No dtype conversion is performed.
+Run the Python validation suite:
 
-The RMSNorm stack is correctness-complete, and its CUDA kernel uses warp
-shuffles plus a small shared-memory reduction across warp partials. Build and
-run the direct native CUDA microbenchmark from the repository root with:
-
-```bat
-scripts\native.cmd benchmark -Filter rmsnorm
+```powershell
+python -m pytest -q
 ```
 
-An aligned `float4` memory-access path was evaluated as the final standalone
-RMSNorm optimization, but was not retained. Across three repeated 5,000-call
-runs on an otherwise idle RTX 5070 Ti, the `(1, 8192, 576)` median increased
-from 29.502 microseconds for scalar warp reduction to 37.166 microseconds with
-vectorized access. A 128-thread vector variant remained slower at 38.106
-microseconds. The production kernel therefore retains scalar memory access for
-all hidden sizes.
+Run the native validation suite:
 
-The benchmark checks correctness before timing and prints machine-specific
-results to standard output; it does not save them in the repository.
-
-## Reference inference
-
-After installation, run from the repository root:
-
-```bash
-python scripts/reference_inference.py
-```
-
-The script selects CUDA when available, otherwise CPU. Optional `--device cpu`
-and `--prompt "Your prompt"` overrides are supported. The first run downloads
-[HuggingFaceTB/SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M)
-into the standard Hugging Face cache, outside Git. The model and tokenizer use
-the same pinned revision, defined in `flux/model/smollm2.py`.
-
-The baseline uses float32, evaluation mode, inference mode, eager attention,
-seed 0, deterministic PyTorch algorithms, and disabled TF32. It prints runtime
-versions, model configuration, tensor metadata, an actual final-token logits
-fingerprint, and up to 16 greedily generated tokens (`do_sample=False`). These
-settings support repeatability in the same environment; bit-for-bit agreement
-is not guaranteed across GPUs, PyTorch/Transformers versions, CUDA versions,
-or dtypes. Lightweight tests use synthetic configurations and mocked loading
-boundaries and do not download model weights or tokenizers.
-
-## Flux-integrated inference
-
-With the native extension built, compare the pinned reference model with the
-integrated path on identical FP32 inputs:
-
-```bash
-python scripts/flux_inference.py
-```
-
-The script reports decoder-layer and full-logit differences, greedy token-ID
-equality with KV caching, installed Flux module counts, and a basic full-forward
-latency sanity check. The Flux attention path remains explicit eager attention.
-Its fused Q/K RoPE operator consumes the exact position-dependent cosine and
-sine tensors produced by Hugging Face, preserving position ids, offsets, and
-RoPE scaling. It reads non-contiguous projection views directly and supports
-SmolLM2's grouped-query head counts. Multi-token masked attention fuses score
-scaling, additive masking, and
-softmax after the QK matmul. Pass `fuse_attention_scores=False` to
-`enable_flux_ops` to retain the previous separate sequence for comparison. QK
-and P@V matmuls remain outside the operator; this is not a FlashAttention-style
-or fused-SDPA implementation.
-
-The packed MLP remains separately opt-in so the established Flux path is
-unchanged. It concatenates each layer's standard gate/up checkpoint weights
-once, releases their old runtime storage, and retains the Hugging Face SiLU,
-multiply, and down projection:
-
-```python
-from flux.model.smollm2_flux import FLUX_OPERATOR_CATEGORIES, enable_flux_ops
-
-enable_flux_ops(model, operators=FLUX_OPERATOR_CATEGORIES | {"mlp"})
-```
-
-The independent `"qkv"` category similarly concatenates the bias-free Q, K,
-and V weights once in `[Q | K | V]` order and replaces the three projections
-with one standard `nn.Linear`/cuBLAS GEMM. For SmolLM2-135M its packed weight is
-`[960, 576]`. Allocation-free split, reshape, and transpose views feed the
-existing Flux RoPE and cache paths directly; no custom GEMM or RoPE change is
-involved:
-
-```python
-enable_flux_ops(model, operators=FLUX_OPERATOR_CATEGORIES | {"qkv"})
-```
-
-Packed QKV remains independently selectable from packed MLP, packed SwiGLU,
-RoPE, softmax, and CUDA-Graph decode. At runtime it is the sole Q/K/V weight
-storage, while strict loading, `state_dict()`, and `save_pretrained` retain the
-ordinary `q_proj.weight`, `k_proj.weight`, and `v_proj.weight` checkpoint
-interface.
-
-Add the separately controlled `"packed_swiglu"` category to replace the
-SiLU/multiply pair with `torch.ops.flux.packed_swiglu`. The operator consumes
-the original contiguous `[gate; up]` projection result directly, produces a
-last dimension half as large, and performs no implicit input copy:
-
-```python
-enable_flux_ops(
-    model,
-    operators=FLUX_OPERATOR_CATEGORIES | {"mlp", "packed_swiglu"},
-)
-```
-
-Packed models continue to load and export the standard `gate_proj.weight` and
-`up_proj.weight` state-dict keys. Their layout, state-dict, prefill, cached
-decode, and generation contracts are maintained in `tests/test_system.py`;
-the final integrated performance path is measured by
-`benchmarks/benchmark_flux.py --mode system`.
-
-The independent `"gqa_decode_attention"` category replaces the one-token
-cached-decode sequence—K/V repetition, QK, scaling/mask/softmax, and P@V—with
-a native operator that reads unexpanded `[B, KVH, capacity, D]` cache storage.
-The initial native contract is FP32, batch size one, and query length one;
-unsupported inputs retain the existing attention path. DynamicCache decode
-uses the fused path at every supported length. StaticCache
-CUDA-Graph decode uses it above the measured 512-token capacity crossover and
-retains the existing shared-memory path through 512. Prefill is unchanged. The
-FP32 CUDA head-dimension-64 path uses one shared-score block through 512 tokens and
-128-token online-softmax partials plus a max-rescaled reduction beyond 512.
-Capacities through 4096 use query-head partials; larger SmolLM2 capacities use
-KV-head-grouped partials that reuse each K/V load across three query heads;
-other supported head dimensions use the general single-block kernel.
-
-```python
-enable_flux_ops(
-    model,
-    operators=FLUX_OPERATOR_CATEGORIES | {"gqa_decode_attention"},
-)
-```
-
-Validate and benchmark the production attention kernel directly with:
-
-```bat
-scripts\native.cmd benchmark -Filter gqa
-```
-
-The separately controlled `"packed_qkv_rope_cache"` category fuses the work
-between the retained packed QKV projection and native one-token GQA attention.
-For the FP32 SmolLM2 `B=1`, `Q=1` StaticCache path, one CUDA block applies Q/K
-RoPE, writes rotated K and unmodified V directly into unexpanded cache storage,
-returns compact head-major Q, and advances the device-resident cache length.
-It is CUDA-Graph safe and removes the separate RoPE/cache-update sequence
-without a workspace or graph-pool increase. It requires `"rope"`, `"qkv"`, and
-`"gqa_decode_attention"`; unsupported inputs use the retained path. As with
-native GQA attention, StaticCache capacities through 512 retain the measured
-short-context fallback. The specialized fused path supports capacities 513
-through 8192.
-
-```python
-enable_flux_ops(
-    model,
-    operators=FLUX_OPERATOR_CATEGORIES
-    | {"qkv", "gqa_decode_attention", "packed_qkv_rope_cache"},
-)
-```
-
-The fused boundary's dispatcher, cache-update, FakeTensor, and opcheck contracts
-are maintained in `tests/test_native_packed_qkv_rope_cache.py`; native CTest
-owns its direct stream and graph behavior. Its production contribution is
-exercised by the final-system benchmark and native runtime profiler.
-
-For the fully fused FP32 `B=1`, one-token StaticCache graph path at capacities
-513 through 8192, graph capture also preallocates a small state-owned scratch
-set. Narrow internal out variants reuse it for RMSNorm, residual RMSNorm,
-packed SwiGLU, packed-QKV post-processing, and native GQA attention. The
-buffers are shared only where producer/consumer lifetimes do not overlap,
-remain owned by the captured native runtime object, and are not used by eager
-or unsupported paths. PyTorch deterministic algorithms and uninitialized-memory
-safety filling remain enabled. Native CTest owns overwrite, stable-address,
-stream, graph, and allocation behavior; the Python operator tests retain the
-public out-schema, identity, alias, and FakeTensor contracts.
-
-The separately controlled `"cublaslt_projection"` category replaces only the
-FP32 one-token packed-QKV and attention-output projections inside the supported
-stable-buffer CUDA-Graph path. It uses a measured zero-workspace cuBLASLt
-configuration with caller-owned outputs; eager, short-cache, and unsupported
-paths retain `nn.Linear`. It requires `"packed_qkv_rope_cache"` and that
-category's dependencies.
-
-```python
-enable_flux_ops(
-    model,
-    operators=FLUX_OPERATOR_CATEGORIES
-    | {
-        "mlp",
-        "packed_swiglu",
-        "qkv",
-        "gqa_decode_attention",
-        "packed_qkv_rope_cache",
-        "cublaslt_projection",
-        "fused_gate_up_swiglu",
-    },
-)
-```
-
-The retained explicit cuBLASLt configuration, current-stream behavior, graph
-capture, numerical result, and FakeTensor contract are maintained in
-`tests/test_native_cublaslt_linear.py`. The full CUDA-Graph sweep, production
-launch inventory, and memory behavior are maintained by the final-system
-benchmark and decode profiler.
-
-See [the projection milestone report](docs/PROJECTION_MILESTONE.md) for the
-retention evidence and rejected candidates.
-
-The separately controlled `"fused_gate_up_swiglu"` category owns only the
-FP32 SmolLM2 one-token packed gate/up shape `[1,1,576] @ [3072,576].T`. In the
-supported fixed-shape CUDA-Graph path it computes matched gate/up dot products,
-applies SwiGLU, and writes directly to the existing stable 1,536-element MLP
-activation buffer. Eager, prefill, non-FP32, non-unit batch/query, and other
-geometry use the existing packed `nn.Linear` plus packed-SwiGLU fallback.
-
-Add `"fused_gate_up_swiglu"` to the fully optimized category set shown above.
-Measure the retained production kernel with:
-
-```bat
-scripts\native.cmd benchmark -Filter gate_up
-```
-
-See [the gate/up GEMV milestone report](docs/GATE_UP_GEMV_MILESTONE.md) for the
-bounded standalone and fused experiments, correctness, launch, traffic, and
-memory results.
-
-The subsequent retained-system re-profile found the LM head to be the largest
-individual remaining library kernel. A bounded FP32 M=1 custom GEMV experiment
-produced only a marginal isolated win and regressed integrated graph decode at
-the primary and longer capacities, so no LM-head operator or dispatch was
-retained. See [the LM-head GEMV milestone report](docs/LM_HEAD_GEMV_MILESTONE.md)
-for the fresh category profile, rejected architectures, correctness, traffic,
-resource, graph, eager, and memory results.
-
-The follow-up long-context GQA investigation retained shared per-chunk
-rescaling in the final reduction, reducing redundant workspace reads and
-rescaling exponentials without changing launches or operator semantics. A
-coalesced stage-1 candidate was removed after its isolated 4096 win regressed
-the integrated graph. Reproduce the retained kernel/stage benchmark with:
-
-```bat
-scripts\native.cmd benchmark -Filter gqa
-```
-
-See [the GQA reduction milestone report](docs/GQA_REDUCTION_MILESTONE.md) for
-the baseline structure, traffic/resource analysis, alternating full-graph A/B
-results, rejected experiment, correctness, and recommendation.
-
-Packed-QKV layout, checkpoint compatibility, storage, prefill, decode, and
-generation behavior are maintained in `tests/test_system.py`; production
-performance is included in the canonical final-system benchmark.
-
-Benchmark RoPE directly with:
-
-```bat
-scripts\native.cmd benchmark -Filter rope
-```
-
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the planned progression toward the integrated system.
-
-The coherent native correctness suite discovers the repository's verified
-MSVC, CUDA, and PyTorch toolchain and builds CPU, CUDA-operator, and native
-prefill/decode runtime tests:
-
-```bat
+```powershell
 scripts\native.cmd test
 ```
 
-The implementation accumulates each sum of squares sequentially in `float`.
-PyTorch may reduce in a different order, so cross-language checks use FP32
-tolerances rather than requiring bit-for-bit equality.
+Run the canonical full-system benchmark:
 
-The standalone CUDA kernel uses one 256-thread block per row, scalar FP32 memory
-access, a two-level FP32 warp reduction, and a caller-provided CUDA stream. The
-suite targets the configured CUDA architecture (SmolLM2 development uses an RTX
-5070 Ti at compute capability 12.0), calls production launchers directly, and
-does not use binary-file or Python executable wrappers. Native benchmarks are
-separately opt-in:
-
-```bat
-scripts\native.cmd build-benchmarks
-scripts\native.cmd benchmark -Warmup 10 -Samples 51
+```powershell
+python benchmarks\benchmark_flux.py --mode system
 ```
+
+Run focused benchmark modes with:
+
+```powershell
+python benchmarks\benchmark_flux.py --mode prefill
+python benchmarks\benchmark_flux.py --mode decode
+python benchmarks\benchmark_flux.py --mode generation
+python benchmarks\benchmark_flux.py --mode profile
+```
+
+Reproduce the final prefill grid with:
+
+```powershell
+python benchmarks\benchmark_flux.py --mode prefill `
+  --lengths 1,8,32,64,128,256,512,1024,2048,4096,8192 `
+  --warmup 5 `
+  --samples 20 `
+  --rounds 3 `
+  --correctness-tokens 0 `
+  --report-cache-drift `
+  --json-output build\final_prefill_results.json
+```
+
+Build and run the standalone CUDA microbenchmarks with:
+
+```powershell
+scripts\native.cmd benchmark
+```
+
+## What I Learned
+
+* How to design and integrate custom C++/CUDA operators into PyTorch while preserving model and checkpoint behavior.
+* How to optimize transformer inference by reducing memory traffic, kernel launches, tensor allocations, and redundant intermediate operations.
+* How to build specialized decode paths using static KV caches, stable device memory, and CUDA Graph capture and replay.
+* How to use Nsight Compute and benchmark data to analyze register pressure, occupancy, dependency chains, instruction throughput, and memory behavior.
+* How to validate optimized kernels against Hugging Face and reject changes that improve theoretical metrics but regress end-to-end performance.
+
+
+## Future Work
+
+* Add FP16 and BF16 execution paths and evaluate Tensor Core acceleration.
+* Explore quantized inference, including INT8 or lower-precision weight formats.
+* Generalize the optimized runtime to additional transformer architectures and model sizes.
+* Add EOS-aware native generation so fixed-length decoding can terminate directly on device.
+* Investigate alternative long-context attention designs that reduce dependency latency without increasing instruction or synchronization overhead.

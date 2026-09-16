@@ -90,8 +90,11 @@ class DecodeResult:
     window_start: int
     window_stop: int
     reference_ms: float
+    reference_mad_ms: float
     flux_eager_ms: float
+    flux_eager_mad_ms: float
     native_ms: float
+    native_mad_ms: float
 
 
 @dataclass(frozen=True)
@@ -100,11 +103,17 @@ class GenerationResult:
     output_tokens: int
     path: str
     prefill_ms: float
+    prefill_mad_ms: float
     ttft_ms: float
+    ttft_mad_ms: float
     decode_ms: float
+    decode_mad_ms: float
     total_execution_ms: float
+    total_execution_mad_ms: float
     total_observed_ms: float
+    total_observed_mad_ms: float
     average_decode_token_ms: float
+    average_decode_token_mad_ms: float
 
 
 @dataclass(frozen=True)
@@ -613,8 +622,11 @@ def _benchmark_decode(
         effective_length - samples + 1,
         effective_length,
         statistics.median(values["reference"]),
+        _median_absolute_deviation(values["reference"]),
         statistics.median(values["Flux eager"]),
+        _median_absolute_deviation(values["Flux eager"]),
         statistics.median(values["native"]),
+        _median_absolute_deviation(values["native"]),
     )
 
 
@@ -764,20 +776,31 @@ def _benchmark_generation(
             del prompt
     results = []
     for name in paths:
-        prefill = statistics.median(item[0] for item in samples[name])
-        ttft = statistics.median(item[1] for item in samples[name])
-        decode = statistics.median(item[2] for item in samples[name])
+        prefill_samples = [item[0] for item in samples[name]]
+        ttft_samples = [item[1] for item in samples[name]]
+        decode_samples = [item[2] for item in samples[name]]
+        execution_samples = [item[0] + item[2] for item in samples[name]]
+        observed_samples = [item[1] + item[2] for item in samples[name]]
+        per_token_samples = [
+            item[2] / max(output_tokens - 1, 1) for item in samples[name]
+        ]
         results.append(
             GenerationResult(
                 prompt_length,
                 output_tokens,
                 name,
-                prefill,
-                ttft,
-                decode,
-                prefill + decode,
-                ttft + decode,
-                decode / max(output_tokens - 1, 1),
+                statistics.median(prefill_samples),
+                _median_absolute_deviation(prefill_samples),
+                statistics.median(ttft_samples),
+                _median_absolute_deviation(ttft_samples),
+                statistics.median(decode_samples),
+                _median_absolute_deviation(decode_samples),
+                statistics.median(execution_samples),
+                _median_absolute_deviation(execution_samples),
+                statistics.median(observed_samples),
+                _median_absolute_deviation(observed_samples),
+                statistics.median(per_token_samples),
+                _median_absolute_deviation(per_token_samples),
             )
         )
     return results
@@ -910,32 +933,36 @@ def _print_results(
         )
     print("\nSteady-state decode (effective attention length; median window shown)")
     print(
-        f"{'length':>8} {'window':>13} {'reference':>11} {'Flux eager':>11} "
-        f"{'native':>11} {'native/ref':>10} {'native/eager':>12}"
+        f"{'length':>8} {'window':>13} {'reference':>11} {'ref MAD':>9} "
+        f"{'Flux eager':>11} {'eager MAD':>9} {'native':>11} {'nat MAD':>9} "
+        f"{'native/ref':>10} {'native/eager':>12}"
     )
     for item in decode:
         print(
             f"{item.effective_length:>8} "
             f"{item.window_start:>5}-{item.window_stop:<5} "
-            f"{item.reference_ms:>11.4f} {item.flux_eager_ms:>11.4f} "
-            f"{item.native_ms:>11.4f} "
+            f"{item.reference_ms:>11.4f} {item.reference_mad_ms:>9.4f} "
+            f"{item.flux_eager_ms:>11.4f} {item.flux_eager_mad_ms:>9.4f} "
+            f"{item.native_ms:>11.4f} {item.native_mad_ms:>9.4f} "
             f"{item.reference_ms / item.native_ms:>9.3f}x "
             f"{item.flux_eager_ms / item.native_ms:>11.3f}x"
         )
     if generation:
         print("\nGeneration (CUDA-event execution; native observed total includes setup)")
         print(
-            f"{'prompt':>7} {'path':>11} {'prefill':>10} {'TTFT':>10} "
-            f"{'decode':>10} {'ms/token':>10} {'total exec':>11} "
-            f"{'total seen':>11} {'gen tok/s':>10}"
+            f"{'prompt':>7} {'path':>13} {'prefill':>10} {'decode':>10} "
+            f"{'dec MAD':>9} {'ms/token':>10} {'total exec':>11} "
+            f"{'exec MAD':>9} {'total seen':>11} {'seen MAD':>9}"
         )
         for item in generation:
             print(
-                f"{item.prompt_length:>7} {item.path:>11} {item.prefill_ms:>10.3f} "
-                f"{item.ttft_ms:>10.3f} {item.decode_ms:>10.3f} "
+                f"{item.prompt_length:>7} {item.path:>13} {item.prefill_ms:>10.3f} "
+                f"{item.decode_ms:>10.3f} {item.decode_mad_ms:>9.3f} "
                 f"{item.average_decode_token_ms:>10.4f} "
-                f"{item.total_execution_ms:>11.3f} {item.total_observed_ms:>11.3f} "
-                f"{1000 * item.output_tokens / item.total_observed_ms:>10.2f}"
+                f"{item.total_execution_ms:>11.3f} "
+                f"{item.total_execution_mad_ms:>9.3f} "
+                f"{item.total_observed_ms:>11.3f} "
+                f"{item.total_observed_mad_ms:>9.3f}"
             )
     if audit is not None:
         print("\nCUDA-Graph runtime audit")
